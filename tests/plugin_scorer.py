@@ -16,3 +16,13 @@ class MaxLength(Scorer):
 
 
 NOT_A_SCORER = object()
+
+
+class Exploding(Scorer):
+    async def score(self, case: Case, output: str) -> ScoreResult:
+        raise RuntimeError("plugin bug")
+
+
+class OutOfRange(Scorer):
+    async def score(self, case: Case, output: str) -> ScoreResult:
+        return ScoreResult(float(self.options.get("value", 2.0)))

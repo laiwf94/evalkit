@@ -56,7 +56,7 @@ select = ["E", "W", "F", "I", "B", "UP", "S", "SIM", "RUF", "PL", "PT", "C4", "R
 ignore = ["PLR0913", "PLR2004", "TRY003", "PLR0911", "PLR0912"]
 
 [tool.ruff.lint.per-file-ignores]
-"tests/**" = ["S101", "S104", "TRY301", "S105", "S106", "S311", "PLR2004", "S603", "S607", "PLC0415", "TRY002"]
+"tests/**" = ["S101", "S104", "TRY301", "ASYNC110", "S105", "S106", "S311", "PLR2004", "S603", "S607", "PLC0415", "TRY002"]
 "benchmarks/**" = ["S311", "T201"]
 
 [tool.mypy]
