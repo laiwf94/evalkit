@@ -53,7 +53,7 @@ exclude-newer = "2026-10-11T00:00:00Z"
 [tool.ruff]
 line-length = 100
 target-version = "py312"
-src = ["src", "tests"]
+src = ["src", "tests", "benchmarks"]
 
 [tool.ruff.lint]
 select = ["E", "W", "F", "I", "B", "UP", "S", "SIM", "RUF", "PL", "PT", "C4", "RET", "TRY", "N", "ASYNC"]
@@ -66,7 +66,7 @@ ignore = ["PLR0913", "PLR2004", "TRY003", "PLR0911", "PLR0912"]
 [tool.mypy]
 strict = true
 python_version = "3.12"
-files = ["src", "tests"]
+files = ["src", "tests", "benchmarks"]
 plugins = ["pydantic.mypy"]
 
 [tool.pytest.ini_options]
