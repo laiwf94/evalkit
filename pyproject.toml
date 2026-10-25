@@ -1,0 +1,71 @@
+[project]
+name = "evalkit"
+version = "0.1.0"
+description = "Evaluation and regression testing for LLM applications"
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "Woon Fei Lai" }]
+requires-python = ">=3.12"
+dependencies = [
+    "pydantic==2.14.0",
+]
+
+[project.scripts]
+evalkit = "evalkit.cli:main"
+
+[dependency-groups]
+dev = [
+    "pytest==9.1.1",
+    "pytest-cov==7.1.0",
+    "hypothesis==6.168.5",
+    "ruff==0.17.0",
+    "mypy==2.4.0",
+    "pip-audit==2.10.1",
+]
+
+[build-system]
+requires = ["hatchling==1.32.4"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/evalkit"]
+
+[tool.uv]
+# Only resolve releases that have been public for at least two weeks.
+exclude-newer = "2026-10-11T00:00:00Z"
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "W", "F", "I", "B", "UP", "S", "SIM", "RUF", "PL", "PT", "C4", "RET", "TRY", "N", "ASYNC"]
+ignore = ["PLR0913", "PLR2004", "TRY003", "PLR0911", "PLR0912"]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["S101", "S104", "TRY301", "S105", "S106", "S311", "PLR2004", "S603", "S607", "PLC0415", "TRY002"]
+"benchmarks/**" = ["S311", "T201"]
+
+[tool.mypy]
+strict = true
+python_version = "3.12"
+files = ["src", "tests"]
+plugins = ["pydantic.mypy"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q --strict-markers --cov=evalkit --cov-report=term-missing:skip-covered --cov-fail-under=90"
+markers = [
+    "live: calls the real Claude API; skipped without ANTHROPIC_API_KEY",
+    "e2e: needs Docker for Testcontainers",
+]
+filterwarnings = ["error"]
+
+[tool.coverage.run]
+branch = true
+source = ["evalkit"]
+
+[tool.coverage.report]
+exclude_also = ["if TYPE_CHECKING:", "raise NotImplementedError", "@overload"]
