@@ -133,7 +133,12 @@ class ClaudeClient:
                     message = await stream.get_final_message()
             else:
                 message = await self._client.beta.messages.create(**params)
-        return self.completion_from_message(message, requested_model=model)
+        try:
+            return self.completion_from_message(message, requested_model=model)
+        except (TypeError, AttributeError) as exc:
+            raise TargetError(
+                f"unexpected response from the Claude API: {exc}", retryable=False
+            ) from None
 
     def completion_from_message(
         self, message: Any, *, requested_model: str, batch: bool = False
@@ -216,6 +221,11 @@ async def _mapped_errors() -> AsyncIterator[None]:
         raise TargetError("Claude API request timed out", retryable=True) from None
     except anthropic.APIConnectionError as exc:
         raise TargetError(f"cannot reach the Claude API: {exc}", retryable=True) from None
+    except (anthropic.APIError, ValueError) as exc:
+        # A response the SDK cannot parse: specific to this case, not worth retrying.
+        raise TargetError(
+            f"unexpected response from the Claude API: {exc}", retryable=False
+        ) from None
 
 
 def _counts(usage: Any) -> TokenCounts:

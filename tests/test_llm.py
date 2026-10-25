@@ -281,3 +281,16 @@ def test_prices_file(tmp_path: Path) -> None:
     f.write_text("[prices.my-model]\ninput = -1\noutput = 3\n")
     with pytest.raises(ConfigError, match="invalid configuration"):
         Settings.from_env({"EVALKIT_PRICES_FILE": str(f)})
+
+
+def test_unparseable_responses_are_case_errors() -> None:
+    import httpx2
+
+    bad_json = httpx2.Response(
+        200, content=b"{not json", headers={"content-type": "application/json"}
+    )
+    wrong_shape = httpx2.Response(200, json={"unexpected": True})
+    for reply in (bad_json, wrong_shape):
+        with pytest.raises(TargetError, match="unexpected response") as info:
+            run(FakeAnthropic(reply).client().complete(model="claude-opus-5-5", prompt="x"))
+        assert not info.value.retryable
