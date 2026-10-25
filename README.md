@@ -189,6 +189,9 @@ timings, so ranges are given.
 | 400-case rerun served from the cache | 34-71 ms vs 2.6 s cold (37-77x) |
 | Paired comparison, 1,000 cases, 10,000 resamples | 47-50 ms |
 
+On PostgreSQL 16 in Docker on the same machine the overhead is 250-300 µs per
+case and a cached rerun takes 98 ms (27x); throughput is the same.
+
 At 64 workers 400 cases are only six rounds deep, so the last partial round
 and result writes show up; model latencies of seconds hide both.
 
