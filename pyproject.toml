@@ -10,14 +10,17 @@ requires-python = ">=3.12"
 dependencies = [
     "alembic==1.20.0",
     "anthropic==1.13.0",
+    "fastapi==0.143.0",
     "httpx2==2.13.1",
     "jsonschema==4.26.0",
     "numpy==2.5.4",
+    "prometheus-client==0.26.0",
     "psycopg[binary]==3.3.6",
     "pydantic==2.14.0",
     "referencing==0.37.0",
     "regex==2026.9.29",
     "sqlalchemy==2.1.4",
+    "uvicorn==0.54.0",
 ]
 
 [project.scripts]

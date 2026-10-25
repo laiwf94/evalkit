@@ -36,7 +36,7 @@ from sqlalchemy import or_, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, sessionmaker
 
-from evalkit import cache
+from evalkit import cache, metrics
 from evalkit.config import Settings
 from evalkit.datasets import Case, get_dataset, load_cases
 from evalkit.db.models import Dataset, Result, Run, utcnow
@@ -218,12 +218,17 @@ class Runner:
             run = await asyncio.to_thread(self._claim, run_id)
             if run.status == "completed":
                 return ExecutionReport(run_id, "completed", 0, 0, 0, 0)
+            metrics.RUNS_ACTIVE.inc()
+            status = "failed"
             try:
                 report = await self._execute_claimed(run)
+                status = "completed"
             except LeaseLostError:
+                status = "lease_lost"
                 log.warning("lease lost; another process now owns the run")
                 raise
             except (asyncio.CancelledError, KeyboardInterrupt):
+                status = "interrupted"
                 await asyncio.shield(asyncio.to_thread(self._finish, run_id, "interrupted", ""))
                 raise
             except Exception as exc:
@@ -231,6 +236,9 @@ class Runner:
                 await asyncio.to_thread(self._finish, run_id, "failed", message)
                 log.exception("run failed")
                 raise
+            finally:
+                metrics.RUNS_ACTIVE.dec()
+                metrics.RUNS_FINISHED.labels(status).inc()
             await asyncio.to_thread(self._finish, run_id, "completed", "")
             log.info("run completed", extra=asdict(report))
             return report
@@ -255,6 +263,7 @@ class Runner:
                     result = await self._run_case(ctx, case, keys[case.id])
                     counts["executed"] += 1
                 counts["errors"] += result.status == "error"
+                _record(result, "cache" if result.cached else "target", ctx.target.provider)
                 await results.put(result)
 
         unsaved: list[CaseResult] = []
@@ -412,6 +421,7 @@ class Runner:
             result = await self._finish_case(
                 ctx, answered, keys[answered.id], generation, latency_ms=0.0, attempts=1
             )
+            _record(result, "batch", target.provider)
             await results.put(result)
             handled.add(answered.id)
         log.info("batch results saved", extra={"batch_id": batch_id, "answered": len(handled)})
@@ -665,6 +675,18 @@ class Runner:
                         log.warning("duplicate result skipped", extra={"case_id": r.case_id})
                 cache.store(session, entries)
                 session.commit()
+
+
+def _record(result: CaseResult, source: str, provider: str) -> None:
+    metrics.CASES.labels(result.status, source).inc()
+    if result.attempts:
+        metrics.TARGET_ATTEMPTS.labels(provider).inc(result.attempts)
+    metrics.TOKENS.labels("input").inc(result.input_tokens + result.judge_input_tokens)
+    metrics.TOKENS.labels("output").inc(result.output_tokens + result.judge_output_tokens)
+    metrics.TOKENS.labels("cache_read").inc(result.cache_read_tokens)
+    metrics.TOKENS.labels("cache_write").inc(result.cache_write_tokens)
+    metrics.COST.labels("target").inc(result.cost_usd)
+    metrics.COST.labels("judge").inc(result.judge_cost_usd)
 
 
 def _usage_fields(usage: Usage) -> dict[str, Any]:

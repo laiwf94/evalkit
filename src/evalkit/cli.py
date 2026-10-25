@@ -33,6 +33,7 @@ from sqlalchemy.engine import make_url
 from sqlalchemy.orm import Session, sessionmaker
 
 from evalkit import __version__
+from evalkit.api import serve
 from evalkit.config import ConfigError, Settings
 from evalkit.datasets import (
     get_dataset,
@@ -262,6 +263,11 @@ async def cmd_db(args: argparse.Namespace, app: App) -> int:
     return EXIT_OK
 
 
+def cmd_serve(settings: Settings) -> int:
+    serve(settings)
+    return EXIT_OK
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="evalkit", description=__doc__.splitlines()[0])
     parser.add_argument("--version", action="version", version=f"evalkit {__version__}")
@@ -323,6 +329,8 @@ def build_parser() -> argparse.ArgumentParser:
     db = sub.add_parser("db", help="database maintenance")
     db.add_argument("db_command", choices=["upgrade"])
     db.set_defaults(handler=cmd_db)
+
+    sub.add_parser("serve", help="run the HTTP API (EVALKIT_HOST, EVALKIT_PORT)")
     return parser
 
 
@@ -336,6 +344,12 @@ def main(argv: Sequence[str] | None = None, out: TextIO | None = None) -> int:
     except ConfigError as exc:
         _err(str(exc))
         return EXIT_INPUT
+    if args.command == "serve":
+        try:
+            return cmd_serve(settings)
+        except ConfigError as exc:
+            _err(str(exc))
+            return EXIT_INPUT
     configure_logging("INFO" if args.verbose else "WARNING")
     scrubber.register(*settings.secret_values())
     try:

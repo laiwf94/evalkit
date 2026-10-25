@@ -19,3 +19,8 @@ def engine(tmp_path: Path) -> Iterator[Engine]:
 @pytest.fixture
 def sessions(engine: Engine) -> sessionmaker[Session]:
     return make_session_factory(engine)
+
+
+@pytest.fixture
+def anyio_backend() -> str:
+    return "asyncio"
