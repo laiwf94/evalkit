@@ -192,6 +192,7 @@ async def test_body_limit_and_unknown_routes(client: httpx2.AsyncClient) -> None
     big = await client.post("/v1/datasets/qa", content="x" * (64 * 1024 + 1), headers=AUTH)
     assert big.status_code == 413
     assert big.json()["error"]["code"] == "payload_too_large"
+    assert big.json()["error"]["request_id"] == big.headers["x-request-id"]
 
     async def chunks() -> AsyncIterator[bytes]:
         for _ in range(100):

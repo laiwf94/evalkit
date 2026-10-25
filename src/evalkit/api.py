@@ -97,8 +97,14 @@ class BodyLimit:
         if scope["type"] != "http":
             await self.app(scope, receive, send)
             return
-        too_large = _error(413, "payload_too_large", f"body is larger than {self.limit} bytes", "")
-        declared = dict(scope.get("headers") or []).get(b"content-length")
+        headers = dict(scope.get("headers") or [])
+        incoming = headers.get(b"x-request-id", b"").decode("latin-1")
+        request_id = incoming if REQUEST_ID.fullmatch(incoming) else uuid.uuid4().hex
+        too_large = _error(
+            413, "payload_too_large", f"body is larger than {self.limit} bytes", request_id
+        )
+        too_large.headers["X-Request-ID"] = request_id
+        declared = headers.get(b"content-length")
         if declared is not None and (not declared.isdigit() or int(declared) > self.limit):
             await too_large(scope, receive, send)
             return
