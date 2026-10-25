@@ -189,13 +189,26 @@ class LLMJudge(Scorer):
             stats=RetryStats(),
         )
 
+    def prompts(self, case: Case, output: str) -> list[str]:
+        """The user messages the judge sends for one case (two in pairwise mode)."""
+        task = f"<task>\n{_text(case.input)}\n</task>"
+        if self.mode == "rubric":
+            parts = [task]
+            if case.expected is not None:
+                parts.append(f"<reference>\n{_text(case.expected)}\n</reference>")
+            parts.append(f"<response>\n{output}\n</response>")
+            return ["\n\n".join(parts)]
+        reference = _text(case.expected)
+
+        def pair(a: str, b: str) -> str:
+            return f"{task}\n\n<response_a>\n{a}\n</response_a>\n\n<response_b>\n{b}\n</response_b>"
+
+        return [pair(output, reference), pair(reference, output)]
+
     async def _rubric(self, case: Case, output: str) -> Judgement:
-        parts = [f"<task>\n{_text(case.input)}\n</task>"]
-        if case.expected is not None:
-            parts.append(f"<reference>\n{_text(case.expected)}\n</reference>")
-        parts.append(f"<response>\n{output}\n</response>")
+        (prompt,) = self.prompts(case, output)
         try:
-            completion = await self._call("\n\n".join(parts), RUBRIC_SCHEMA)
+            completion = await self._call(prompt, RUBRIC_SCHEMA)
         except TargetError as exc:
             return Judgement(None, None, f"judge call failed: {exc.message}")
         usage = completion.usage
@@ -216,16 +229,11 @@ class LLMJudge(Scorer):
     async def _pairwise(self, case: Case, output: str) -> Judgement:
         if case.expected is None:
             return Judgement(None, None, "pairwise judging needs a reference answer")
-        task = f"<task>\n{_text(case.input)}\n</task>"
-        reference = _text(case.expected)
-
-        def prompt(a: str, b: str) -> str:
-            return f"{task}\n\n<response_a>\n{a}\n</response_a>\n\n<response_b>\n{b}\n</response_b>"
-
+        a_first_prompt, b_first_prompt = self.prompts(case, output)
         try:
             first, second = await asyncio.gather(
-                self._call(prompt(output, reference), PAIRWISE_SCHEMA),
-                self._call(prompt(reference, output), PAIRWISE_SCHEMA),
+                self._call(a_first_prompt, PAIRWISE_SCHEMA),
+                self._call(b_first_prompt, PAIRWISE_SCHEMA),
             )
         except TargetError as exc:
             return Judgement(None, None, f"judge call failed: {exc.message}")
