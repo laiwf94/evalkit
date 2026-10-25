@@ -11,6 +11,7 @@ a silent precedence rule.
     EVALKIT_MAX_BODY_BYTES      request body cap for the API (default 16 MiB)
     EVALKIT_MAX_ACTIVE_RUNS     runs the API executes at once (default 2)
     EVALKIT_LOG_LEVEL           DEBUG, INFO, WARNING or ERROR (default INFO)
+    EVALKIT_LEASE_SECONDS       seconds before a dead runner's run can be resumed (default 30)
     EVALKIT_REDACTION_FILE      TOML file with a [redaction] table (default: all built-ins on)
     EVALKIT_PRICES_FILE         TOML [prices.<model>] tables overriding the built-in prices
     EVALKIT_HTTP_TARGETS_FILE   TOML [endpoints.<name>] tables: the only URLs HTTP targets may call
@@ -55,6 +56,7 @@ class Settings(BaseModel):
     max_body_bytes: int = Field(default=16 * 1024 * 1024, ge=1024, le=256 * 1024 * 1024)
     max_active_runs: int = Field(default=2, ge=1, le=64)
     log_level: LogLevel = "INFO"
+    lease_seconds: float = Field(default=30.0, ge=2, le=3600)
     anthropic_api_key: SecretStr | None = None
     redaction: RedactionConfig = RedactionConfig()
     prices: dict[str, ModelPrice] = Field(default_factory=dict)
@@ -91,6 +93,7 @@ class Settings(BaseModel):
             "EVALKIT_MAX_BODY_BYTES": "max_body_bytes",
             "EVALKIT_MAX_ACTIVE_RUNS": "max_active_runs",
             "EVALKIT_LOG_LEVEL": "log_level",
+            "EVALKIT_LEASE_SECONDS": "lease_seconds",
         }
         for var, field in plain.items():
             raw = env.get(var, "").strip()

@@ -60,8 +60,6 @@ from evalkit.targets.prompt import PromptTarget
 
 log = logging.getLogger(__name__)
 
-LEASE_TTL = timedelta(seconds=30)
-HEARTBEAT_SECONDS = 10.0
 WRITE_BATCH = 50
 WRITE_LINGER_SECONDS = 0.2
 MAX_ERROR_CHARS = 2000
@@ -170,8 +168,8 @@ class Runner:
         owner: str | None = None,
         allow_import_paths: bool = False,
         target_factory: Callable[[Any], Target] | None = None,
-        lease_ttl: timedelta = LEASE_TTL,
-        heartbeat_seconds: float = HEARTBEAT_SECONDS,
+        lease_ttl: timedelta | None = None,
+        heartbeat_seconds: float | None = None,
     ) -> None:
         self.sessions = sessions
         self.settings = settings
@@ -181,8 +179,9 @@ class Runner:
         self.allow_import_paths = allow_import_paths
         self.redactor = Redactor(settings.redaction)
         self._target_factory = target_factory
-        self.lease_ttl = lease_ttl
-        self.heartbeat_seconds = heartbeat_seconds
+        self.lease_ttl = lease_ttl or timedelta(seconds=settings.lease_seconds)
+        # Renew well before expiry so one slow database round trip cannot lose the lease.
+        self.heartbeat_seconds = heartbeat_seconds or self.lease_ttl.total_seconds() / 3
 
     def create_run(self, config: RunConfig) -> Run:
         """Validate ``config`` against the stored dataset and record a pending run."""
