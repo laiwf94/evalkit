@@ -8,13 +8,14 @@ The redaction fingerprint is there because the cache stores redacted text.
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import Iterable, Sequence
 from typing import Any
 
 from sqlalchemy import select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, sessionmaker
 
 from evalkit.datasets import canonical_json, sha256_hex
 from evalkit.db.models import CachedResponse
@@ -45,3 +46,34 @@ def store(session: Session, rows: Iterable[dict[str, Any]]) -> None:
     session.execute(
         insert(CachedResponse).values(values).on_conflict_do_nothing(index_elements=["key"])
     )
+
+
+class VerdictStore:
+    """Judge answers in the response cache table, keyed by the judge's own hash."""
+
+    def __init__(self, sessions: sessionmaker[Session]) -> None:
+        self.sessions = sessions
+
+    async def get(self, key: str) -> str | None:
+        def load() -> str | None:
+            with self.sessions() as session:
+                row = session.get(CachedResponse, key)
+                return row.output if row is not None else None
+
+        return await asyncio.to_thread(load)
+
+    async def put(self, key: str, judge_hash: str, text: str, usage: dict[str, Any]) -> None:
+        entry = {
+            "key": key,
+            "target_hash": judge_hash,
+            "output": text,
+            "stop_reason": "end_turn",
+            "usage": usage,
+        }
+
+        def save() -> None:
+            with self.sessions() as session:
+                store(session, [entry])
+                session.commit()
+
+        await asyncio.to_thread(save)

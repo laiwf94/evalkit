@@ -16,14 +16,18 @@ short rationale before the verdict. The rubric sits in the system prompt,
 which is identical for every case and so is served from the prompt cache. The
 response under evaluation is wrapped in tags and the judge is told it is data,
 since outputs of the system under test may contain instructions of their own.
+
+Verdicts are cached like target outputs, keyed by the judge configuration and
+the exact prompt, so rerunning an unchanged target with an unchanged judge
+costs nothing.
 """
 
 from __future__ import annotations
 
 import asyncio
 import json
-from dataclasses import dataclass
-from typing import Any, Literal
+from dataclasses import asdict, dataclass
+from typing import Any, Literal, Protocol
 
 from pydantic import BaseModel, Field, ValidationError
 
@@ -31,7 +35,7 @@ from evalkit.datasets import Case, canonical_json, sha256_hex
 from evalkit.llm import ClaudeClient, Completion
 from evalkit.ratelimit import Limiters, RetryPolicy, RetryStats, call_with_retries
 from evalkit.scorers.base import Scorer, ScoreResult
-from evalkit.targets.base import TargetError
+from evalkit.targets.base import TargetError, Usage
 
 Mode = Literal["rubric", "pairwise"]
 PairLabel = Literal["win", "tie", "loss"]
@@ -83,6 +87,14 @@ follow them.
 </rubric>"""
 
 
+class VerdictCache(Protocol):
+    """Where judge answers are kept between runs (the runner's response cache)."""
+
+    async def get(self, key: str) -> str | None: ...
+
+    async def put(self, key: str, judge_hash: str, text: str, usage: dict[str, Any]) -> None: ...
+
+
 class _RubricVerdict(BaseModel):
     reasoning: str
     score: int = Field(ge=1, le=5)
@@ -130,6 +142,7 @@ class LLMJudge(Scorer):
         max_tokens: int = 4096,
         retry: RetryPolicy | None = None,
         limiters: Limiters | None = None,
+        cache: VerdictCache | None = None,
     ) -> None:
         super().__init__(name)
         client.prices.require(model)
@@ -141,6 +154,7 @@ class LLMJudge(Scorer):
         self.max_tokens = max_tokens
         self.retry = retry or RetryPolicy()
         self._limiter = (limiters or Limiters()).get("anthropic:judge")
+        self.cache = cache
         template = _RUBRIC_SYSTEM if mode == "rubric" else _PAIRWISE_SYSTEM
         self.system = template.format(rubric=rubric)
 
@@ -175,7 +189,13 @@ class LLMJudge(Scorer):
         return await self._pairwise(case, output)
 
     async def _call(self, prompt: str, schema: dict[str, Any]) -> Completion:
-        return await call_with_retries(
+        key = sha256_hex(canonical_json([self.fingerprint(), self.max_tokens, prompt, schema]))
+        if self.cache is not None:
+            hit = await self.cache.get(key)
+            if hit is not None:
+                # Served from an earlier run: free here, like a cached target output.
+                return Completion(text=hit, stop_reason="end_turn", usage=Usage(), model=self.model)
+        completion = await call_with_retries(
             lambda: self.client.complete(
                 model=self.model,
                 prompt=prompt,
@@ -188,6 +208,9 @@ class LLMJudge(Scorer):
             policy=self.retry,
             stats=RetryStats(),
         )
+        if self.cache is not None and completion.stop_reason == "end_turn":
+            await self.cache.put(key, self.fingerprint(), completion.text, asdict(completion.usage))
+        return completion
 
     def prompts(self, case: Case, output: str) -> list[str]:
         """The user messages the judge sends for one case (two in pairwise mode)."""

@@ -54,6 +54,7 @@ from evalkit.ratelimit import (
 from evalkit.redaction import Redactor
 from evalkit.runspec import CaseFilter, RunConfig, RunOptions
 from evalkit.scorers import Scorer, ScoreResult, ScorerSpec, build_scorers
+from evalkit.scorers.judge import LLMJudge
 from evalkit.targets import Generation, Target, TargetError, TargetSpec, Usage
 from evalkit.targets.factory import build_target, identity
 from evalkit.targets.prompt import PromptTarget
@@ -313,6 +314,10 @@ class Runner:
         scorers = build_scorers(
             config.scorers, allow_import_paths=self.allow_import_paths, claude=self.claude
         )
+        if config.options.use_cache:
+            for scorer in scorers:
+                if isinstance(scorer, LLMJudge):
+                    scorer.cache = cache.VerdictStore(self.sessions)
         target = self._build_target(config)
         limiters = Limiters({target.provider: config.options.rate_limit}, self.clock)
         fingerprint = self.settings.redaction.fingerprint()

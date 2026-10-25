@@ -82,7 +82,10 @@ is that a crashed run waits up to one lease length before it can be resumed.
 **Response cache.** Outputs are cached after redaction, keyed by (target hash,
 canonical input, redaction fingerprint). Cache hits cost nothing in the new run;
 the original usage stays on the cache row. Errors are never cached, and neither
-is an output whose redaction timed out, so a rerun retries both.
+is an output whose redaction timed out, so a rerun retries both. Judge verdicts
+go in the same table, keyed by the judge configuration and the exact prompt, so
+a rerun of an unchanged target with an unchanged judge makes no API calls at
+all. `use_cache = false` turns both off.
 
 **Rate limits and retries.** Each provider (the Claude API, each HTTP endpoint,
 the judge) has a token bucket. When any call gets a Retry-After, the whole

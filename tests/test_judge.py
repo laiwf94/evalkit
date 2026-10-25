@@ -277,3 +277,33 @@ def test_pair_label() -> None:
         "win",
         "win",
     ]
+
+
+class MemoryCache:
+    def __init__(self) -> None:
+        self.data: dict[str, str] = {}
+
+    async def get(self, key: str) -> str | None:
+        return self.data.get(key)
+
+    async def put(self, key: str, judge_hash: str, text: str, usage: dict[str, Any]) -> None:
+        self.data[key] = text
+
+
+def test_verdicts_are_cached_and_free_on_reuse() -> None:
+    fake = FakeAnthropic(
+        reply({"reasoning": "ok", "score": 4}),
+        json_reply(message("", stop_reason="refusal")),
+        json_reply(message("", stop_reason="refusal")),
+    )
+    j = judge(fake)
+    j.cache = MemoryCache()
+    first = asyncio.run(j.score(CASE, "Paris"))
+    again = asyncio.run(j.score(CASE, "Paris"))
+    assert len(fake.requests) == 1
+    assert (first.value, again.value) == (0.75, 0.75)
+    assert again.cost_usd == 0.0
+    # Refusals are not cached: the next run asks again.
+    asyncio.run(j.score(CASE, "Lyon"))
+    asyncio.run(j.score(CASE, "Lyon"))
+    assert len(fake.requests) == 3

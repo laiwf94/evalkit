@@ -490,3 +490,28 @@ def test_interrupt_saves_queued_results(sessions: sessionmaker[Session], dataset
 
     asyncio.run(main())
     assert result_count(sessions, run.id) == 2
+
+
+def test_judge_verdicts_are_cached_across_runs(
+    sessions: sessionmaker[Session], dataset: str
+) -> None:
+    import json as _json
+
+    from tests.fake_anthropic import FakeAnthropic, json_reply, message
+
+    fake = FakeAnthropic()
+    fake.default = lambda body: json_reply(message(_json.dumps({"reasoning": "r", "score": 5})))
+    r = Runner(sessions, Settings(), claude=fake.client())
+    scorers = [{"type": "judge", "rubric": "be right"}]
+    first = r.create_run(config(scorers=scorers, filter={"split": "test"}))
+    asyncio.run(r.execute(first.id))
+    calls = len(fake.requests)
+    second = r.create_run(config(scorers=scorers, filter={"split": "test"}))
+    asyncio.run(r.execute(second.id))
+    assert calls == 20
+    assert len(fake.requests) == 20
+    with sessions() as s:
+        a, b = summarize(s, first.id, resamples=200), summarize(s, second.id, resamples=200)
+    assert a.judge_cost_usd > 0
+    assert b.judge_cost_usd == 0.0
+    assert b.metrics[0].mean == a.metrics[0].mean == 1.0
