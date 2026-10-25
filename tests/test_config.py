@@ -108,3 +108,34 @@ def test_secret_file_problems(tmp_path: Path) -> None:
 def test_unset_secret_is_none() -> None:
     assert read_secret({}, "K") is None
     assert read_secret({"K": "  "}, "K") is None
+
+
+def test_redaction_file(tmp_path: Path) -> None:
+    f = tmp_path / "redaction.toml"
+    f.write_text(
+        '[redaction]\nbuiltins = ["email"]\n'
+        '[[redaction.patterns]]\nname = "TICKET"\npattern = "TCK-\\\\d+"\n'
+    )
+    s = Settings.from_env({"EVALKIT_REDACTION_FILE": str(f)})
+    assert s.redaction.builtins == ("email",)
+    assert s.redaction.patterns[0].name == "TICKET"
+
+
+@pytest.mark.parametrize(
+    ("content", "message"),
+    [
+        ("not toml [", "not valid TOML"),
+        ("[other]\nx = 1\n", r"no \[redaction\] table"),
+        ('[redaction]\nbuiltins = ["dob"]\n', "invalid configuration"),
+    ],
+)
+def test_bad_redaction_file(tmp_path: Path, content: str, message: str) -> None:
+    f = tmp_path / "r.toml"
+    f.write_text(content)
+    with pytest.raises(ConfigError, match=message):
+        Settings.from_env({"EVALKIT_REDACTION_FILE": str(f)})
+
+
+def test_missing_redaction_file(tmp_path: Path) -> None:
+    with pytest.raises(ConfigError, match="cannot read"):
+        Settings.from_env({"EVALKIT_REDACTION_FILE": str(tmp_path / "none.toml")})

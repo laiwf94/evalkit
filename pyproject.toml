@@ -11,6 +11,7 @@ dependencies = [
     "alembic==1.20.0",
     "psycopg[binary]==3.3.6",
     "pydantic==2.14.0",
+    "regex==2026.9.29",
     "sqlalchemy==2.1.4",
 ]
 
@@ -25,6 +26,7 @@ dev = [
     "ruff==0.17.0",
     "mypy==2.4.0",
     "pip-audit==2.10.1",
+    "types-regex==2026.9.29.20261005",
 ]
 
 [build-system]

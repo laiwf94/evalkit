@@ -11,6 +11,7 @@ a silent precedence rule.
     EVALKIT_MAX_BODY_BYTES      request body cap for the API (default 16 MiB)
     EVALKIT_MAX_ACTIVE_RUNS     runs the API executes at once (default 2)
     EVALKIT_LOG_LEVEL           DEBUG, INFO, WARNING or ERROR (default INFO)
+    EVALKIT_REDACTION_FILE      TOML file with a [redaction] table (default: all built-ins on)
     ANTHROPIC_API_KEY           Claude API key (secret)
 """
 
@@ -19,11 +20,14 @@ from __future__ import annotations
 import hashlib
 import ipaddress
 import os
+import tomllib
 from collections.abc import Mapping
 from pathlib import Path
 from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, SecretStr, ValidationError
+
+from evalkit.redaction import RedactionConfig
 
 LogLevel = Literal["DEBUG", "INFO", "WARNING", "ERROR"]
 
@@ -46,6 +50,7 @@ class Settings(BaseModel):
     max_active_runs: int = Field(default=2, ge=1, le=64)
     log_level: LogLevel = "INFO"
     anthropic_api_key: SecretStr | None = None
+    redaction: RedactionConfig = RedactionConfig()
 
     @property
     def auth_enabled(self) -> bool:
@@ -88,6 +93,10 @@ class Settings(BaseModel):
         if key is not None:
             values["anthropic_api_key"] = SecretStr(key)
 
+        redaction_file = env.get("EVALKIT_REDACTION_FILE", "").strip()
+        if redaction_file:
+            values["redaction"] = load_toml_table(redaction_file, "redaction")
+
         try:
             return cls.model_validate(values)
         except ValidationError as exc:
@@ -95,6 +104,20 @@ class Settings(BaseModel):
                 f"{'.'.join(str(p) for p in e['loc'])}: {e['msg']}" for e in exc.errors()
             )
             raise ConfigError(f"invalid configuration: {problems}") from None
+
+
+def load_toml_table(path: str, table: str) -> dict[str, object]:
+    try:
+        with Path(path).open("rb") as fh:
+            data = tomllib.load(fh)
+    except OSError as exc:
+        raise ConfigError(f"cannot read {path}: {exc.strerror}") from None
+    except tomllib.TOMLDecodeError as exc:
+        raise ConfigError(f"{path} is not valid TOML: {exc}") from None
+    section = data.get(table)
+    if not isinstance(section, dict):
+        raise ConfigError(f"{path} has no [{table}] table")
+    return section
 
 
 def read_secret(env: Mapping[str, str], name: str) -> str | None:
