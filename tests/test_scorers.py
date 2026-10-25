@@ -77,6 +77,7 @@ def test_json_schema_match() -> None:
     assert detail.startswith("age:")
     assert run(s, case(), "{}")[1].startswith("(root):")
     assert run(s, case(), "not json")[1].startswith("not JSON")
+    assert run(s, case(), "[" * 200_000)[1].startswith("not JSON")
     per_case = JsonSchemaMatch("j")
     assert run(per_case, case(SCHEMA), '{"name": "x"}')[0] == 1.0
     assert run(per_case, case("nope"), "{}")[1] == "case has no expected schema"

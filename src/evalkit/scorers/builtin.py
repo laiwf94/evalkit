@@ -124,7 +124,7 @@ class JsonSchemaMatch(Scorer):
         text = fenced.group(1) if fenced else output
         try:
             document = json.loads(text)
-        except ValueError as exc:
+        except (ValueError, RecursionError) as exc:
             return ScoreResult.passed(ok=False, detail=_short(f"not JSON: {exc}"))
         try:
             error = next(iter(validator.iter_errors(document)), None)

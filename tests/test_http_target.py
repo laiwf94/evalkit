@@ -183,6 +183,7 @@ def test_resolution_failures_are_retryable() -> None:
         (httpx2.Response(408), "returned 408", True, None),
         (httpx2.Response(404), "returned 404", False, None),
         (httpx2.Response(200, content=b"<html>"), "did not return JSON", False, None),
+        (httpx2.Response(200, content=b"[" * 200_000), "did not return JSON", False, None),
         (httpx2.Response(200, json={"answer": "x"}), "no field 'output'", False, None),
         (httpx2.Response(200, json=["output"]), "no field 'output'", False, None),
     ],

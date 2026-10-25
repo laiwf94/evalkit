@@ -215,7 +215,7 @@ class HttpTarget(Target):
     def _extract(self, response: httpx2.Response, body: bytes) -> str:
         try:
             document = json.loads(body)
-        except ValueError:
+        except (ValueError, RecursionError):
             raise TargetError(
                 f"endpoint {self.spec.endpoint!r} did not return JSON "
                 f"(content-type {response.headers.get('content-type', 'missing')})",
