@@ -13,6 +13,7 @@ a silent precedence rule.
     EVALKIT_LOG_LEVEL           DEBUG, INFO, WARNING or ERROR (default INFO)
     EVALKIT_REDACTION_FILE      TOML file with a [redaction] table (default: all built-ins on)
     EVALKIT_PRICES_FILE         TOML [prices.<model>] tables overriding the built-in prices
+    EVALKIT_HTTP_TARGETS_FILE   TOML [endpoints.<name>] tables: the only URLs HTTP targets may call
     ANTHROPIC_API_KEY           Claude API key (secret)
 """
 
@@ -21,6 +22,7 @@ from __future__ import annotations
 import hashlib
 import ipaddress
 import os
+import re
 import tomllib
 from collections.abc import Mapping
 from pathlib import Path
@@ -30,10 +32,12 @@ from pydantic import BaseModel, ConfigDict, Field, SecretStr, ValidationError
 
 from evalkit.pricing import ModelPrice
 from evalkit.redaction import RedactionConfig
+from evalkit.targets.http import HttpEndpoint
 
 LogLevel = Literal["DEBUG", "INFO", "WARNING", "ERROR"]
 
 MIN_TOKEN_LENGTH = 16
+ENDPOINT_NAME = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
 MAX_SECRET_FILE_BYTES = 64 * 1024
 
 
@@ -54,6 +58,7 @@ class Settings(BaseModel):
     anthropic_api_key: SecretStr | None = None
     redaction: RedactionConfig = RedactionConfig()
     prices: dict[str, ModelPrice] = Field(default_factory=dict)
+    http_endpoints: dict[str, HttpEndpoint] = Field(default_factory=dict)
 
     @property
     def auth_enabled(self) -> bool:
@@ -70,7 +75,10 @@ class Settings(BaseModel):
 
     def secret_values(self) -> list[str]:
         """Raw secret strings the log scrubber must never let through."""
-        return [self.anthropic_api_key.get_secret_value()] if self.anthropic_api_key else []
+        values = [self.anthropic_api_key.get_secret_value()] if self.anthropic_api_key else []
+        for endpoint in self.http_endpoints.values():
+            values.extend(v.get_secret_value() for v in endpoint.secret_headers.values())
+        return values
 
     @classmethod
     def from_env(cls, env: Mapping[str, str] | None = None) -> Settings:
@@ -102,6 +110,9 @@ class Settings(BaseModel):
         prices_file = env.get("EVALKIT_PRICES_FILE", "").strip()
         if prices_file:
             values["prices"] = load_toml_table(prices_file, "prices")
+        endpoints_file = env.get("EVALKIT_HTTP_TARGETS_FILE", "").strip()
+        if endpoints_file:
+            values["http_endpoints"] = _endpoints(env, load_toml_table(endpoints_file, "endpoints"))
 
         try:
             return cls.model_validate(values)
@@ -146,6 +157,29 @@ def read_secret(env: Mapping[str, str], name: str) -> str | None:
             raise ConfigError(f"{name}_FILE {path} is empty")
         return content
     return direct or None
+
+
+def _endpoints(env: Mapping[str, str], table: dict[str, object]) -> dict[str, object]:
+    """Endpoint configs with ``secret_headers`` resolved from the variables they name."""
+    out: dict[str, object] = {}
+    for name, raw in table.items():
+        if not ENDPOINT_NAME.fullmatch(name):
+            raise ConfigError(f"endpoint name {name!r} must match {ENDPOINT_NAME.pattern}")
+        if not isinstance(raw, dict):
+            raise ConfigError(f"endpoints.{name} must be a table")
+        endpoint = dict(raw)
+        secret_vars = endpoint.get("secret_headers", {})
+        if not isinstance(secret_vars, dict):
+            raise ConfigError(f"endpoints.{name}.secret_headers must map header names to variables")
+        resolved = {}
+        for header, var in secret_vars.items():
+            value = read_secret(env, str(var))
+            if value is None:
+                raise ConfigError(f"endpoints.{name}: header {header} needs {var} or {var}_FILE")
+            resolved[header] = value
+        endpoint["secret_headers"] = resolved
+        out[name] = endpoint
+    return out
 
 
 def _token_digests(raw: str) -> tuple[bytes, ...]:
