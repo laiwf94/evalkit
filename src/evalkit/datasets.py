@@ -77,7 +77,10 @@ def content_hash(cases: Iterable[Case]) -> str:
 
 def parse_jsonl(data: bytes | str, max_cases: int = MAX_CASES) -> list[Case]:
     """Parse JSONL into cases. Errors name the 1-based line."""
-    text = data.decode("utf-8") if isinstance(data, bytes) else data
+    try:
+        text = data.decode("utf-8") if isinstance(data, bytes) else data
+    except UnicodeDecodeError as exc:
+        raise InvalidInputError(f"dataset is not UTF-8 (byte {exc.start})") from None
     cases: list[Case] = []
     seen: dict[str, int] = {}
     for number, line in enumerate(text.splitlines(), start=1):

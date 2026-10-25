@@ -240,3 +240,8 @@ def test_version_allocation_gives_up_after_repeated_conflicts(
         monkeypatch.setattr(Session, "commit", always_conflict)
         with pytest.raises(InvalidInputError, match="could not allocate"):
             import_dataset(s, "qa", parse_jsonl(SAMPLE))
+
+
+def test_non_utf8_is_rejected() -> None:
+    with pytest.raises(InvalidInputError, match=r"not UTF-8 \(byte 8\)"):
+        parse_jsonl(b'{"id": "\xff"}')

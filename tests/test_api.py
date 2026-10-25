@@ -96,6 +96,8 @@ async def test_dataset_endpoints(client: httpx2.AsyncClient) -> None:
         "request_id": bad.headers["x-request-id"],
     }
     assert (await client.post("/v1/datasets/-bad", content=CASES, headers=AUTH)).status_code == 400
+    latin1 = await client.post("/v1/datasets/qa", content=b"\xff\xfe", headers=AUTH)
+    assert latin1.status_code == 400
     listing = (await client.get("/v1/datasets", headers=AUTH)).json()
     assert [d["name"] for d in listing["datasets"]] == ["qa"]
     version = await client.get("/v1/datasets/qa/versions/1", headers=AUTH)
