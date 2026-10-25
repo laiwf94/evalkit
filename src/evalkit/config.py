@@ -12,6 +12,7 @@ a silent precedence rule.
     EVALKIT_MAX_ACTIVE_RUNS     runs the API executes at once (default 2)
     EVALKIT_LOG_LEVEL           DEBUG, INFO, WARNING or ERROR (default INFO)
     EVALKIT_REDACTION_FILE      TOML file with a [redaction] table (default: all built-ins on)
+    EVALKIT_PRICES_FILE         TOML [prices.<model>] tables overriding the built-in prices
     ANTHROPIC_API_KEY           Claude API key (secret)
 """
 
@@ -27,6 +28,7 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, SecretStr, ValidationError
 
+from evalkit.pricing import ModelPrice
 from evalkit.redaction import RedactionConfig
 
 LogLevel = Literal["DEBUG", "INFO", "WARNING", "ERROR"]
@@ -51,6 +53,7 @@ class Settings(BaseModel):
     log_level: LogLevel = "INFO"
     anthropic_api_key: SecretStr | None = None
     redaction: RedactionConfig = RedactionConfig()
+    prices: dict[str, ModelPrice] = Field(default_factory=dict)
 
     @property
     def auth_enabled(self) -> bool:
@@ -96,6 +99,9 @@ class Settings(BaseModel):
         redaction_file = env.get("EVALKIT_REDACTION_FILE", "").strip()
         if redaction_file:
             values["redaction"] = load_toml_table(redaction_file, "redaction")
+        prices_file = env.get("EVALKIT_PRICES_FILE", "").strip()
+        if prices_file:
+            values["prices"] = load_toml_table(prices_file, "prices")
 
         try:
             return cls.model_validate(values)
