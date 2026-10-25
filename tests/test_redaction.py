@@ -26,7 +26,7 @@ R = Redactor()
         ("card 4111-1111-1111-1111", "card [CARD]", "CARD"),
         ("ssn 123-45-6789", "ssn [SSN]", "SSN"),
         ("key sk-ant-api03-abcdefgh_ijk", "key [CREDENTIAL]", "CREDENTIAL"),
-        ("aws AKIAIOSFODNN7EXAMPLE", "aws [CREDENTIAL]", "CREDENTIAL"),
+        ("key AKIAIOSFODNN7EXAMPLE", "key [CREDENTIAL]", "CREDENTIAL"),
         ("jwt eyJhbGciOiJI.eyJzdWIiOiIx.SflKxwRJSMeKKF2QT4", "jwt [CREDENTIAL]", "CREDENTIAL"),
         (
             "-----BEGIN RSA PRIVATE KEY-----\nMIIabc\n-----END RSA PRIVATE KEY-----",
