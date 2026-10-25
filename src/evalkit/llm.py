@@ -19,7 +19,9 @@ so request shape, refusal handling, usage and cost are decided once:
 
 from __future__ import annotations
 
+import contextlib
 import json
+from collections.abc import AsyncIterator
 from dataclasses import dataclass
 from typing import Any
 
@@ -125,18 +127,12 @@ class ClaudeClient:
         if fallbacks and model in FALLBACK_MODELS:
             params["betas"] = [FALLBACK_BETA]
             params["fallbacks"] = "default"
-        try:
+        async with _mapped_errors():
             if max_tokens > STREAMING_THRESHOLD:
                 async with self._client.beta.messages.stream(**params) as stream:
                     message = await stream.get_final_message()
             else:
                 message = await self._client.beta.messages.create(**params)
-        except anthropic.APIStatusError as exc:
-            raise _status_error(exc) from None
-        except anthropic.APITimeoutError:
-            raise TargetError("Claude API request timed out", retryable=True) from None
-        except anthropic.APIConnectionError as exc:
-            raise TargetError(f"cannot reach the Claude API: {exc}", retryable=True) from None
         return self.completion_from_message(message, requested_model=model)
 
     def completion_from_message(
@@ -178,6 +174,21 @@ class ClaudeClient:
             cost,
         )
 
+    async def create_batch(self, requests: list[dict[str, Any]]) -> Any:
+        """Submit Messages requests as one Message Batch (half price, results within 24 h)."""
+        async with _mapped_errors():
+            return await self._client.messages.batches.create(requests=requests)  # type: ignore[arg-type]
+
+    async def get_batch(self, batch_id: str) -> Any:
+        async with _mapped_errors():
+            return await self._client.messages.batches.retrieve(batch_id)
+
+    async def batch_results(self, batch_id: str) -> list[Any]:
+        """All result entries of an ended batch. Results arrive in any order; match on custom_id."""
+        async with _mapped_errors():
+            decoder = await self._client.messages.batches.results(batch_id)
+            return [entry async for entry in decoder]
+
     async def count_tokens(self, *, model: str, prompt: str, system: str = "") -> int:
         self.prices.require(model)
         params: dict[str, Any] = {
@@ -186,16 +197,25 @@ class ClaudeClient:
         }
         if system:
             params["system"] = system
-        try:
+        async with _mapped_errors():
             result = await self._client.messages.count_tokens(**params)
-        except anthropic.APIStatusError as exc:
-            raise _status_error(exc) from None
-        except anthropic.APIConnectionError as exc:
-            raise TargetError(f"cannot reach the Claude API: {exc}", retryable=True) from None
         return int(result.input_tokens)
 
     async def aclose(self) -> None:
         await self._client.close()
+
+
+@contextlib.asynccontextmanager
+async def _mapped_errors() -> AsyncIterator[None]:
+    """Turn SDK exceptions into TargetErrors that the retry policy understands."""
+    try:
+        yield
+    except anthropic.APIStatusError as exc:
+        raise _status_error(exc) from None
+    except anthropic.APITimeoutError:
+        raise TargetError("Claude API request timed out", retryable=True) from None
+    except anthropic.APIConnectionError as exc:
+        raise TargetError(f"cannot reach the Claude API: {exc}", retryable=True) from None
 
 
 def _counts(usage: Any) -> TokenCounts:

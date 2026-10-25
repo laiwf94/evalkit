@@ -18,6 +18,7 @@ How a run stays correct when it is killed at any point:
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import logging
 import math
 import os
@@ -55,6 +56,7 @@ from evalkit.runspec import CaseFilter, RunConfig, RunOptions
 from evalkit.scorers import Scorer, ScoreResult, ScorerSpec, build_scorers
 from evalkit.targets import Generation, Target, TargetError, TargetSpec, Usage
 from evalkit.targets.factory import build_target, identity
+from evalkit.targets.prompt import PromptTarget
 
 log = logging.getLogger(__name__)
 
@@ -127,6 +129,12 @@ class ExecutionReport:
     cached: int
     errors: int
     skipped: int
+    batched: int = 0
+
+
+def batch_custom_id(case_id: str) -> str:
+    """Batch custom ids allow only [A-Za-z0-9_-]{1,64}; case ids allow more."""
+    return "c" + hashlib.sha256(case_id.encode()).hexdigest()[:40]
 
 
 def new_owner_id() -> str:
@@ -226,38 +234,10 @@ class Runner:
             return report
 
     async def _execute_claimed(self, run: Run) -> ExecutionReport:
-        config = StoredRun.from_row(run)
-        cases, done = await asyncio.to_thread(self._load_cases, run, config)
-        pending = [c for c in cases if c.id not in done]
-        scorers = build_scorers(config.scorers, allow_import_paths=self.allow_import_paths)
-        target = self._build_target(config)
-        limiter = Limiters({target.provider: config.options.rate_limit}, self.clock).get(
-            target.provider
-        )
-        fingerprint = self.settings.redaction.fingerprint()
-        keys = {c.id: cache.cache_key(run.target_hash, c.input, fingerprint) for c in pending}
-        hits: dict[str, Any] = {}
-        if config.options.use_cache and pending:
-            hits = await asyncio.to_thread(self._cache_lookup, list(keys.values()))
-        log.info(
-            "run started",
-            extra={"cases": len(cases), "already_done": len(done), "cache_hits": len(hits)},
-        )
-
+        ctx, pending, done, keys, hits = await self._prepare(run)
         results: asyncio.Queue[CaseResult | None] = asyncio.Queue(maxsize=WRITE_BATCH * 4)
         work: asyncio.Queue[Case] = asyncio.Queue()
-        for c in pending:
-            work.put_nowait(c)
-        counts = {"executed": 0, "cached": 0, "errors": 0}
-        ctx = _Context(
-            run_id=run.id,
-            target_hash=run.target_hash,
-            config=config,
-            target=target,
-            scorers=scorers,
-            limiter=limiter,
-            rng=random.Random(run.seed),  # noqa: S311 - retry jitter
-        )
+        counts = {"executed": 0, "cached": 0, "errors": 0, "batched": 0}
 
         async def worker() -> None:
             while True:
@@ -267,7 +247,7 @@ class Runner:
                     return
                 hit = hits.get(keys[case.id])
                 if hit is not None:
-                    result = await self._from_cache(case, hit, scorers)
+                    result = await self._from_cache(case, hit, ctx.scorers)
                     counts["cached"] += 1
                 else:
                     result = await self._run_case(ctx, case, keys[case.id])
@@ -280,8 +260,19 @@ class Runner:
             async with asyncio.TaskGroup() as group:
                 writer = group.create_task(self._writer(run.id, results, unsaved))
                 heartbeat = group.create_task(self._heartbeat(run.id))
-                workers = [group.create_task(worker()) for _ in range(config.options.concurrency)]
-                await asyncio.gather(*workers)
+                handled: set[str] = set()
+                if ctx.config.options.mode == "batch":
+                    uncached = [c for c in pending if keys[c.id] not in hits]
+                    handled, failed = await self._run_batch(
+                        ctx, run.batch_id, uncached, keys, results
+                    )
+                    counts["batched"] = len(handled) - failed
+                    counts["errors"] += failed
+                for c in pending:
+                    if c.id not in handled:
+                        work.put_nowait(c)
+                concurrency = ctx.config.options.concurrency
+                await asyncio.gather(*(group.create_task(worker()) for _ in range(concurrency)))
                 await results.put(None)
                 await writer
                 heartbeat.cancel()
@@ -292,10 +283,45 @@ class Runner:
             await self._save_unwritten(run.id, results, unsaved)
             raise
         finally:
-            await target.aclose()
+            await ctx.target.aclose()
         return ExecutionReport(
-            run.id, "completed", counts["executed"], counts["cached"], counts["errors"], len(done)
+            run.id,
+            "completed",
+            counts["executed"],
+            counts["cached"],
+            counts["errors"],
+            len(done),
+            counts["batched"],
         )
+
+    async def _prepare(
+        self, run: Run
+    ) -> tuple[_Context, list[Case], set[str], dict[str, str], dict[str, Any]]:
+        config = StoredRun.from_row(run)
+        cases, done = await asyncio.to_thread(self._load_cases, run, config)
+        pending = [c for c in cases if c.id not in done]
+        scorers = build_scorers(config.scorers, allow_import_paths=self.allow_import_paths)
+        target = self._build_target(config)
+        limiters = Limiters({target.provider: config.options.rate_limit}, self.clock)
+        fingerprint = self.settings.redaction.fingerprint()
+        keys = {c.id: cache.cache_key(run.target_hash, c.input, fingerprint) for c in pending}
+        hits: dict[str, Any] = {}
+        if config.options.use_cache and pending:
+            hits = await asyncio.to_thread(self._cache_lookup, list(keys.values()))
+        log.info(
+            "run started",
+            extra={"cases": len(cases), "already_done": len(done), "cache_hits": len(hits)},
+        )
+        ctx = _Context(
+            run_id=run.id,
+            target_hash=run.target_hash,
+            config=config,
+            target=target,
+            scorers=scorers,
+            limiter=limiters.get(target.provider),
+            rng=random.Random(run.seed),  # noqa: S311 - retry jitter
+        )
+        return ctx, pending, done, keys, hits
 
     async def _save_unwritten(
         self, run_id: str, queue: asyncio.Queue[CaseResult | None], unsaved: list[CaseResult]
@@ -308,6 +334,84 @@ class Runner:
                 unsaved.append(item)
         if unsaved:
             await asyncio.shield(asyncio.to_thread(self._write, run_id, list(unsaved)))
+
+    async def _run_batch(
+        self,
+        ctx: _Context,
+        batch_id: str | None,
+        cases: list[Case],
+        keys: dict[str, str],
+        results: asyncio.Queue[CaseResult | None],
+    ) -> tuple[set[str], int]:
+        """Send ``cases`` through the Message Batches API.
+
+        Returns the ids that need no online call (answered, or failed before
+        submission) and how many of those failed.
+
+        The batch id is saved on the run as soon as the batch exists, so a resumed
+        run polls the same batch instead of paying for a second one. Entries that
+        errored, expired or were cancelled are left to the online workers.
+        """
+        target = ctx.target
+        if not isinstance(target, PromptTarget):
+            raise InvalidInputError("batch mode is only available for prompt targets")
+        client, spec = target.client, target.spec
+        handled: set[str] = set()
+        failed = 0
+        by_custom_id = {batch_custom_id(c.id): c for c in cases}
+
+        async def retried(call: Callable[[], Any]) -> Any:
+            return await call_with_retries(
+                call, limiter=ctx.limiter, policy=ctx.config.options.retry, stats=RetryStats()
+            )
+
+        if batch_id is None:
+            requests = []
+            for custom_id, case in by_custom_id.items():
+                try:
+                    prompt = target.prompt_for(case)
+                except InvalidInputError as exc:
+                    await results.put(
+                        self._error(case, exc.message, RetryStats(), time.perf_counter())
+                    )
+                    handled.add(case.id)
+                    failed += 1
+                    continue
+                params = client.request_params(
+                    model=spec.model,
+                    prompt=prompt,
+                    system=spec.system,
+                    max_tokens=spec.max_tokens,
+                    effort=spec.effort,
+                )
+                requests.append({"custom_id": custom_id, "params": params})
+            if not requests:
+                return handled, failed
+            batch = await retried(lambda: client.create_batch(requests))
+            batch_id = str(batch.id)
+            await asyncio.to_thread(self._set_batch_id, ctx.run_id, batch_id)
+            log.info("batch submitted", extra={"batch_id": batch_id, "requests": len(requests)})
+        while True:
+            batch = await retried(lambda: client.get_batch(batch_id))
+            if batch.processing_status == "ended":
+                break
+            await self.clock.sleep(ctx.config.options.batch_poll_seconds)
+        entries = await retried(lambda: client.batch_results(batch_id))
+        for entry in entries:
+            answered = by_custom_id.get(entry.custom_id)
+            if answered is None or answered.id in handled or entry.result.type != "succeeded":
+                continue
+            completion = client.completion_from_message(
+                entry.result.message, requested_model=spec.model, batch=True
+            )
+            generation = Generation(completion.text, completion.stop_reason, completion.usage)
+            result = await self._finish_case(
+                ctx, answered, keys[answered.id], generation, latency_ms=0.0, attempts=1
+            )
+            await results.put(result)
+            handled.add(answered.id)
+        log.info("batch results saved", extra={"batch_id": batch_id, "answered": len(handled)})
+        return handled, failed
 
     def _build_target(self, config: StoredRun) -> Target:
         if self._target_factory is not None:
@@ -486,6 +590,16 @@ class Runner:
                 run.started_at = now
                 session.commit()
             return run
+
+    def _set_batch_id(self, run_id: str, batch_id: str) -> None:
+        with self.sessions() as session:
+            session.execute(
+                update(Run)
+                .where(Run.id == run_id)
+                .values(batch_id=batch_id)
+                .execution_options(synchronize_session=False)
+            )
+            session.commit()
 
     def _renew(self, run_id: str) -> bool:
         with self.sessions() as session:
