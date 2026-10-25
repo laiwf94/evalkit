@@ -182,6 +182,16 @@ def test_interrupts(db: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) ->
     assert run_cli(db, "dataset", "list")[0] == 130
 
 
+def test_failed_runs_exit_3_not_1(db: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    cfg = write_config(tmp_path, "main", 0.9)
+
+    async def broken(self: Any, run_id: str) -> Any:
+        raise RuntimeError("database went away key=sk-ant-abcdefghijkl")
+
+    monkeypatch.setattr("evalkit.runner.Runner.execute", broken)
+    assert run_cli(db, "run", str(cfg))[0] == 3
+
+
 def fake_claude(monkeypatch: pytest.MonkeyPatch, fake: FakeAnthropic) -> None:
     monkeypatch.setattr(cli.App, "claude", lambda self: fake.client())
 

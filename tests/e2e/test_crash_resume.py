@@ -73,7 +73,7 @@ def test_kill_minus_nine_then_resume(postgres_url: str, tmp_path: Path) -> None:
         capture_output=True,
         text=True,
     )
-    assert early.returncode == 2
+    assert early.returncode == 3
     assert "another process" in early.stderr
 
     # ...and accepted once the lease has expired.

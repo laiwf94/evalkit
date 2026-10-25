@@ -6,7 +6,8 @@ broken job:
     0  success; for ``gate``, no regression
     1  ``gate`` found a regression
     2  bad input: config, arguments, unknown dataset or run
-    3  the run cannot be used: it failed, is incomplete, or cannot be paired
+    3  the run cannot be used: it failed, is incomplete, is being executed by
+       another process, or cannot be paired; also any unexpected error
     130 interrupted (the run is saved and can be resumed with --resume)
 
 Configuration comes from the environment (see ``evalkit.config``); the
@@ -45,7 +46,7 @@ from evalkit.datasets import (
 )
 from evalkit.db import make_engine, make_session_factory, upgrade
 from evalkit.db.models import Run
-from evalkit.errors import EvalkitError, NotFoundError, PreconditionError
+from evalkit.errors import ConflictError, EvalkitError, NotFoundError, PreconditionError
 from evalkit.estimate import estimate
 from evalkit.llm import ClaudeClient
 from evalkit.logs import configure_logging, scrubber
@@ -359,12 +360,16 @@ def main(argv: Sequence[str] | None = None, out: TextIO | None = None) -> int:
     except CliError as exc:
         _err(exc.message)
         return exc.code
-    except PreconditionError as exc:
+    except (PreconditionError, ConflictError) as exc:
         _err(exc.message)
         return EXIT_UNUSABLE
     except EvalkitError as exc:
         _err(exc.message)
         return EXIT_INPUT
+    except Exception as exc:
+        # A failed run, an unreachable database: never exit 1, which means "regression".
+        _err(scrubber.scrub(f"{type(exc).__name__}: {exc}"))
+        return EXIT_UNUSABLE
 
 
 async def _dispatch(args: argparse.Namespace, settings: Settings, out: TextIO) -> int:

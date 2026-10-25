@@ -130,8 +130,8 @@ job on a regression.
 
 `RUN` is a run id or `label:NAME` for the newest completed run with that
 label. Exit codes: 0 success, 1 regression, 2 bad input, 3 the run cannot be
-used (failed, incomplete, different datasets), 130 interrupted. Commands that
-print a report take `--json`.
+used (failed, incomplete, held by another process, different datasets) or any
+other error, 130 interrupted. Commands that print a report take `--json`.
 
 ## API
 
