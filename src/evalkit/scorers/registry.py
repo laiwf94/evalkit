@@ -18,8 +18,10 @@ from jsonschema.exceptions import SchemaError
 from pydantic import BaseModel, ConfigDict, Field, JsonValue
 
 from evalkit.errors import InvalidInputError
+from evalkit.llm import ClaudeClient
 from evalkit.scorers.base import Scorer
 from evalkit.scorers.builtin import ExactMatch, JsonSchemaMatch, NumericMatch, RegexMatch, TokenF1
+from evalkit.scorers.judge import LLMJudge
 
 ENTRY_POINT_GROUP = "evalkit.scorers"
 Name = Annotated[str, Field(pattern=r"^[a-z][a-z0-9_]{0,47}$")]
@@ -67,6 +69,15 @@ class TokenF1Spec(_Spec):
     expected_key: str | None = None
 
 
+class JudgeSpec(_Spec):
+    type: Literal["judge"]
+    mode: Literal["rubric", "pairwise"] = "rubric"
+    rubric: str = Field(min_length=1, max_length=20_000)
+    model: str = Field(default="claude-opus-5-5", min_length=1, max_length=64)
+    effort: Literal["low", "medium", "high", "xhigh", "max"] = "medium"
+    max_tokens: int = Field(default=4096, ge=256, le=16_000)
+
+
 class PluginSpec(_Spec):
     type: Literal["plugin"]
     entry: str = Field(min_length=1, max_length=200)
@@ -74,22 +85,27 @@ class PluginSpec(_Spec):
 
 
 ScorerSpec = Annotated[
-    ExactSpec | RegexSpec | JsonSchemaSpec | NumericSpec | TokenF1Spec | PluginSpec,
+    ExactSpec | RegexSpec | JsonSchemaSpec | NumericSpec | TokenF1Spec | JudgeSpec | PluginSpec,
     Field(discriminator="type"),
 ]
 
 
-def build_scorers(specs: Sequence[ScorerSpec], *, allow_import_paths: bool) -> list[Scorer]:
+def build_scorers(
+    specs: Sequence[ScorerSpec],
+    *,
+    allow_import_paths: bool,
+    claude: ClaudeClient | None = None,
+) -> list[Scorer]:
     if not specs:
         raise InvalidInputError("at least one scorer is required")
     names = [s.resolved_name() for s in specs]
     duplicates = sorted({n for n in names if names.count(n) > 1})
     if duplicates:
         raise InvalidInputError(f"scorer names must be unique; repeated: {', '.join(duplicates)}")
-    return [_build(spec, allow_import_paths=allow_import_paths) for spec in specs]
+    return [_build(spec, allow_import_paths=allow_import_paths, claude=claude) for spec in specs]
 
 
-def _build(spec: ScorerSpec, *, allow_import_paths: bool) -> Scorer:
+def _build(spec: ScorerSpec, *, allow_import_paths: bool, claude: ClaudeClient | None) -> Scorer:
     name = spec.resolved_name()
     try:
         match spec:
@@ -119,6 +135,20 @@ def _build(spec: ScorerSpec, *, allow_import_paths: bool) -> Scorer:
                 )
             case TokenF1Spec():
                 return TokenF1(name, expected_key=spec.expected_key)
+            case JudgeSpec():
+                if claude is None:
+                    raise InvalidInputError(
+                        f"scorer {name}: the judge needs the Claude API; set ANTHROPIC_API_KEY"
+                    )
+                return LLMJudge(
+                    name,
+                    client=claude,
+                    rubric=spec.rubric,
+                    mode=spec.mode,
+                    model=spec.model,
+                    effort=spec.effort,
+                    max_tokens=spec.max_tokens,
+                )
             case PluginSpec():
                 return _load_plugin(spec, name, allow_import_paths=allow_import_paths)
     except SchemaError as exc:

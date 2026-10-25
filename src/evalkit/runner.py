@@ -186,7 +186,9 @@ class Runner:
 
     def create_run(self, config: RunConfig) -> Run:
         """Validate ``config`` against the stored dataset and record a pending run."""
-        build_scorers(config.scorers, allow_import_paths=self.allow_import_paths)
+        build_scorers(
+            config.scorers, allow_import_paths=self.allow_import_paths, claude=self.claude
+        )
         target_id = identity(config.target, self.settings.http_endpoints)
         if config.options.mode == "batch" and config.target.type != "prompt":
             raise InvalidInputError("batch mode is only available for prompt targets")
@@ -300,7 +302,9 @@ class Runner:
         config = StoredRun.from_row(run)
         cases, done = await asyncio.to_thread(self._load_cases, run, config)
         pending = [c for c in cases if c.id not in done]
-        scorers = build_scorers(config.scorers, allow_import_paths=self.allow_import_paths)
+        scorers = build_scorers(
+            config.scorers, allow_import_paths=self.allow_import_paths, claude=self.claude
+        )
         target = self._build_target(config)
         limiters = Limiters({target.provider: config.options.rate_limit}, self.clock)
         fingerprint = self.settings.redaction.fingerprint()

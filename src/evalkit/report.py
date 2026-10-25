@@ -115,7 +115,11 @@ def summarize(session: Session, run_id: str, *, resamples: int = DEFAULT_RESAMPL
     dataset = session.get_one(Dataset, run.dataset_id)
     split = run.case_filter.get("split")
     tags = run.case_filter.get("tags") or ()
-    total = len(load_cases(session, dataset, split, tags))
+    total = (
+        dataset.case_count
+        if not (split or tags)
+        else len(load_cases(session, dataset, split, tags))
+    )
     rows = list(
         session.execute(
             select(
