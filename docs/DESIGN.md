@@ -1,24 +1,22 @@
 # evalkit design
 
-## Goals
+"The candidate scored 2 points lower" is not a decision. evalkit exists to say
+whether a difference is larger than the noise for this many cases, and to exit
+non-zero only when it is. That verdict is only worth something if the two runs
+are comparable, so runs are compared only when they used the same cases, byte
+for byte, and every output is tied to the exact target that produced it.
+Evaluations run on every pull request, which means an unchanged target has to
+cost nothing the second time and a crash must not throw away (or re-bill)
+finished work. And because the harness also runs as a shared service, inputs
+are bounded, it makes no requests to arbitrary URLs, and neither the store nor
+the logs hold personal data or keys.
 
-1. **A verdict you can gate on.** "The candidate scored 2 points lower" is not
-   a decision. The harness says whether a difference is larger than the noise
-   for this many cases, and exits non-zero only when it is.
-2. **Comparable runs.** Two runs are compared only if they used the same cases,
-   byte for byte, and every output is tied to the exact target that produced it.
-3. **Cheap to rerun.** Evaluations run on every pull request. An unchanged
-   target must cost nothing the second time, and a crash must not throw away
-   (or re-bill) finished work.
-4. **Safe to run as a shared service.** Bounded inputs, no requests to
-   arbitrary URLs, no personal data or keys in the store or the logs.
+It does not evaluate model weights at training time, it is not a human
+annotation tool (calibration labels are imported, not collected), and it does
+not spread a single run across machines. That last one is discussed under
+[Bigger runs](#bigger-runs).
 
-Non-goals: training-time evaluation of model weights, human annotation
-tooling (calibration labels are imported, not collected), and distributed
-execution of a single run across machines. The last is discussed under
-[Scaling out](#scaling-out).
-
-## Data model
+## What is stored
 
 ```text
 datasets        (name, version) unique, (name, content_hash) unique
@@ -31,7 +29,9 @@ response_cache  key = sha256(target hash, input, redaction fingerprint)
 judge_calibrations  judge hash, kappa, weighted kappa, agreement, confusion matrix
 ```
 
-**Dataset identity.** The content hash is SHA-256 over the cases in canonical
+### How a dataset is identified
+
+The content hash is SHA-256 over the cases in canonical
 JSON (sorted keys, no whitespace), sorted by case id. Key order, whitespace and
 line order do not change it; any change to an input, expected value, tag, split
 or metadata does. Importing content that already exists under the name returns
@@ -39,18 +39,22 @@ the existing version, so a CI job can import on every run without minting
 versions. Concurrent imports race on the unique constraints and the loser
 re-reads, so the same content never gets two versions.
 
-**Target identity.** The target hash covers every field that can change an
+### How a target is identified
+
+The target hash covers every field that can change an
 output: model, system prompt, template, `max_tokens`, effort, fallback setting,
 and for HTTP targets the resolved URL and header names (not the secret values).
 It keys the response cache, so a cache hit is only possible when nothing that
 could change the answer changed.
 
-**Runs store their own config.** The target spec, scorer specs, options and
+### Runs keep their own config
+
+The target spec, scorer specs, options and
 case filter are copied onto the run row when it is created. Resuming a run
 uses the stored config, never the current file, so a run cannot change
 definition halfway through.
 
-## Execution
+## How a run executes
 
 ```text
 work queue -> N workers -> (cache hit? -> score) | (rate limit -> call -> retry) -> redact -> score
@@ -65,21 +69,27 @@ every 200 ms. A slow model call therefore never pins a pooled connection, and
 the bounded results queue (200 entries) gives backpressure if the database is
 slower than the target.
 
-**Resume.** A result row is unique on (run, case). On resume the runner loads
+### Resuming
+
+A result row is unique on (run, case). On resume the runner loads
 the case ids that already have a row and only executes the rest. A crash loses
 at most the results still in memory (the in-flight calls plus whatever the
 writer had not committed); on Ctrl-C or shutdown even those are written before
 the process stops. The kill -9 test in `tests/e2e` checks the exactly-once
 property against PostgreSQL.
 
-**Leases.** Two processes must never execute the same run, or cases would be
+### Leases
+
+Two processes must never execute the same run, or cases would be
 paid for twice. A process claims a run with a conditional UPDATE that succeeds
 only if the lease is free, its own, or expired, and renews it every third of
 the lease length (30 s by default). A process that finds its lease taken stops.
 If a runner dies, its lease expires and any process can resume. The trade-off
 is that a crashed run waits up to one lease length before it can be resumed.
 
-**Response cache.** Outputs are cached after redaction, keyed by (target hash,
+### The response cache
+
+Outputs are cached after redaction, keyed by (target hash,
 canonical input, redaction fingerprint). Cache hits cost nothing in the new run;
 the original usage stays on the cache row. Errors are never cached, and neither
 is an output whose redaction timed out, so a rerun retries both. Judge verdicts
@@ -87,7 +97,9 @@ go in the same table, keyed by the judge configuration and the exact prompt, so
 a rerun of an unchanged target with an unchanged judge makes no API calls at
 all. `use_cache = false` turns both off.
 
-**Rate limits and retries.** Each provider (the Claude API, each HTTP endpoint,
+### Rate limits and retries
+
+Each provider (the Claude API, each HTTP endpoint,
 the judge) has a token bucket. When any call gets a Retry-After, the whole
 provider enters a cool-down that every worker waits out; without this, 32
 workers would each spend an attempt on the same 429. Failures without
@@ -96,7 +108,9 @@ Retry-After is honoured up to 120 s by default so a misbehaving server cannot
 park a run for an hour. The SDK's own retries are turned off so there is
 exactly one retry policy.
 
-**Batch mode.** Prompt targets can send their uncached cases as one Message
+### Batch mode
+
+Prompt targets can send their uncached cases as one Message
 Batch at half price. The batch id is written to the run before polling starts,
 so a resumed run polls the same batch rather than paying for a second one. The
 window between the batch being created and its id being committed is the one
@@ -154,18 +168,18 @@ example, the case has no expected value), which is different from 0.
 | `judge` | Rubric 1-5 mapped to (s-1)/4, or pairwise win/tie/loss against the reference. |
 | `plugin` | Any `Scorer` subclass from an `evalkit.scorers` entry point. |
 
-**Failed calls score 0, unscorable cases are left out.** If the target errored
-after all retries, every metric gets 0 for that case: the system did not
-produce an answer, and the gate must see that. Unscorable cases are counted
+A failed call scores 0 and an unscorable case is left out. If the target
+errored after all retries, every metric gets 0 for that case: the system did
+not produce an answer, and the gate must see that. Unscorable cases are counted
 separately and excluded from that metric.
 
-**Scorers see redacted text.** Redaction happens before scoring, so the judge
-never receives personal data, and a cached rerun (which only has the redacted
-text) scores exactly like the original. The cost: an expected answer that
-itself contains, say, an email address will not match. Disable that pattern for
-such datasets.
+Scorers see redacted text, because redaction happens before scoring. The judge
+therefore never receives personal data, and a cached rerun (which only has
+the redacted text) scores exactly like the original. The cost is that an
+expected answer which itself contains, say, an email address will not match;
+disable that pattern for such datasets.
 
-## LLM judge
+## The judge
 
 The judge prompt puts the rubric in the system prompt and the task, reference
 and response in tagged sections, and tells the judge the response is data to be
@@ -173,7 +187,9 @@ graded. Outputs of the system under test can contain instructions; the judge is
 asked to ignore them, and structured output means it can only answer with a
 verdict.
 
-**Position bias.** LLM judges prefer the first (or second) answer more often
+### Position bias
+
+LLM judges prefer the first (or second) answer more often
 than content warrants (Zheng et al., *Judging LLM-as-a-Judge with MT-Bench and
 Chatbot Arena*). Pairwise judging runs every comparison twice with the order
 swapped and averages the two outcomes from the response's point of view (win 1,
@@ -181,7 +197,9 @@ tie 0.5, loss 0). A judge that always picks "A" scores every response 0.5, a
 tie, instead of deciding the result by position. The disagreement is noted in
 the score detail. The cost is two calls per case.
 
-**Calibration.** `evalkit calibrate` runs a judge over outputs that people have
+### Calibration
+
+`evalkit calibrate` runs a judge over outputs that people have
 labelled and reports raw agreement, Cohen's kappa (Cohen, *A Coefficient of
 Agreement for Nominal Scales*) and, for the ordinal 1-5 scale, quadratic
 weighted kappa (Cohen, *Weighted kappa*), which counts a 4-vs-5 disagreement as
@@ -192,7 +210,7 @@ substantial agreement (Landis & Koch, *The Measurement of Observer Agreement for
 Categorical Data*). Results are stored per judge configuration hash (mode,
 model, effort, rubric), so a rubric edit is visibly uncalibrated.
 
-## Statistics
+## Deciding whether a change is real
 
 Evaluation datasets are small (tens to a few hundred cases) and scores are
 often binary, so a raw difference of means is mostly noise. The comparison is
@@ -202,35 +220,39 @@ which is why a paired test detects a regression with a fraction of the cases an
 unpaired test would need (Berg-Kirkpatrick et al., *An Empirical Investigation
 of Statistical Significance in NLP*).
 
-- **Interval for one run**: percentile bootstrap of the mean, 10,000 resamples
-  (Efron & Tibshirani, *An Introduction to the Bootstrap*). Simple and
-  distribution-free. It runs slightly narrow for small n; the coverage test
-  measures 93.5% for a nominal 95% at n = 100. BCa would correct that at the
-  cost of a jackknife pass; the gate does not use this interval, so the simpler
-  method was kept.
-- **Interval for a difference**: the same bootstrap on paired differences.
-- **Test**: sign-flip permutation test on paired differences. Under "no
-  difference" each difference is equally likely to have either sign. Exact
-  (all 2^n sign patterns) for n <= 16, 10,000 random flips above, with the +1
-  correction so the p-value is never 0 (Phipson & Smyth, *Permutation P-values
-  Should Never Be Zero*). It makes no normality assumption, which matters for
-  0/1 scores where a t-test is shaky at small n.
-- **Effect size**: the mean difference itself (in score units) and Cohen's d_z,
-  the mean difference over the standard deviation of the differences.
-- **Several metrics**: p-values are adjusted with Holm's step-down method
-  (Holm, *A Simple Sequentially Rejective Multiple Test Procedure*), so gating
-  on five metrics does not give five chances of a false alarm.
-- **Verdict**: `worse` or `better` when the adjusted p-value is below alpha
-  (0.05) and the mean difference is larger than `--min-effect` in size;
-  otherwise `no detectable change`. That phrase is deliberate: with 30 cases a
-  3-point drop may be real and still undetectable. `--min-effect` is how a team
-  says which differences it does not care about.
+The interval for one run is a percentile bootstrap of the mean with 10,000
+resamples (Efron & Tibshirani, *An Introduction to the Bootstrap*): simple and
+distribution-free. It runs slightly narrow for small n; the coverage test
+measures 93.5% for a nominal 95% at n = 100. BCa would correct that at the cost
+of a jackknife pass, but the gate does not use this interval, so the simpler
+method was kept. The interval for a difference is the same bootstrap on paired
+differences.
+
+The test is a sign-flip permutation test on paired differences. Under "no
+difference" each difference is equally likely to have either sign. It is exact
+(all 2^n sign patterns) for n <= 16 and uses 10,000 random flips above that,
+with the +1 correction so the p-value is never 0 (Phipson & Smyth, *Permutation
+P-values Should Never Be Zero*). It makes no normality assumption, which
+matters for 0/1 scores, where a t-test is shaky at small n.
+
+Effect size is reported two ways: the mean difference itself, in score units,
+and Cohen's d_z, the mean difference over the standard deviation of the
+differences. When several metrics are gated, p-values are adjusted with Holm's
+step-down method (Holm, *A Simple Sequentially Rejective Multiple Test
+Procedure*), so gating on five metrics does not give five chances of a false
+alarm.
+
+The verdict is `worse` or `better` when the adjusted p-value is below alpha
+(0.05) and the mean difference is larger than `--min-effect` in size, and
+`no detectable change` otherwise. That phrase is deliberate: with 30 cases a
+3-point drop may be real and still undetectable. `--min-effect` is how a team
+says which differences it does not care about.
 
 The property tests check the methods, not one lucky draw: 1,000 simulated
 datasets with a known answer per test, checked against a binomial tolerance
 band.
 
-## Failure modes
+## Interrupted and failed runs
 
 | Failure | What happens |
 |---|---|
@@ -268,37 +290,39 @@ band.
 | Result page | 500 | |
 | Run lease | 30 s default | Time before a dead runner's run can be resumed. |
 
-## Security
+## Running it as a shared service
 
-- **SSRF.** HTTP targets name an endpoint from the operator's config file; a
-  run config cannot contain a URL. On each call the host is resolved and every
-  address must be public: loopback, private, link-local (which includes the
-  cloud metadata address 169.254.169.254), CGNAT, multicast and reserved ranges
-  are refused, including IPv4 addresses embedded in IPv6 (mapped, 6to4,
-  Teredo). The request then goes to the checked IP literal with the original
-  Host header and TLS server name, so a DNS answer that changes between check
-  and connect cannot redirect it. Proxy environment variables are ignored,
-  redirects are not followed, and the response size is capped while streaming.
-  `allow_private` exists per endpoint for local development.
-- **Code execution.** Templates only substitute `{{ field }}`; there is no
-  expression language. Plugin scorers by import path are accepted from CLI
-  config files only; the API accepts installed entry points by name.
-- **ReDoS.** Every regex from config or case data runs on the `regex` module with
-  a time limit.
-- **Secrets.** API keys come from environment variables or `*_FILE` secret
-  files. Bearer tokens are stored as SHA-256 digests and compared with
-  `hmac.compare_digest` against every configured digest, without stopping
-  early. Known secret values and credential-shaped strings are scrubbed from
-  every log line. Endpoint secret headers are excluded from the target hash and
-  never stored.
-- **Personal data.** Outputs are redacted before they are stored, cached or
-  sent to the judge. A pattern that times out fails closed.
-- **API.** Without tokens the server refuses to listen beyond loopback. Bodies
-  are size-capped before buffering, unknown JSON fields are rejected, internal
-  errors return a generic message with the request id, and `/metrics` is behind
-  the same tokens as `/v1`.
+The main risk is server-side request forgery. HTTP targets name an endpoint
+from the operator's config file; a run config cannot contain a URL. On each
+call the host is resolved and every address must be public: loopback, private,
+link-local (which includes the cloud metadata address 169.254.169.254), CGNAT,
+multicast and reserved ranges are refused, including IPv4 addresses embedded in
+IPv6 (mapped, 6to4, Teredo). The request then goes to the checked IP literal
+with the original Host header and TLS server name, so a DNS answer that changes
+between check and connect cannot redirect it. Proxy environment variables are
+ignored, redirects are not followed, and the response size is capped while
+streaming. `allow_private` exists per endpoint for local development.
 
-## Dependencies
+Nothing a caller sends is executed. Templates only substitute `{{ field }}`;
+there is no expression language. Plugin scorers by import path are accepted
+from CLI config files only, and the API accepts installed entry points by name.
+Every regex from config or case data runs on the `regex` module with a time
+limit, so a catastrophic pattern cannot stall a worker.
+
+API keys come from environment variables or `*_FILE` secret files. Bearer
+tokens are stored as SHA-256 digests and compared with `hmac.compare_digest`
+against every configured digest, without stopping early. Known secret values
+and credential-shaped strings are scrubbed from every log line, and endpoint
+secret headers are excluded from the target hash and never stored. Outputs are
+redacted before they are stored, cached or sent to the judge, and a pattern
+that times out fails closed.
+
+Without tokens the server refuses to listen beyond loopback. Bodies are
+size-capped before buffering, unknown JSON fields are rejected, internal errors
+return a generic message with the request id, and `/metrics` is behind the same
+tokens as `/v1`.
+
+## Third-party packages
 
 Each pinned to an exact version released at least two weeks before the lock
 was made (`exclude-newer` in `pyproject.toml`). The exception is a release that
@@ -318,21 +342,25 @@ allowed newer versions because `pip-audit` flagged the older ones.
 | `prometheus-client` | Standard metrics exposition. |
 | dev: `pytest`, `hypothesis`, `testcontainers`, `ruff`, `mypy`, `pip-audit` | Tests, property tests, real PostgreSQL in tests, lint and format, types, vulnerability audit. |
 
-## Scaling out
+## Bigger runs
 
-What would change for many teams and much larger datasets:
+Several things would change for many teams and much larger datasets.
 
-1. **Distributed workers.** Today one process executes a run. The lease model
-   extends to case-level leases (claim batches of case ids with `SELECT ... FOR
-   UPDATE SKIP LOCKED`), so several machines can work on one run; the unique
-   (run, case) constraint already makes results idempotent.
-2. **A shared rate limiter.** Token buckets are per process. With many workers
-   on one API key they would move to a shared store (for example a Redis-backed
-   GCRA limiter) so the provider limit is respected fleet-wide.
-3. **Summary tables.** Summaries are computed from the result rows on request,
-   which is fine at tens of thousands of cases. Beyond that, the writer would
-   maintain per-run aggregates as results are committed.
-4. **Cache retention.** The response cache grows without bound. A last-used
-   timestamp and a sweep by age, or partitioning by month, would bound it.
-5. **Object storage for outputs.** Long outputs would move to object storage,
-   keyed by content hash, with only the reference in the results table.
+Today one process executes a run. The lease model extends to case-level leases,
+where workers claim batches of case ids with `SELECT ... FOR UPDATE SKIP
+LOCKED`, so several machines could work on one run; the unique (run, case)
+constraint already makes results idempotent.
+
+Token buckets are per process. With many workers on one API key they would move
+to a shared store (for example a Redis-backed GCRA limiter) so the provider
+limit is respected fleet-wide.
+
+Summaries are computed from the result rows on request, which is fine at tens of
+thousands of cases. Beyond that, the writer would maintain per-run aggregates as
+results are committed.
+
+The response cache grows without bound. A last-used timestamp and a sweep by
+age, or partitioning by month, would bound it.
+
+Long outputs would move to object storage, keyed by content hash, with only the
+reference left in the results table.

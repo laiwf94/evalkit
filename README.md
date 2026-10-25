@@ -21,6 +21,34 @@ $ echo $?
 1
 ```
 
+## Trying it
+
+```console
+$ uv sync
+$ ./examples/demo.sh                 # no API key needed: fake targets, throwaway SQLite
+```
+
+The demo runs a baseline and two candidates on a bundled 120-case dataset. The
+candidate of similar quality passes the gate; the broken one fails it with exit
+code 1.
+
+With a key, the same comparison on Claude, scored by a judge:
+
+```console
+$ export ANTHROPIC_API_KEY=...
+$ evalkit estimate examples/live/baseline.toml      # input cost exactly, output at worst case
+$ evalkit run examples/live/baseline.toml
+$ evalkit run examples/live/candidate.toml
+$ evalkit gate label:live-baseline label:live-candidate
+$ evalkit calibrate --judge examples/live/judge.toml examples/live/labels.jsonl
+```
+
+[examples/github-action/eval-gate.yml](examples/github-action/eval-gate.yml)
+is a workflow that evaluates the base branch and the pull request and fails the
+job on a regression.
+
+## Run configs: dataset, target, scorers
+
 A run config is a small TOML file:
 
 ```toml
@@ -44,77 +72,44 @@ type = "judge"
 rubric = "5: names the same menu path as the reference ..."
 ```
 
-## What it does
+The dataset is a JSONL file of test cases with ids, inputs, expected values,
+tags and splits. Each import is versioned and identified by a SHA-256 of its
+content, so re-importing the same file is a no-op, and two runs can only be
+compared if they used exactly the same cases.
 
-- **Datasets**: JSONL test cases with ids, inputs, expected values, tags and
-  splits. Each import is versioned and identified by a SHA-256 of its content,
-  so re-importing the same file is a no-op and two runs can only be compared if
-  they used exactly the same cases.
-- **Targets**: a prompt template on a Claude model, your application behind an
-  HTTP endpoint named in server config (never a URL from the request), or a fake
-  target with known accuracy for demos and tests.
-- **Scorers**: exact match, regex, JSON Schema, numeric tolerance, token F1, and
-  an LLM judge with a rubric. The pairwise judge runs every comparison twice
-  with the answers swapped, so a judge that prefers a position cannot decide the
-  result. Judges are calibrated against human labels with Cohen's kappa. Your
-  own scorers plug in through an entry point.
-- **Runs**: a bounded worker pool, per-provider rate limits, retries that honour
-  Retry-After across all workers, and a response cache that makes reruns free.
-  A run killed at any point resumes without repeating or re-paying for finished
-  cases. Prompt targets can go through the Message Batches API at half price.
-- **Statistics**: means with bootstrap confidence intervals, paired comparison
-  of two runs (paired bootstrap interval and a sign-flip permutation test) with
-  a better / worse / no detectable change verdict, effect size, and Holm
-  correction when several metrics are gated together.
-- **Cost**: tokens and dollars per case and per run, including prompt cache
-  reads and writes and judge calls, and an estimate before you run, from the
-  token counting endpoint.
-- **Safety**: outputs are redacted (emails, phone numbers, card numbers, keys
-  and your own patterns) before they are stored or shown to the judge. Keys come
-  from the environment or secret files and are scrubbed from logs.
+The target is the thing under test: a prompt template on a Claude model, your
+application behind an HTTP endpoint named in server config (never a URL from
+the request), or a fake target with known accuracy for demos and tests.
 
-## Quick start
+Scorers grade each answer by exact match, regex, JSON Schema, numeric
+tolerance, token F1, or an LLM judge with a rubric. The pairwise judge runs
+every comparison twice with the answers swapped, so a judge that prefers a
+position cannot decide the result, and judges are calibrated against human
+labels with Cohen's kappa. Your own scorers plug in through an entry point.
 
-```console
-$ uv sync
-$ ./examples/demo.sh                 # no API key needed: fake targets, throwaway SQLite
-```
+## During a run
 
-The demo runs a baseline and two candidates on a bundled 120-case dataset. The
-candidate of similar quality passes the gate; the broken one fails it with exit
-code 1.
+A run uses a bounded worker pool, per-provider rate limits, retries that honour
+Retry-After across all workers, and a response cache that makes reruns free.
+A run killed at any point resumes without repeating or re-paying for finished
+cases. Prompt targets can go through the Message Batches API at half price.
 
-With a key, the same comparison on Claude, scored by a judge:
+Tokens and dollars are counted per case and per run, including prompt cache
+reads and writes and judge calls, and `evalkit estimate` prices a run before
+you start it, using the token counting endpoint.
 
-```console
-$ export ANTHROPIC_API_KEY=...
-$ evalkit estimate examples/live/baseline.toml      # input cost exactly, output at worst case
-$ evalkit run examples/live/baseline.toml
-$ evalkit run examples/live/candidate.toml
-$ evalkit gate label:live-baseline label:live-candidate
-$ evalkit calibrate --judge examples/live/judge.toml examples/live/labels.jsonl
-```
+Outputs are redacted (emails, phone numbers, card numbers, keys and your own
+patterns) before they are stored or shown to the judge. Keys come from the
+environment or secret files and are scrubbed from logs.
 
-As a service:
+## Reading the verdict
 
-```console
-$ export EVALKIT_DATABASE_URL=postgresql+psycopg://evalkit@localhost/evalkit
-$ export EVALKIT_API_TOKENS=$(openssl rand -hex 24)
-$ evalkit serve                                     # migrates, then listens on 127.0.0.1:8080
-```
+Each run reports means with bootstrap confidence intervals. Two runs are
+compared pairwise, with a paired bootstrap interval and a sign-flip permutation
+test, giving a better / worse / no detectable change verdict and an effect
+size; Holm correction applies when several metrics are gated together.
 
-Or with Docker:
-
-```console
-$ docker build -t evalkit .
-$ docker run -p 8080:8080 -e EVALKIT_API_TOKENS=... -e EVALKIT_DATABASE_URL=... evalkit
-```
-
-[examples/github-action/eval-gate.yml](examples/github-action/eval-gate.yml)
-is a workflow that evaluates the base branch and the pull request and fails the
-job on a regression.
-
-## CLI
+## Command line
 
 | Command | Purpose |
 |---|---|
@@ -133,7 +128,20 @@ label. Exit codes: 0 success, 1 regression, 2 bad input, 3 the run cannot be
 used (failed, incomplete, held by another process, different datasets) or any
 other error, 130 interrupted. Commands that print a report take `--json`.
 
-## API
+## Running it as a service
+
+```console
+$ export EVALKIT_DATABASE_URL=postgresql+psycopg://evalkit@localhost/evalkit
+$ export EVALKIT_API_TOKENS=$(openssl rand -hex 24)
+$ evalkit serve                                     # migrates, then listens on 127.0.0.1:8080
+```
+
+Or with Docker:
+
+```console
+$ docker build -t evalkit .
+$ docker run -p 8080:8080 -e EVALKIT_API_TOKENS=... -e EVALKIT_DATABASE_URL=... evalkit
+```
 
 Every `/v1` route takes `Authorization: Bearer <token>`.
 
@@ -155,7 +163,7 @@ with stable codes: `invalid_argument` 400, `unauthenticated` 401, `not_found`
 404, `conflict` 409, `failed_precondition` 412, `payload_too_large` 413,
 `internal` 500, `unavailable` 503.
 
-## How it is tested
+## Tests
 
 No test calls the real API. The Claude client is exercised through the real SDK
 over a fake HTTP transport that checks the exact request body; one opt-in test
@@ -176,7 +184,7 @@ $ uv run pip-audit
 $ uv run python benchmarks/run.py
 ```
 
-## Performance
+## Speed
 
 On an Apple M4 Max, SQLite, fake targets (so this is the harness, not a model).
 Repeated runs on a busy machine vary by up to a factor of two for the shortest
@@ -195,14 +203,11 @@ case and a cached rerun takes 98 ms (27x); throughput is the same.
 At 64 workers 400 cases are only six rounds deep, so the last partial round
 and result writes show up; model latencies of seconds hide both.
 
-## Design
+## Inside the package
 
-[docs/DESIGN.md](docs/DESIGN.md) covers the data model, the statistics and why
-they are paired, the judge and its calibration, caching and resume, rate limits,
-failure modes, limits, security and what would change to run it at larger
-scale.
-
-## Layout
+The reasoning behind the data model, the paired statistics, the judge and its
+calibration, caching and resume, rate limits, failure modes, limits, security
+and what would change at larger scale is in [docs/DESIGN.md](docs/DESIGN.md).
 
 ```text
 src/evalkit/datasets.py    JSONL parsing, content hashing, versioned storage
