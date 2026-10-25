@@ -240,7 +240,14 @@ def test_transport_failures_are_retryable() -> None:
         yield b'{"out'
         raise httpx2.ReadError("reset")
 
-    for handler, message in ((refuse, "cannot reach"), (slow, "timed out")):
+    def bad_request(request: httpx2.Request) -> httpx2.Response:
+        raise httpx2.DecodingError("odd")
+
+    for handler, message in (
+        (refuse, "cannot reach"),
+        (slow, "timed out"),
+        (bad_request, "failed: DecodingError"),
+    ):
         t = HttpTarget(
             HttpTargetSpec(type="http", endpoint="bot"),
             HttpEndpoint(url="https://bot.example.com/"),
@@ -249,7 +256,7 @@ def test_transport_failures_are_retryable() -> None:
         )
         with pytest.raises(TargetError, match=message) as info:
             run(t)
-        assert info.value.retryable
+        assert info.value.retryable is (message != "failed: DecodingError")
     with pytest.raises(TargetError, match="cut off") as info:
         run(
             target(
@@ -332,3 +339,13 @@ def test_bad_endpoints_file(
     f.write_text(content)
     with pytest.raises(ConfigError, match=message):
         Settings.from_env({"EVALKIT_HTTP_TARGETS_FILE": str(f), **env})
+
+
+def test_undecodable_body() -> None:
+    async def garbage() -> Any:
+        yield b"not gzip"
+
+    response = httpx2.Response(200, content=garbage(), headers={"content-encoding": "gzip"})
+    with pytest.raises(TargetError, match="could not be decoded") as info:
+        run(target(Recorder(response), resolver_for(["93.184.216.34"])))
+    assert not info.value.retryable

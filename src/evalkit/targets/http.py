@@ -173,6 +173,11 @@ class HttpTarget(Target):
                 f"cannot reach endpoint {self.spec.endpoint!r}: {type(exc).__name__}",
                 retryable=True,
             ) from None
+        except httpx2.HTTPError as exc:
+            raise TargetError(
+                f"request to endpoint {self.spec.endpoint!r} failed: {type(exc).__name__}",
+                retryable=False,
+            ) from None
         try:
             body = await self._read_capped(response)
         finally:
@@ -206,6 +211,10 @@ class HttpTarget(Target):
                 if size > limit:
                     raise TargetError(f"response is larger than {limit} bytes", retryable=False)
                 chunks.append(chunk)
+        except httpx2.DecodingError:
+            raise TargetError(
+                f"response from {self.spec.endpoint!r} could not be decoded", retryable=False
+            ) from None
         except httpx2.TransportError as exc:
             raise TargetError(
                 f"response from {self.spec.endpoint!r} was cut off: {exc}", retryable=True
