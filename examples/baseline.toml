@@ -1,0 +1,26 @@
+# The version on main. The fake target stands in for the app: it answers
+# correctly for a seeded 92% of cases, so the demo needs no API key.
+label = "baseline"
+
+[dataset]
+name = "support"
+path = "data/support.jsonl"
+
+[target]
+type = "fake"
+accuracy = 0.92
+seed = 1
+latency_ms = 5
+wrong_answer = "Please contact support."
+
+[[scorers]]
+type = "exact"
+normalize_whitespace = true
+case_sensitive = false
+
+[[scorers]]
+type = "token_f1"
+gate = false
+
+[options]
+concurrency = 16

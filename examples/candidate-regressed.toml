@@ -1,0 +1,25 @@
+# A change that broke something: 70% accuracy.
+label = "candidate-regressed"
+
+[dataset]
+name = "support"
+path = "data/support.jsonl"
+
+[target]
+type = "fake"
+accuracy = 0.70
+seed = 3
+latency_ms = 5
+wrong_answer = "Please contact support."
+
+[[scorers]]
+type = "exact"
+normalize_whitespace = true
+case_sensitive = false
+
+[[scorers]]
+type = "token_f1"
+gate = false
+
+[options]
+concurrency = 16

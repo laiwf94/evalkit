@@ -1,0 +1,41 @@
+# Copy to .github/workflows/ in the repository of the app under test.
+# Runs the evaluation for main and for the pull request, then fails the job
+# if the pull request is worse on any gated metric.
+name: eval-gate
+
+on:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  eval:
+    runs-on: ubuntu-latest
+    env:
+      ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+      # The cache makes the baseline free after its first run on a given main commit.
+      EVALKIT_DATABASE_URL: sqlite:///${{ github.workspace }}/.evalkit/evalkit.db
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: astral-sh/setup-uv@v6
+      - name: Restore evaluation cache
+        uses: actions/cache@v4
+        with:
+          path: .evalkit
+          key: evalkit-${{ github.base_ref }}-${{ hashFiles('evals/**') }}
+          restore-keys: evalkit-${{ github.base_ref }}-
+      - name: Install evalkit
+        run: uv tool install git+https://github.com/laiwf94/evalkit
+      - name: Evaluate main
+        run: |
+          mkdir -p .evalkit
+          git show origin/${{ github.base_ref }}:evals/run.toml > .evalkit/base.toml
+          cp evals/*.jsonl .evalkit/
+          evalkit run .evalkit/base.toml --label base
+      - name: Evaluate this pull request
+        run: evalkit run evals/run.toml --label pr
+      - name: Gate
+        run: evalkit gate label:base label:pr --min-effect 0.02

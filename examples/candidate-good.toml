@@ -1,0 +1,25 @@
+# A change that is just as good: 91% accuracy, wrong on a different set of cases.
+label = "candidate-good"
+
+[dataset]
+name = "support"
+path = "data/support.jsonl"
+
+[target]
+type = "fake"
+accuracy = 0.91
+seed = 2
+latency_ms = 5
+wrong_answer = "Please contact support."
+
+[[scorers]]
+type = "exact"
+normalize_whitespace = true
+case_sensitive = false
+
+[[scorers]]
+type = "token_f1"
+gate = false
+
+[options]
+concurrency = 16

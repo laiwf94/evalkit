@@ -1,0 +1,7 @@
+# The judge from baseline.toml, for: evalkit calibrate --judge examples/live/judge.toml examples/live/labels.jsonl
+[judge]
+name = "correct_path"
+rubric = """5: names the same menu path as the reference, in one sentence.
+3: right destination but a step is missing or extra.
+1: wrong destination, or no menu path at all."""
+effort = "low"

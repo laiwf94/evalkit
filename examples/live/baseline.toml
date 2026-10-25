@@ -1,0 +1,47 @@
+# Live run against the Claude API. Needs ANTHROPIC_API_KEY (or ANTHROPIC_API_KEY_FILE).
+# Check the cost first:  evalkit estimate examples/live/baseline.toml
+label = "live-baseline"
+
+[dataset]
+name = "support"
+path = "../data/support.jsonl"
+
+[filter]
+split = "dev"          # 30 cases; drop this to run all 120
+
+[target]
+type = "prompt"
+model = "claude-opus-5-5"
+effort = "low"
+max_tokens = 1024
+system = """You answer questions about the acme web app from its help centre.
+Answer in one sentence that names the menu path, for example:
+"Open Settings, choose Security, then Reset password."
+
+Help centre:
+- Password: Settings > Security > Reset password.
+- Billing email: Billing > Contacts.
+- Cancel: Billing > Plan > Cancel subscription.
+- Export: Settings > Data > Export (sent by email).
+- Invite: Team > Invite. Remove: the member's menu > Remove.
+- Two-factor: Security > Two-factor authentication.
+- Invoices: Billing > Invoices > Download. Change plan: Billing > Plan.
+- Delete account: Settings > Account > Delete account.
+- Card: Billing > Payment method. Rename project: project Settings.
+- Restore: Trash > Restore. Share: Share in the document.
+- Email notifications: Settings > Notifications."""
+template = "{{question}}"
+
+[[scorers]]
+type = "token_f1"
+
+[[scorers]]
+type = "judge"
+name = "correct_path"
+rubric = """5: names the same menu path as the reference, in one sentence.
+3: right destination but a step is missing or extra.
+1: wrong destination, or no menu path at all."""
+effort = "low"
+
+[options]
+concurrency = 4

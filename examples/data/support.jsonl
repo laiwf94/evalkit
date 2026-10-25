@@ -1,0 +1,120 @@
+{"id": "faq-001", "input": {"question": "How do I reset my password?"}, "expected": "Open Settings, choose Security, then Reset password.", "tags": ["account"], "split": "dev"}
+{"id": "faq-002", "input": {"question": "Where can I reset my password?"}, "expected": "Open Settings, choose Security, then Reset password.", "tags": ["account"], "split": "test"}
+{"id": "faq-003", "input": {"question": "I need to reset my password. What are the steps?"}, "expected": "Open Settings, choose Security, then Reset password.", "tags": ["account"], "split": "test"}
+{"id": "faq-004", "input": {"question": "Can you tell me how to reset my password?"}, "expected": "Open Settings, choose Security, then Reset password.", "tags": ["account"], "split": "test"}
+{"id": "faq-005", "input": {"question": "What's the way to reset my password?"}, "expected": "Open Settings, choose Security, then Reset password.", "tags": ["account"], "split": "dev"}
+{"id": "faq-006", "input": {"question": "Steps to reset my password, please."}, "expected": "Open Settings, choose Security, then Reset password.", "tags": ["account"], "split": "test"}
+{"id": "faq-007", "input": {"question": "Help me reset my password."}, "expected": "Open Settings, choose Security, then Reset password.", "tags": ["account"], "split": "test"}
+{"id": "faq-008", "input": {"question": "Is it possible to reset my password?"}, "expected": "Open Settings, choose Security, then Reset password.", "tags": ["account"], "split": "test"}
+{"id": "faq-009", "input": {"question": "How do I change my billing email?"}, "expected": "Go to Billing, then Contacts, and edit the billing email.", "tags": ["billing"], "split": "dev"}
+{"id": "faq-010", "input": {"question": "Where can I change my billing email?"}, "expected": "Go to Billing, then Contacts, and edit the billing email.", "tags": ["billing"], "split": "test"}
+{"id": "faq-011", "input": {"question": "I need to change my billing email. What are the steps?"}, "expected": "Go to Billing, then Contacts, and edit the billing email.", "tags": ["billing"], "split": "test"}
+{"id": "faq-012", "input": {"question": "Can you tell me how to change my billing email?"}, "expected": "Go to Billing, then Contacts, and edit the billing email.", "tags": ["billing"], "split": "test"}
+{"id": "faq-013", "input": {"question": "What's the way to change my billing email?"}, "expected": "Go to Billing, then Contacts, and edit the billing email.", "tags": ["billing"], "split": "dev"}
+{"id": "faq-014", "input": {"question": "Steps to change my billing email, please."}, "expected": "Go to Billing, then Contacts, and edit the billing email.", "tags": ["billing"], "split": "test"}
+{"id": "faq-015", "input": {"question": "Help me change my billing email."}, "expected": "Go to Billing, then Contacts, and edit the billing email.", "tags": ["billing"], "split": "test"}
+{"id": "faq-016", "input": {"question": "Is it possible to change my billing email?"}, "expected": "Go to Billing, then Contacts, and edit the billing email.", "tags": ["billing"], "split": "test"}
+{"id": "faq-017", "input": {"question": "How do I cancel my subscription?"}, "expected": "Open Billing, choose Plan, then Cancel subscription.", "tags": ["workspace"], "split": "dev"}
+{"id": "faq-018", "input": {"question": "Where can I cancel my subscription?"}, "expected": "Open Billing, choose Plan, then Cancel subscription.", "tags": ["workspace"], "split": "test"}
+{"id": "faq-019", "input": {"question": "I need to cancel my subscription. What are the steps?"}, "expected": "Open Billing, choose Plan, then Cancel subscription.", "tags": ["workspace"], "split": "test"}
+{"id": "faq-020", "input": {"question": "Can you tell me how to cancel my subscription?"}, "expected": "Open Billing, choose Plan, then Cancel subscription.", "tags": ["workspace"], "split": "test"}
+{"id": "faq-021", "input": {"question": "What's the way to cancel my subscription?"}, "expected": "Open Billing, choose Plan, then Cancel subscription.", "tags": ["workspace"], "split": "dev"}
+{"id": "faq-022", "input": {"question": "Steps to cancel my subscription, please."}, "expected": "Open Billing, choose Plan, then Cancel subscription.", "tags": ["workspace"], "split": "test"}
+{"id": "faq-023", "input": {"question": "Help me cancel my subscription."}, "expected": "Open Billing, choose Plan, then Cancel subscription.", "tags": ["workspace"], "split": "test"}
+{"id": "faq-024", "input": {"question": "Is it possible to cancel my subscription?"}, "expected": "Open Billing, choose Plan, then Cancel subscription.", "tags": ["workspace"], "split": "test"}
+{"id": "faq-025", "input": {"question": "How do I export my data?"}, "expected": "Use Settings, Data, Export; the archive arrives by email.", "tags": ["account"], "split": "dev"}
+{"id": "faq-026", "input": {"question": "Where can I export my data?"}, "expected": "Use Settings, Data, Export; the archive arrives by email.", "tags": ["account"], "split": "test"}
+{"id": "faq-027", "input": {"question": "I need to export my data. What are the steps?"}, "expected": "Use Settings, Data, Export; the archive arrives by email.", "tags": ["account"], "split": "test"}
+{"id": "faq-028", "input": {"question": "Can you tell me how to export my data?"}, "expected": "Use Settings, Data, Export; the archive arrives by email.", "tags": ["account"], "split": "test"}
+{"id": "faq-029", "input": {"question": "What's the way to export my data?"}, "expected": "Use Settings, Data, Export; the archive arrives by email.", "tags": ["account"], "split": "dev"}
+{"id": "faq-030", "input": {"question": "Steps to export my data, please."}, "expected": "Use Settings, Data, Export; the archive arrives by email.", "tags": ["account"], "split": "test"}
+{"id": "faq-031", "input": {"question": "Help me export my data."}, "expected": "Use Settings, Data, Export; the archive arrives by email.", "tags": ["account"], "split": "test"}
+{"id": "faq-032", "input": {"question": "Is it possible to export my data?"}, "expected": "Use Settings, Data, Export; the archive arrives by email.", "tags": ["account"], "split": "test"}
+{"id": "faq-033", "input": {"question": "How do I add a team member?"}, "expected": "Open Team, select Invite, and enter their email address.", "tags": ["billing"], "split": "dev"}
+{"id": "faq-034", "input": {"question": "Where can I add a team member?"}, "expected": "Open Team, select Invite, and enter their email address.", "tags": ["billing"], "split": "test"}
+{"id": "faq-035", "input": {"question": "I need to add a team member. What are the steps?"}, "expected": "Open Team, select Invite, and enter their email address.", "tags": ["billing"], "split": "test"}
+{"id": "faq-036", "input": {"question": "Can you tell me how to add a team member?"}, "expected": "Open Team, select Invite, and enter their email address.", "tags": ["billing"], "split": "test"}
+{"id": "faq-037", "input": {"question": "What's the way to add a team member?"}, "expected": "Open Team, select Invite, and enter their email address.", "tags": ["billing"], "split": "dev"}
+{"id": "faq-038", "input": {"question": "Steps to add a team member, please."}, "expected": "Open Team, select Invite, and enter their email address.", "tags": ["billing"], "split": "test"}
+{"id": "faq-039", "input": {"question": "Help me add a team member."}, "expected": "Open Team, select Invite, and enter their email address.", "tags": ["billing"], "split": "test"}
+{"id": "faq-040", "input": {"question": "Is it possible to add a team member?"}, "expected": "Open Team, select Invite, and enter their email address.", "tags": ["billing"], "split": "test"}
+{"id": "faq-041", "input": {"question": "How do I remove a team member?"}, "expected": "Open Team, open the member's menu, and choose Remove.", "tags": ["workspace"], "split": "dev"}
+{"id": "faq-042", "input": {"question": "Where can I remove a team member?"}, "expected": "Open Team, open the member's menu, and choose Remove.", "tags": ["workspace"], "split": "test"}
+{"id": "faq-043", "input": {"question": "I need to remove a team member. What are the steps?"}, "expected": "Open Team, open the member's menu, and choose Remove.", "tags": ["workspace"], "split": "test"}
+{"id": "faq-044", "input": {"question": "Can you tell me how to remove a team member?"}, "expected": "Open Team, open the member's menu, and choose Remove.", "tags": ["workspace"], "split": "test"}
+{"id": "faq-045", "input": {"question": "What's the way to remove a team member?"}, "expected": "Open Team, open the member's menu, and choose Remove.", "tags": ["workspace"], "split": "dev"}
+{"id": "faq-046", "input": {"question": "Steps to remove a team member, please."}, "expected": "Open Team, open the member's menu, and choose Remove.", "tags": ["workspace"], "split": "test"}
+{"id": "faq-047", "input": {"question": "Help me remove a team member."}, "expected": "Open Team, open the member's menu, and choose Remove.", "tags": ["workspace"], "split": "test"}
+{"id": "faq-048", "input": {"question": "Is it possible to remove a team member?"}, "expected": "Open Team, open the member's menu, and choose Remove.", "tags": ["workspace"], "split": "test"}
+{"id": "faq-049", "input": {"question": "How do I enable two-factor authentication?"}, "expected": "Go to Security and turn on Two-factor authentication.", "tags": ["account"], "split": "dev"}
+{"id": "faq-050", "input": {"question": "Where can I enable two-factor authentication?"}, "expected": "Go to Security and turn on Two-factor authentication.", "tags": ["account"], "split": "test"}
+{"id": "faq-051", "input": {"question": "I need to enable two-factor authentication. What are the steps?"}, "expected": "Go to Security and turn on Two-factor authentication.", "tags": ["account"], "split": "test"}
+{"id": "faq-052", "input": {"question": "Can you tell me how to enable two-factor authentication?"}, "expected": "Go to Security and turn on Two-factor authentication.", "tags": ["account"], "split": "test"}
+{"id": "faq-053", "input": {"question": "What's the way to enable two-factor authentication?"}, "expected": "Go to Security and turn on Two-factor authentication.", "tags": ["account"], "split": "dev"}
+{"id": "faq-054", "input": {"question": "Steps to enable two-factor authentication, please."}, "expected": "Go to Security and turn on Two-factor authentication.", "tags": ["account"], "split": "test"}
+{"id": "faq-055", "input": {"question": "Help me enable two-factor authentication."}, "expected": "Go to Security and turn on Two-factor authentication.", "tags": ["account"], "split": "test"}
+{"id": "faq-056", "input": {"question": "Is it possible to enable two-factor authentication?"}, "expected": "Go to Security and turn on Two-factor authentication.", "tags": ["account"], "split": "test"}
+{"id": "faq-057", "input": {"question": "How do I download an invoice?"}, "expected": "Open Billing, then Invoices, and select Download.", "tags": ["billing"], "split": "dev"}
+{"id": "faq-058", "input": {"question": "Where can I download an invoice?"}, "expected": "Open Billing, then Invoices, and select Download.", "tags": ["billing"], "split": "test"}
+{"id": "faq-059", "input": {"question": "I need to download an invoice. What are the steps?"}, "expected": "Open Billing, then Invoices, and select Download.", "tags": ["billing"], "split": "test"}
+{"id": "faq-060", "input": {"question": "Can you tell me how to download an invoice?"}, "expected": "Open Billing, then Invoices, and select Download.", "tags": ["billing"], "split": "test"}
+{"id": "faq-061", "input": {"question": "What's the way to download an invoice?"}, "expected": "Open Billing, then Invoices, and select Download.", "tags": ["billing"], "split": "dev"}
+{"id": "faq-062", "input": {"question": "Steps to download an invoice, please."}, "expected": "Open Billing, then Invoices, and select Download.", "tags": ["billing"], "split": "test"}
+{"id": "faq-063", "input": {"question": "Help me download an invoice."}, "expected": "Open Billing, then Invoices, and select Download.", "tags": ["billing"], "split": "test"}
+{"id": "faq-064", "input": {"question": "Is it possible to download an invoice?"}, "expected": "Open Billing, then Invoices, and select Download.", "tags": ["billing"], "split": "test"}
+{"id": "faq-065", "input": {"question": "How do I change my plan?"}, "expected": "Open Billing, choose Plan, and pick the new plan.", "tags": ["workspace"], "split": "dev"}
+{"id": "faq-066", "input": {"question": "Where can I change my plan?"}, "expected": "Open Billing, choose Plan, and pick the new plan.", "tags": ["workspace"], "split": "test"}
+{"id": "faq-067", "input": {"question": "I need to change my plan. What are the steps?"}, "expected": "Open Billing, choose Plan, and pick the new plan.", "tags": ["workspace"], "split": "test"}
+{"id": "faq-068", "input": {"question": "Can you tell me how to change my plan?"}, "expected": "Open Billing, choose Plan, and pick the new plan.", "tags": ["workspace"], "split": "test"}
+{"id": "faq-069", "input": {"question": "What's the way to change my plan?"}, "expected": "Open Billing, choose Plan, and pick the new plan.", "tags": ["workspace"], "split": "dev"}
+{"id": "faq-070", "input": {"question": "Steps to change my plan, please."}, "expected": "Open Billing, choose Plan, and pick the new plan.", "tags": ["workspace"], "split": "test"}
+{"id": "faq-071", "input": {"question": "Help me change my plan."}, "expected": "Open Billing, choose Plan, and pick the new plan.", "tags": ["workspace"], "split": "test"}
+{"id": "faq-072", "input": {"question": "Is it possible to change my plan?"}, "expected": "Open Billing, choose Plan, and pick the new plan.", "tags": ["workspace"], "split": "test"}
+{"id": "faq-073", "input": {"question": "How do I delete my account?"}, "expected": "Go to Settings, Account, then Delete account.", "tags": ["account"], "split": "dev"}
+{"id": "faq-074", "input": {"question": "Where can I delete my account?"}, "expected": "Go to Settings, Account, then Delete account.", "tags": ["account"], "split": "test"}
+{"id": "faq-075", "input": {"question": "I need to delete my account. What are the steps?"}, "expected": "Go to Settings, Account, then Delete account.", "tags": ["account"], "split": "test"}
+{"id": "faq-076", "input": {"question": "Can you tell me how to delete my account?"}, "expected": "Go to Settings, Account, then Delete account.", "tags": ["account"], "split": "test"}
+{"id": "faq-077", "input": {"question": "What's the way to delete my account?"}, "expected": "Go to Settings, Account, then Delete account.", "tags": ["account"], "split": "dev"}
+{"id": "faq-078", "input": {"question": "Steps to delete my account, please."}, "expected": "Go to Settings, Account, then Delete account.", "tags": ["account"], "split": "test"}
+{"id": "faq-079", "input": {"question": "Help me delete my account."}, "expected": "Go to Settings, Account, then Delete account.", "tags": ["account"], "split": "test"}
+{"id": "faq-080", "input": {"question": "Is it possible to delete my account?"}, "expected": "Go to Settings, Account, then Delete account.", "tags": ["account"], "split": "test"}
+{"id": "faq-081", "input": {"question": "How do I update my payment card?"}, "expected": "Open Billing, then Payment method, and replace the card.", "tags": ["billing"], "split": "dev"}
+{"id": "faq-082", "input": {"question": "Where can I update my payment card?"}, "expected": "Open Billing, then Payment method, and replace the card.", "tags": ["billing"], "split": "test"}
+{"id": "faq-083", "input": {"question": "I need to update my payment card. What are the steps?"}, "expected": "Open Billing, then Payment method, and replace the card.", "tags": ["billing"], "split": "test"}
+{"id": "faq-084", "input": {"question": "Can you tell me how to update my payment card?"}, "expected": "Open Billing, then Payment method, and replace the card.", "tags": ["billing"], "split": "test"}
+{"id": "faq-085", "input": {"question": "What's the way to update my payment card?"}, "expected": "Open Billing, then Payment method, and replace the card.", "tags": ["billing"], "split": "dev"}
+{"id": "faq-086", "input": {"question": "Steps to update my payment card, please."}, "expected": "Open Billing, then Payment method, and replace the card.", "tags": ["billing"], "split": "test"}
+{"id": "faq-087", "input": {"question": "Help me update my payment card."}, "expected": "Open Billing, then Payment method, and replace the card.", "tags": ["billing"], "split": "test"}
+{"id": "faq-088", "input": {"question": "Is it possible to update my payment card?"}, "expected": "Open Billing, then Payment method, and replace the card.", "tags": ["billing"], "split": "test"}
+{"id": "faq-089", "input": {"question": "How do I rename a project?"}, "expected": "Open the project, choose Settings, and edit the name.", "tags": ["workspace"], "split": "dev"}
+{"id": "faq-090", "input": {"question": "Where can I rename a project?"}, "expected": "Open the project, choose Settings, and edit the name.", "tags": ["workspace"], "split": "test"}
+{"id": "faq-091", "input": {"question": "I need to rename a project. What are the steps?"}, "expected": "Open the project, choose Settings, and edit the name.", "tags": ["workspace"], "split": "test"}
+{"id": "faq-092", "input": {"question": "Can you tell me how to rename a project?"}, "expected": "Open the project, choose Settings, and edit the name.", "tags": ["workspace"], "split": "test"}
+{"id": "faq-093", "input": {"question": "What's the way to rename a project?"}, "expected": "Open the project, choose Settings, and edit the name.", "tags": ["workspace"], "split": "dev"}
+{"id": "faq-094", "input": {"question": "Steps to rename a project, please."}, "expected": "Open the project, choose Settings, and edit the name.", "tags": ["workspace"], "split": "test"}
+{"id": "faq-095", "input": {"question": "Help me rename a project."}, "expected": "Open the project, choose Settings, and edit the name.", "tags": ["workspace"], "split": "test"}
+{"id": "faq-096", "input": {"question": "Is it possible to rename a project?"}, "expected": "Open the project, choose Settings, and edit the name.", "tags": ["workspace"], "split": "test"}
+{"id": "faq-097", "input": {"question": "How do I restore a deleted file?"}, "expected": "Open Trash, select the file, and choose Restore.", "tags": ["account"], "split": "dev"}
+{"id": "faq-098", "input": {"question": "Where can I restore a deleted file?"}, "expected": "Open Trash, select the file, and choose Restore.", "tags": ["account"], "split": "test"}
+{"id": "faq-099", "input": {"question": "I need to restore a deleted file. What are the steps?"}, "expected": "Open Trash, select the file, and choose Restore.", "tags": ["account"], "split": "test"}
+{"id": "faq-100", "input": {"question": "Can you tell me how to restore a deleted file?"}, "expected": "Open Trash, select the file, and choose Restore.", "tags": ["account"], "split": "test"}
+{"id": "faq-101", "input": {"question": "What's the way to restore a deleted file?"}, "expected": "Open Trash, select the file, and choose Restore.", "tags": ["account"], "split": "dev"}
+{"id": "faq-102", "input": {"question": "Steps to restore a deleted file, please."}, "expected": "Open Trash, select the file, and choose Restore.", "tags": ["account"], "split": "test"}
+{"id": "faq-103", "input": {"question": "Help me restore a deleted file."}, "expected": "Open Trash, select the file, and choose Restore.", "tags": ["account"], "split": "test"}
+{"id": "faq-104", "input": {"question": "Is it possible to restore a deleted file?"}, "expected": "Open Trash, select the file, and choose Restore.", "tags": ["account"], "split": "test"}
+{"id": "faq-105", "input": {"question": "How do I share a document?"}, "expected": "Open the document and use Share to add people.", "tags": ["billing"], "split": "dev"}
+{"id": "faq-106", "input": {"question": "Where can I share a document?"}, "expected": "Open the document and use Share to add people.", "tags": ["billing"], "split": "test"}
+{"id": "faq-107", "input": {"question": "I need to share a document. What are the steps?"}, "expected": "Open the document and use Share to add people.", "tags": ["billing"], "split": "test"}
+{"id": "faq-108", "input": {"question": "Can you tell me how to share a document?"}, "expected": "Open the document and use Share to add people.", "tags": ["billing"], "split": "test"}
+{"id": "faq-109", "input": {"question": "What's the way to share a document?"}, "expected": "Open the document and use Share to add people.", "tags": ["billing"], "split": "dev"}
+{"id": "faq-110", "input": {"question": "Steps to share a document, please."}, "expected": "Open the document and use Share to add people.", "tags": ["billing"], "split": "test"}
+{"id": "faq-111", "input": {"question": "Help me share a document."}, "expected": "Open the document and use Share to add people.", "tags": ["billing"], "split": "test"}
+{"id": "faq-112", "input": {"question": "Is it possible to share a document?"}, "expected": "Open the document and use Share to add people.", "tags": ["billing"], "split": "test"}
+{"id": "faq-113", "input": {"question": "How do I turn off email notifications?"}, "expected": "Go to Settings, Notifications, and switch off email.", "tags": ["workspace"], "split": "dev"}
+{"id": "faq-114", "input": {"question": "Where can I turn off email notifications?"}, "expected": "Go to Settings, Notifications, and switch off email.", "tags": ["workspace"], "split": "test"}
+{"id": "faq-115", "input": {"question": "I need to turn off email notifications. What are the steps?"}, "expected": "Go to Settings, Notifications, and switch off email.", "tags": ["workspace"], "split": "test"}
+{"id": "faq-116", "input": {"question": "Can you tell me how to turn off email notifications?"}, "expected": "Go to Settings, Notifications, and switch off email.", "tags": ["workspace"], "split": "test"}
+{"id": "faq-117", "input": {"question": "What's the way to turn off email notifications?"}, "expected": "Go to Settings, Notifications, and switch off email.", "tags": ["workspace"], "split": "dev"}
+{"id": "faq-118", "input": {"question": "Steps to turn off email notifications, please."}, "expected": "Go to Settings, Notifications, and switch off email.", "tags": ["workspace"], "split": "test"}
+{"id": "faq-119", "input": {"question": "Help me turn off email notifications."}, "expected": "Go to Settings, Notifications, and switch off email.", "tags": ["workspace"], "split": "test"}
+{"id": "faq-120", "input": {"question": "Is it possible to turn off email notifications?"}, "expected": "Go to Settings, Notifications, and switch off email.", "tags": ["workspace"], "split": "test"}

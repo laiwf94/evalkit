@@ -1,0 +1,10 @@
+{"id": "l01", "input": {"question": "How do I reset my password?"}, "expected": "Open Settings, choose Security, then Reset password.", "output": "Open Settings, choose Security, then Reset password.", "label": 5}
+{"id": "l02", "input": {"question": "How do I reset my password?"}, "expected": "Open Settings, choose Security, then Reset password.", "output": "Go to Settings and reset it there.", "label": 3}
+{"id": "l03", "input": {"question": "Where can I download an invoice?"}, "expected": "Open Billing, then Invoices, and select Download.", "output": "Invoices are under Billing > Invoices; click Download.", "label": 5}
+{"id": "l04", "input": {"question": "Where can I download an invoice?"}, "expected": "Open Billing, then Invoices, and select Download.", "output": "Contact support for invoices.", "label": 1}
+{"id": "l05", "input": {"question": "How do I add a team member?"}, "expected": "Open Team, select Invite, and enter their email address.", "output": "Open Team and choose Invite.", "label": 5}
+{"id": "l06", "input": {"question": "How do I add a team member?"}, "expected": "Open Team, select Invite, and enter their email address.", "output": "Open Settings, then Security.", "label": 1}
+{"id": "l07", "input": {"question": "How do I cancel my subscription?"}, "expected": "Open Billing, choose Plan, then Cancel subscription.", "output": "Billing > Cancel subscription.", "label": 3}
+{"id": "l08", "input": {"question": "How do I export my data?"}, "expected": "Use Settings, Data, Export; the archive arrives by email.", "output": "Settings > Data > Export, and you will get an email.", "label": 5}
+{"id": "l09", "input": {"question": "How do I turn off email notifications?"}, "expected": "Go to Settings, Notifications, and switch off email.", "output": "You can't.", "label": 1}
+{"id": "l10", "input": {"question": "How do I share a document?"}, "expected": "Open the document and use Share to add people.", "output": "Use the Share button in the document.", "label": 5}
