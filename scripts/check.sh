@@ -6,3 +6,4 @@ uv run ruff format --check .
 uv run ruff check .
 uv run mypy
 uv run pytest "$@"
+uv run pip-audit --skip-editable

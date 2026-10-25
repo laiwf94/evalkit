@@ -1,0 +1,47 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          version: "0.13.5"
+      - name: Install
+        run: uv sync --frozen
+      - name: Format
+        run: uv run ruff format --check .
+      - name: Lint
+        run: uv run ruff check .
+      - name: Types
+        run: uv run mypy
+      - name: Tests (unit, property, end to end on PostgreSQL; coverage >= 90%)
+        run: uv run pytest
+      - name: Vulnerabilities
+        run: uv run pip-audit --skip-editable
+      - name: Demo
+        run: ./examples/demo.sh
+
+  docker:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build
+        run: docker build -t evalkit .
+      - name: Start and check health
+        run: |
+          docker run -d --name evalkit -p 8080:8080 \
+            -e EVALKIT_API_TOKENS=ci-token-0123456789abcdef \
+            -e EVALKIT_DATABASE_URL=sqlite:////tmp/evalkit.db evalkit
+          for i in $(seq 1 30); do curl -fsS localhost:8080/healthz && exit 0; sleep 1; done
+          docker logs evalkit
+          exit 1

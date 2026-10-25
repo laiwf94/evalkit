@@ -298,7 +298,9 @@ band.
 ## Dependencies
 
 Each pinned to an exact version released at least two weeks before the lock
-was made (`exclude-newer` in `pyproject.toml`).
+was made (`exclude-newer` in `pyproject.toml`). The exception is a release that
+fixes a published vulnerability: `certifi` and `filelock` (both transitive) are
+allowed newer versions because `pip-audit` flagged the older ones.
 
 | Package | Why it is here |
 |---|---|

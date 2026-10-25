@@ -47,8 +47,11 @@ build-backend = "hatchling.build"
 packages = ["src/evalkit"]
 
 [tool.uv]
-# Only resolve releases that have been public for at least two weeks.
+# Only resolve releases that have been public for at least two weeks, except
+# where a newer release fixes a published vulnerability (pip-audit in CI).
 exclude-newer = "2026-10-11T00:00:00Z"
+exclude-newer-package = { certifi = "2026-10-21T00:00:00Z", filelock = "2026-10-18T00:00:00Z" }
+constraint-dependencies = ["certifi>=2026.10.19", "filelock>=4.2.1"]
 
 [tool.ruff]
 line-length = 100
