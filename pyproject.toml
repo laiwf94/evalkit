@@ -9,8 +9,10 @@ authors = [{ name = "Woon Fei Lai" }]
 requires-python = ">=3.12"
 dependencies = [
     "alembic==1.20.0",
+    "jsonschema==4.26.0",
     "psycopg[binary]==3.3.6",
     "pydantic==2.14.0",
+    "referencing==0.37.0",
     "regex==2026.9.29",
     "sqlalchemy==2.1.4",
 ]
@@ -27,6 +29,7 @@ dev = [
     "mypy==2.4.0",
     "pip-audit==2.10.1",
     "types-regex==2026.9.29.20261005",
+    "types-jsonschema==4.26.0.20261006",
 ]
 
 [build-system]
