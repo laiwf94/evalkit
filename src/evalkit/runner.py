@@ -183,6 +183,7 @@ class Runner:
         self.lease_ttl = lease_ttl or timedelta(seconds=settings.lease_seconds)
         # Renew well before expiry so one slow database round trip cannot lose the lease.
         self.heartbeat_seconds = heartbeat_seconds or self.lease_ttl.total_seconds() / 3
+        self._executing: set[str] = set()
 
     def create_run(self, config: RunConfig) -> Run:
         """Validate ``config`` against the stored dataset and record a pending run."""
@@ -214,6 +215,17 @@ class Runner:
             return run
 
     async def execute(self, run_id: str) -> ExecutionReport:
+        # The lease lets its owner re-claim a run, which is how a process resumes
+        # its own failed run; this set stops it from executing one run twice at once.
+        if run_id in self._executing:
+            raise ConflictError(f"run {run_id} is already executing in this process")
+        self._executing.add(run_id)
+        try:
+            return await self._execute(run_id)
+        finally:
+            self._executing.discard(run_id)
+
+    async def _execute(self, run_id: str) -> ExecutionReport:
         with log_context(run_id=run_id):
             run = await asyncio.to_thread(self._claim, run_id)
             if run.status == "completed":

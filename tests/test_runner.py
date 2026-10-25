@@ -515,3 +515,19 @@ def test_judge_verdicts_are_cached_across_runs(
     assert a.judge_cost_usd > 0
     assert b.judge_cost_usd == 0.0
     assert b.metrics[0].mean == a.metrics[0].mean == 1.0
+
+
+def test_one_process_never_executes_a_run_twice(
+    sessions: sessionmaker[Session], dataset: str
+) -> None:
+    factory = CountingFactory()
+    r = runner(sessions, target_factory=factory)
+    run = r.create_run(config(latency_ms=20, options={"concurrency": 2}))
+
+    async def both() -> Any:
+        return await asyncio.gather(r.execute(run.id), r.execute(run.id), return_exceptions=True)
+
+    first, second = asyncio.run(both())
+    assert first.executed == 40
+    assert isinstance(second, ConflictError)
+    assert factory.calls == 40
