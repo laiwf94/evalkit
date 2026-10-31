@@ -31,6 +31,11 @@ CASES = Counter(
     ["status", "source"],
     registry=REGISTRY,
 )
+RESULTS_REFUSED = Counter(
+    "evalkit_results_refused_total",
+    "Results not saved because another process had taken the case over (its lease expired).",
+    registry=REGISTRY,
+)
 TARGET_ATTEMPTS = Counter(
     "evalkit_target_attempts_total",
     "Calls made to targets, including retries.",

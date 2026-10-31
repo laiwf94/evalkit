@@ -125,7 +125,8 @@ size; Holm correction applies when several metrics are gated together.
 
 `RUN` is a run id or `label:NAME` for the newest completed run with that
 label. Exit codes: 0 success, 1 regression, 2 bad input, 3 the run cannot be
-used (failed, incomplete, held by another process, different datasets) or any
+used (failed, incomplete, a batch-mode run held by another process, different
+datasets) or any
 other error, 130 interrupted. Commands that print a report take `--json`.
 
 ## Running it as a service
@@ -173,7 +174,7 @@ over a fake HTTP transport that checks the exact request body; one opt-in test
 |---|---|
 | Statistics | Monte Carlo on synthetic data with a known answer: 95% intervals cover the true mean 93.5% (normal) and 95.3% (Bernoulli) of 1,000 trials; the permutation test rejects 4.2% of true nulls at alpha 0.05; a 0.5 SD drop on 100 pairs is caught in at least 95% of trials. Hypothesis tests for invariants (shift equivariance, sign symmetry, Holm monotonicity). Breaking the methods on purpose (one-sided test, unpaired differences, wrong interval tails) makes these tests fail. |
 | Hashing and redaction | Hypothesis: the dataset hash ignores key order, whitespace and line order but changes with any field; generated emails and Luhn-valid card numbers are always removed; redaction is idempotent. A catastrophic regex is stopped by its time limit. |
-| Crash safety | A CLI run on PostgreSQL is killed with SIGKILL mid-run; a resume is refused while the dead process's lease is live, then completes with every case recorded exactly once. In-process tests interrupt runs and check that finished work is saved and not repeated. |
+| Crash safety | A CLI run on PostgreSQL is killed with SIGKILL mid-run; a resume joins at once and takes the dead process's cases over when their leases expire, with every case recorded exactly once. Four processes share one run on PostgreSQL and one is SIGKILLed: the other three finish it, each case recorded and paid for once. Eight threads claiming at once get disjoint batches. In-process tests interrupt runs, take cases over from under a running process (its late results are refused) and check that finished work is saved and not repeated. |
 | SSRF | Loopback, private, link-local, metadata, CGNAT and IPv4-in-IPv6 addresses are refused; a DNS answer that changes after the check cannot redirect the request. |
 | End to end | Testcontainers PostgreSQL 16, the real server as a subprocess, a stand-in app over HTTP, the CLI gate against the same database. |
 | API and CLI | Every endpoint, error code and exit code, over ASGI and over the wire. |
@@ -214,7 +215,8 @@ src/evalkit/datasets.py    JSONL parsing, content hashing, versioned storage
 src/evalkit/targets/       prompt, HTTP (SSRF-safe) and fake targets; templates
 src/evalkit/scorers/       built-in scorers, plugin registry, LLM judge, calibration
 src/evalkit/llm.py         the Claude client: caching, structured output, fallback, cost
-src/evalkit/runner.py      worker pool, cache, leases, resume, batch mode
+src/evalkit/runner.py      worker pool, cache, resume, run completion, batch mode
+src/evalkit/leases.py      case leases: SKIP LOCKED claims and fenced result writes
 src/evalkit/stats.py       bootstrap, permutation test, effect size, Holm
 src/evalkit/report.py      run summaries and comparisons
 src/evalkit/estimate.py    cost estimates from token counts

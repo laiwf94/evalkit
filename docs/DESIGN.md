@@ -11,10 +11,10 @@ finished work. And because the harness also runs as a shared service, inputs
 are bounded, it makes no requests to arbitrary URLs, and neither the store nor
 the logs hold personal data or keys.
 
-It does not evaluate model weights at training time, it is not a human
-annotation tool (calibration labels are imported, not collected), and it does
-not spread a single run across machines. That last one is discussed under
-[Bigger runs](#bigger-runs).
+It does not evaluate model weights at training time, and it is not a human
+annotation tool (calibration labels are imported, not collected). Several
+processes, on several machines, can share one run; what else changes at scale
+is discussed under [Bigger runs](#bigger-runs).
 
 ## What is stored
 
@@ -22,7 +22,8 @@ not spread a single run across machines. That last one is discussed under
 datasets        (name, version) unique, (name, content_hash) unique
 dataset_cases   (dataset_id, case_id) unique; input, expected, tags, split, metadata (JSON)
 runs            target spec + target hash, scorer specs, options, filter, seed,
-                status, lease (owner, expires_at), batch_id
+                status, lease (owner, expires_at; batch mode only), batch_id
+case_leases     (run_id, case_id) key; position, owner, expires_at, fence, done
 results         (run_id, case_id) unique; redacted output, scores (JSON), tokens,
                 cost, judge tokens and cost, attempts, latency, error
 response_cache  key = sha256(target hash, input, redaction fingerprint)
@@ -78,14 +79,47 @@ writer had not committed); on Ctrl-C or shutdown even those are written before
 the process stops. The kill -9 test in `tests/e2e` checks the exactly-once
 property against PostgreSQL.
 
-### Leases
+### Case leases
 
-Two processes must never execute the same run, or cases would be
-paid for twice. A process claims a run with a conditional UPDATE that succeeds
-only if the lease is free, its own, or expired, and renews it every third of
-the lease length (30 s by default). A process that finds its lease taken stops.
-If a runner dies, its lease expires and any process can resume. The trade-off
-is that a crashed run waits up to one lease length before it can be resumed.
+Any number of processes can execute one run, and a case must never be
+executed (and paid for) twice. When a run is first joined, every case still to
+do gets a row in `case_leases`. A process claims a batch of rows (four per
+worker, at least 64) with one UPDATE whose candidates come from
+`SELECT ... FOR UPDATE SKIP LOCKED`, so processes claiming at the same moment
+take disjoint batches without waiting for each other. A claim sets an owner, an
+expiry and a fence token one higher than the last. The process renews its
+leases every third of the lease length (30 s by default) and claims again when
+its queue is half empty.
+
+A result is written in the same transaction that marks its lease done, and only
+if the lease still has the owner and token of the claim. A process that stalls
+past its expiry can lose a case to another process, which claims it with a
+higher token; the stalled process's late result is then refused, so the case is
+recorded once. If a process dies, its leases expire and the others take the
+cases over: a crashed run waits up to one lease length for the cases that were
+in flight, and none for the rest. On Ctrl-C a process writes its finished
+results and gives its other leases back at once.
+
+A process that finds nothing to claim waits while other processes still hold
+cases (until their first lease could expire, or one heartbeat), and keeps
+claiming until every case is finished, including its own. Then it marks the run
+completed with a compare-and-set (`status <> 'completed' AND NOT EXISTS
+(unfinished lease)`), so exactly one of the processes that finish together
+completes the run. Worker clocks must agree to well within one lease length.
+
+On SQLite there are no row locks: the claiming UPDATE takes the database write
+lock, which serialises claims, and within one process claims and result writes
+take turns on a thread lock rather than SQLite's busy-wait. Claims, and the
+lease update in each result write, add 20-30% to the harness overhead on a
+target that answers instantly (about 100 µs per case on SQLite, 160 µs on
+PostgreSQL, on the benchmark machine) and under 5% of throughput on a 50 ms
+target.
+
+A batch-mode run is the exception. One Message Batch is one paid request for
+the whole run, so a batch-mode run is held by one process at a time with a
+lease on the run row (a conditional UPDATE that succeeds only if the lease is
+free, its own, or expired); a second process gets `conflict`, and a process
+that finds the lease taken stops.
 
 ### The response cache
 
@@ -256,9 +290,10 @@ band.
 
 | Failure | What happens |
 |---|---|
-| Process killed mid-run | Finished, committed cases are kept. The lease expires after 30 s; `run --resume` continues with the remaining cases. |
-| Ctrl-C or server shutdown | Queued results are written, the run is marked `interrupted` and the lease released. |
-| Two processes resume the same run | The second fails with `conflict` while the first holds the lease. |
+| Process killed mid-run | Finished, committed cases are kept. Other processes on the run, or a `run --resume`, take its cases over when its leases expire (30 s). |
+| A process stalls past its lease | Another process takes its cases over; the stalled process's results for them are refused. |
+| Ctrl-C or server shutdown | Queued results are written and the process's other leases released; the run is marked `interrupted` unless another process is still working on it. |
+| Two processes resume the same run | They share it. For a batch-mode run, the second fails with `conflict` while the first holds the lease. |
 | 429 or 529 from the API | Provider-wide cool-down for Retry-After, then retry; after the attempt limit the case is recorded as an error and scores 0. |
 | Target returns 4xx, redirect, non-JSON or an oversized body | Recorded as an error for that case, not retried. |
 | A scorer plugin raises | That score is `unscorable` with the message; the run continues. |
@@ -288,7 +323,8 @@ band.
 | Judge `max_tokens` | 256-16,000 | |
 | Calibration items | 5,000 | |
 | Result page | 500 | |
-| Run lease | 30 s default | Time before a dead runner's run can be resumed. |
+| Case lease | 30 s default | Time before a dead process's cases are taken over. |
+| Cases per claim | 4 per worker, 64-500 | Bounds what a dead process strands for one lease length. |
 
 ## Running it as a shared service
 
@@ -345,11 +381,6 @@ allowed newer versions because `pip-audit` flagged the older ones.
 ## Bigger runs
 
 Several things would change for many teams and much larger datasets.
-
-Today one process executes a run. The lease model extends to case-level leases,
-where workers claim batches of case ids with `SELECT ... FOR UPDATE SKIP
-LOCKED`, so several machines could work on one run; the unique (run, case)
-constraint already makes results idempotent.
 
 Token buckets are per process. With many workers on one API key they would move
 to a shared store (for example a Redis-backed GCRA limiter) so the provider

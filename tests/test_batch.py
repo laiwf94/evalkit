@@ -1,22 +1,23 @@
 import asyncio
 import json
+from datetime import timedelta
 from typing import Any
 
 import anthropic
 import httpx2
 import pytest
 from pydantic import SecretStr
-from sqlalchemy import select
+from sqlalchemy import select, update
 from sqlalchemy.orm import Session, sessionmaker
 
 from evalkit.config import Settings
 from evalkit.datasets import Case, import_dataset
-from evalkit.db.models import Result, Run
-from evalkit.errors import InvalidInputError
+from evalkit.db.models import CaseLease, Result, Run, utcnow
+from evalkit.errors import ConflictError, InvalidInputError
 from evalkit.llm import ClaudeClient
 from evalkit.pricing import PriceTable
 from evalkit.report import summarize
-from evalkit.runner import Runner, batch_custom_id
+from evalkit.runner import LeaseLostError, Runner, batch_custom_id
 from evalkit.runspec import RunConfig
 from evalkit.targets.fake import FakeTarget
 from tests.fake_anthropic import message
@@ -217,3 +218,57 @@ def test_custom_ids_fit_the_api_pattern() -> None:
     cid = batch_custom_id("a case id with spaces/and slashes")
     assert len(cid) <= 64
     assert cid.replace("_", "").replace("-", "").isalnum()
+
+
+def test_a_batch_run_belongs_to_one_process(
+    sessions: sessionmaker[Session], cases: list[Case]
+) -> None:
+    api = FakeBatchApi(polls_before_end=0)
+    a = Runner(sessions, Settings(), claude=api.client(), clock=FakeClock(), owner="a")
+    run = a.create_run(batch_config())
+    a._claim(run.id)
+    b = Runner(sessions, Settings(), claude=api.client(), clock=FakeClock(), owner="b")
+    # One Message Batch is one paid request for the whole run, so a second
+    # process does not join a batch-mode run the way it joins an online one.
+    with pytest.raises(ConflictError, match="another process"):
+        asyncio.run(b.execute(run.id))
+    with sessions() as s:
+        s.execute(
+            update(Run)
+            .where(Run.id == run.id)
+            .values(lease_expires_at=utcnow() - timedelta(seconds=1))
+        )
+        s.commit()
+    assert asyncio.run(b.execute(run.id)).batched == 10
+    assert len(api.created) == 1
+
+
+def test_losing_a_batch_run_stops_the_process(
+    sessions: sessionmaker[Session], cases: list[Case]
+) -> None:
+    api = FakeBatchApi()
+    api.hold = True
+    r = Runner(sessions, Settings(), claude=api.client(), clock=FakeClock(), heartbeat_seconds=0.05)
+    run = r.create_run(batch_config())
+
+    async def steal() -> None:
+        task = asyncio.create_task(r.execute(run.id))
+        while True:
+            await asyncio.sleep(0.01)
+            with sessions() as s:
+                if s.get_one(Run, run.id).batch_id:
+                    break
+        with sessions() as s:
+            s.execute(update(Run).where(Run.id == run.id).values(lease_owner="thief"))
+            s.commit()
+        with pytest.raises(LeaseLostError):
+            await task
+
+    asyncio.run(steal())
+    with sessions() as s:
+        assert s.get_one(Run, run.id).lease_owner == "thief"
+    # Even with every case finished, only the lease holder may complete the run.
+    with sessions() as s:
+        s.execute(update(CaseLease).values(done=True))
+        s.commit()
+    assert r._complete(run.id, exclusive=True) == "running"

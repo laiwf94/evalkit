@@ -12,7 +12,7 @@ import pytest
 from sqlalchemy import func, select
 
 from evalkit.db import make_engine, make_session_factory
-from evalkit.db.models import Result, Run
+from evalkit.db.models import CaseLease, Result, Run
 from tests.e2e.conftest import evalkit_env
 
 pytestmark = pytest.mark.e2e
@@ -63,21 +63,17 @@ def test_kill_minus_nine_then_resume(postgres_url: str, tmp_path: Path) -> None:
     with sessions() as s:
         run = s.get_one(Run, run_id)
         assert run.status == "running"  # nobody got to mark it: the process died
-        assert run.lease_owner is not None
+        held = s.scalar(
+            select(func.count())
+            .select_from(CaseLease)
+            .where(CaseLease.run_id == run_id, CaseLease.owner.is_not(None))
+        )
+        assert held  # and its claimed cases are still leased to it
     assert 40 <= before < CASES
 
-    # The dead process still holds the lease, so an immediate resume is refused...
-    early = subprocess.run(
-        [sys.executable, "-m", "evalkit", "run", "--resume", run_id],
-        env=env,
-        capture_output=True,
-        text=True,
-    )
-    assert early.returncode == 3
-    assert "another process" in early.stderr
-
-    # ...and accepted once the lease has expired.
-    time.sleep(3.5)
+    # A resume joins at once, runs what nobody holds, and takes the dead
+    # process's cases over when their leases expire.
+    started = time.monotonic()
     resumed = subprocess.run(
         [sys.executable, "-m", "evalkit", "run", "--resume", run_id, "--json"],
         env=env,
@@ -85,6 +81,7 @@ def test_kill_minus_nine_then_resume(postgres_url: str, tmp_path: Path) -> None:
         text=True,
         timeout=120,
     )
+    assert time.monotonic() - started < 60
     assert resumed.returncode == 0, resumed.stderr
     summary = json.loads(resumed.stdout)
     assert summary["status"] == "completed"

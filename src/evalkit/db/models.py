@@ -97,6 +97,7 @@ class Run(Base):
     batch_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
     lease_owner: Mapped[str | None] = mapped_column(String(64), nullable=True)
     lease_expires_at: Mapped[datetime | None] = mapped_column(nullable=True)
+    leases_seeded: Mapped[bool] = mapped_column(Boolean, default=False)
     created_at: Mapped[datetime] = mapped_column(default=utcnow)
     started_at: Mapped[datetime | None] = mapped_column(nullable=True)
     finished_at: Mapped[datetime | None] = mapped_column(nullable=True)
@@ -128,6 +129,24 @@ class Result(Base):
     scores: Mapped[dict[str, Any]] = mapped_column(default=dict)
     error: Mapped[str] = mapped_column(Text, default="")
     created_at: Mapped[datetime] = mapped_column(default=utcnow)
+
+
+class CaseLease(Base):
+    """One row per case of a run that still needed executing when the run was first
+    joined. A worker owns a case while ``owner`` is set and ``expires_at`` is in the
+    future; ``fence`` grows on every claim, so a result written under an older claim
+    can be recognised and refused."""
+
+    __tablename__ = "case_leases"
+    __table_args__ = (Index("ix_case_leases_claimable", "run_id", "done", "position"),)
+
+    run_id: Mapped[str] = mapped_column(ForeignKey("runs.id", ondelete="CASCADE"), primary_key=True)
+    case_id: Mapped[str] = mapped_column(String(256), primary_key=True)
+    position: Mapped[int] = mapped_column(Integer)
+    owner: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    expires_at: Mapped[datetime | None] = mapped_column(nullable=True)
+    fence: Mapped[int] = mapped_column(BigInteger, default=0)
+    done: Mapped[bool] = mapped_column(Boolean, default=False)
 
 
 class CachedResponse(Base):
