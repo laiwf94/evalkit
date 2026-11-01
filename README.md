@@ -94,7 +94,11 @@ Retry-After across all workers, and a response cache that makes reruns free.
 On PostgreSQL the rate limits and Retry-After cool-downs are shared by every
 process, so a fleet of workers on one API key stays within that key's limit.
 A run killed at any point resumes without repeating or re-paying for finished
-cases. Prompt targets can go through the Message Batches API at half price.
+cases. Runs submitted to the server wait in a queue, highest priority first, for
+`evalkit worker` daemons on any number of machines; several workers share one
+run (up to a per-run cap), a cancel stops every one of them within moments, and
+a worker sent SIGTERM finishes the cases it has in flight, hands the rest back
+and exits. Prompt targets can go through the Message Batches API at half price.
 
 Tokens and dollars are counted per case and per run, including prompt cache
 reads and writes and judge calls, and `evalkit estimate` prices a run before
@@ -117,6 +121,9 @@ size; Holm correction applies when several metrics are gated together.
 |---|---|
 | `evalkit run CONFIG [--label L]` | Run an evaluation; prints the summary. |
 | `evalkit run --resume RUN_ID` | Continue an interrupted or crashed run. |
+| `evalkit run CONFIG --queue` | Queue the run for worker daemons and exit. |
+| `evalkit worker [--runs N]` | Execute queued runs until SIGTERM, then drain. |
+| `evalkit cancel RUN_ID` | Cancel a queued or running run. |
 | `evalkit show RUN` | Summary of a run. |
 | `evalkit compare BASE CAND` | Paired comparison per metric. |
 | `evalkit gate BASE CAND` | Same, and exit 1 if any gated metric is worse. |
@@ -146,6 +153,21 @@ $ docker build -t evalkit .
 $ docker run -p 8080:8080 -e EVALKIT_API_TOKENS=... -e EVALKIT_DATABASE_URL=... evalkit
 ```
 
+The server executes up to `EVALKIT_MAX_ACTIVE_RUNS` runs itself (default 2).
+To spread runs over a fleet, set it to 0 on the server and start workers
+against the same PostgreSQL database:
+
+```console
+$ evalkit worker --runs 4                 # or: docker run ... evalkit worker --runs 4
+```
+
+Workers wake on PostgreSQL notifications, so a run starts as soon as it is
+submitted, and they poll every `EVALKIT_WORKER_POLL_SECONDS` (5) as a fallback.
+On SIGTERM a worker drains for up to `EVALKIT_DRAIN_SECONDS` (25), which fits
+the default Kubernetes grace period of 30 seconds. A run's `[queue]` table (or
+`"queue"` in the API body) sets `priority` (higher first, -1000 to 1000) and
+`max_workers` (how many workers may share it).
+
 Every `/v1` route takes `Authorization: Bearer <token>`.
 
 | Endpoint | Purpose |
@@ -153,11 +175,12 @@ Every `/v1` route takes `Authorization: Bearer <token>`.
 | `POST /v1/datasets/{name}` | Import JSONL (body). 201 for a new version, 200 if the content already exists. |
 | `GET /v1/datasets` | All datasets and versions. |
 | `GET /v1/datasets/{name}/versions/{v}[/export]` | Metadata, or the cases as JSONL. |
-| `POST /v1/runs` | Start a run from a JSON run config. 202 with the run summary. |
+| `POST /v1/runs` | Queue a run from a JSON run config. 202 with the run summary. |
 | `GET /v1/runs[?label=]` | Recent runs. |
 | `GET /v1/runs/{id}` | Summary: progress, metrics with intervals, tokens, cost, latency. |
 | `GET /v1/runs/{id}/results?after=&limit=` | Per-case outputs and scores, paged. |
-| `POST /v1/runs/{id}/resume` | Continue an interrupted run. |
+| `POST /v1/runs/{id}/resume` | Put an interrupted or failed run back in the queue. |
+| `POST /v1/runs/{id}/cancel` | Cancel a run: `cancelled` at once if nobody is executing it, else `cancelling` until every worker has stopped. 409 for a completed run. |
 | `POST /v1/compare` | Paired comparison of two runs. |
 | `GET /healthz`, `GET /metrics` | Health (no auth, checks the database) and Prometheus metrics. |
 
@@ -176,6 +199,7 @@ over a fake HTTP transport that checks the exact request body; one opt-in test
 |---|---|
 | Statistics | Monte Carlo on synthetic data with a known answer: 95% intervals cover the true mean 93.5% (normal) and 95.3% (Bernoulli) of 1,000 trials; the permutation test rejects 4.2% of true nulls at alpha 0.05; a 0.5 SD drop on 100 pairs is caught in at least 95% of trials. Hypothesis tests for invariants (shift equivariance, sign symmetry, Holm monotonicity). Breaking the methods on purpose (one-sided test, unpaired differences, wrong interval tails) makes these tests fail. |
 | Hashing and redaction | Hypothesis: the dataset hash ignores key order, whitespace and line order but changes with any field; generated emails and Luhn-valid card numbers are always removed; redaction is idempotent. A catastrophic regex is stopped by its time limit. |
+| Worker daemons | On PostgreSQL, an API that only queues and four `evalkit worker` processes share an 800-case run; one is SIGKILLed and the others finish it with every case recorded once. A cancel reaches workers by notification in well under the 20 s their heartbeat would take, a SIGTERMed worker exits 0 after handing its cases to the other, and eight threads taking slots at once on a run capped at three get exactly three. In-process tests cover priority order, caps, drains that finish in-flight cases and drains that time out. |
 | Crash safety | A CLI run on PostgreSQL is killed with SIGKILL mid-run; a resume joins at once and takes the dead process's cases over when their leases expire, with every case recorded exactly once. Four processes share one run on PostgreSQL and one is SIGKILLed: the other three finish it, each case recorded and paid for once. Eight threads claiming at once get disjoint batches. In-process tests interrupt runs, take cases over from under a running process (its late results are refused) and check that finished work is saved and not repeated. |
 | SSRF | Loopback, private, link-local, metadata, CGNAT and IPv4-in-IPv6 addresses are refused; a DNS answer that changes after the check cannot redirect the request. |
 | End to end | Testcontainers PostgreSQL 16, the real server as a subprocess, a stand-in app over HTTP, the CLI gate against the same database. |
@@ -217,8 +241,10 @@ src/evalkit/datasets.py    JSONL parsing, content hashing, versioned storage
 src/evalkit/targets/       prompt, HTTP (SSRF-safe) and fake targets; templates
 src/evalkit/scorers/       built-in scorers, plugin registry, LLM judge, calibration
 src/evalkit/llm.py         the Claude client: caching, structured output, fallback, cost
-src/evalkit/runner.py      worker pool, cache, resume, run completion, batch mode
+src/evalkit/runner.py      worker pool, cache, resume, run completion, batch mode, cancel, drain
 src/evalkit/leases.py      case leases: SKIP LOCKED claims and fenced result writes
+src/evalkit/runqueue.py    the run queue: states, priorities, worker slots and caps, cancel
+src/evalkit/worker.py      the worker daemon: LISTEN/NOTIFY wake-up, heartbeats, SIGTERM drain
 src/evalkit/stats.py       bootstrap, permutation test, effect size, Holm
 src/evalkit/report.py      run summaries and comparisons
 src/evalkit/estimate.py    cost estimates from token counts

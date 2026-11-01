@@ -54,3 +54,11 @@ RATE_LIMIT_REFUNDS = Counter(
     "Reserved rate-limit slots handed back unused (caller cancelled, or a cool-down began).",
     registry=REGISTRY,
 )
+WORKER_RUNS = Gauge(
+    "evalkit_worker_runs", "Runs this worker daemon holds a slot on.", registry=REGISTRY
+)
+RUNS_CANCELLED = Counter(
+    "evalkit_runs_cancelled_total",
+    "Cancellations requested through the API or the CLI.",
+    registry=REGISTRY,
+)

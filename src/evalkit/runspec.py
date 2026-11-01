@@ -37,6 +37,15 @@ class RunOptions(_Model):
     rate_limit: RateLimit = RateLimit()
 
 
+class QueueOptions(_Model):
+    """How worker daemons schedule a queued run. They do not change its results."""
+
+    # Higher runs first; equal priorities run oldest first.
+    priority: int = Field(default=0, ge=-1000, le=1000)
+    # Worker daemons that may execute the run at once; None means no cap.
+    max_workers: int | None = Field(default=None, ge=1, le=1024)
+
+
 class RunConfig(_Model):
     label: str = Field(default="", max_length=128)
     dataset: DatasetRef
@@ -44,3 +53,4 @@ class RunConfig(_Model):
     scorers: list[ScorerSpec] = Field(min_length=1, max_length=32)
     filter: CaseFilter = CaseFilter()
     options: RunOptions = RunOptions()
+    queue: QueueOptions = QueueOptions()

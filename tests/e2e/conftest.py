@@ -85,7 +85,9 @@ def evalkit_env(postgres_url: str, **extra: str) -> dict[str, str]:
     return env
 
 
-@pytest.fixture(scope="session")
+# Module scope: the server's embedded worker would otherwise take runs queued by
+# the worker tests in other modules.
+@pytest.fixture(scope="module")
 def server(
     postgres_url: str, app_under_test: str, tmp_path_factory: pytest.TempPathFactory
 ) -> Iterator[str]:

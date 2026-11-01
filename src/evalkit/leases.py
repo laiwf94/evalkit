@@ -152,19 +152,30 @@ def renew(session: Session, run_id: str, owner: str, *, ttl: timedelta, now: dat
     return int(result.rowcount)  # type: ignore[attr-defined]
 
 
-def release(session: Session, run_id: str, owner: str) -> int:
-    """Give back unfinished leases so other workers can claim them at once."""
-    result = session.execute(
-        update(CaseLease)
-        .where(
-            CaseLease.run_id == run_id,
-            CaseLease.owner == owner,
-            _unfinished(),
-        )
-        .values(owner=None, expires_at=None)
-        .execution_options(synchronize_session=False)
+def release(
+    session: Session, run_id: str, owner: str, case_ids: Sequence[str] | None = None
+) -> int:
+    """Give back unfinished leases (all of them, or those of ``case_ids``) so other
+    workers can claim them at once. Returns how many."""
+    if case_ids is not None and not case_ids:
+        return 0
+    where = [CaseLease.run_id == run_id, CaseLease.owner == owner, _unfinished()]
+    released = 0
+    chunks = (
+        [None]
+        if case_ids is None
+        else [case_ids[i : i + WRITE_CHUNK] for i in range(0, len(case_ids), WRITE_CHUNK)]
     )
-    return int(result.rowcount)  # type: ignore[attr-defined]
+    for chunk in chunks:
+        condition = where if chunk is None else [*where, CaseLease.case_id.in_(chunk)]
+        result = session.execute(
+            update(CaseLease)
+            .where(*condition)
+            .values(owner=None, expires_at=None)
+            .execution_options(synchronize_session=False)
+        )
+        released += int(result.rowcount)  # type: ignore[attr-defined]
+    return released
 
 
 def finish(

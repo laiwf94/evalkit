@@ -9,10 +9,12 @@ loopback address. Errors have one shape with stable codes:
 invalid_argument 400, unauthenticated 401, not_found 404, conflict 409,
 failed_precondition 412, payload_too_large 413, internal 500, unavailable 503.
 
-Runs execute in this process, at most ``EVALKIT_MAX_ACTIVE_RUNS`` at a time;
-later submissions wait their turn as ``pending``. On shutdown running runs
-are interrupted (their finished cases are saved) and can be continued with
-``POST /v1/runs/{id}/resume``, here or from the CLI.
+Submitted runs go into the run queue as ``queued``. Worker daemons
+(``evalkit worker``) execute them, and so does a worker inside this process
+with ``EVALKIT_MAX_ACTIVE_RUNS`` slots (0 makes this process only accept runs).
+On shutdown the embedded worker drains: its runs save their finished cases and
+go back to the queue, where another worker, or this one after a restart, picks
+them up.
 """
 
 from __future__ import annotations
@@ -41,7 +43,7 @@ from sqlalchemy.orm import Session, sessionmaker
 from starlette.exceptions import HTTPException as StarletteHTTPException
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
-from evalkit import metrics
+from evalkit import metrics, runqueue
 from evalkit.config import ConfigError, Settings
 from evalkit.datasets import (
     get_dataset,
@@ -53,7 +55,7 @@ from evalkit.datasets import (
     validate_name,
 )
 from evalkit.db import make_engine, make_session_factory, upgrade
-from evalkit.db.models import Dataset, Result, Run, as_utc
+from evalkit.db.models import Dataset, Result, Run, as_utc, utcnow
 from evalkit.errors import EvalkitError, NotFoundError
 from evalkit.llm import ClaudeClient
 from evalkit.logs import configure_logging, log_context, scrubber
@@ -61,6 +63,7 @@ from evalkit.pricing import PriceTable
 from evalkit.report import compare_runs, summarize
 from evalkit.runner import Runner
 from evalkit.runspec import RunConfig
+from evalkit.worker import Worker, listen_url
 
 log = logging.getLogger("evalkit.api")
 
@@ -140,34 +143,6 @@ def _replay(messages: list[Message], then: Receive | None = None) -> Receive:
     return receive
 
 
-class RunManager:
-    """Executes runs in the background with a cap on how many run at once."""
-
-    def __init__(self, runner: Runner, limit: int) -> None:
-        self.runner = runner
-        self._slots = asyncio.Semaphore(limit)
-        self._tasks: set[asyncio.Task[None]] = set()
-
-    def start(self, run_id: str) -> None:
-        task = asyncio.create_task(self._execute(run_id), name=f"run-{run_id}")
-        self._tasks.add(task)
-        task.add_done_callback(self._tasks.discard)
-
-    async def _execute(self, run_id: str) -> None:
-        async with self._slots:
-            try:
-                await self.runner.execute(run_id)
-            except asyncio.CancelledError:
-                raise
-            except Exception:  # recorded on the run row by the runner
-                log.warning("background run stopped", extra={"run_id": run_id}, exc_info=True)
-
-    async def shutdown(self) -> None:
-        for task in list(self._tasks):
-            task.cancel()
-        await asyncio.gather(*self._tasks, return_exceptions=True)
-
-
 class CompareRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -209,7 +184,11 @@ class Services:
     settings: Settings
     sessions: sessionmaker[Session]
     runner: Runner
-    manager: RunManager
+    worker: Worker | None
+
+    def wake(self) -> None:
+        if self.worker is not None:
+            self.worker.wake()
 
 
 def services(request: Request) -> Services:
@@ -284,8 +263,8 @@ async def export_dataset(name: str, version: int, svc: Svc) -> PlainTextResponse
 
 @router.post("/runs", status_code=202)
 async def create_run(config: RunConfig, svc: Svc) -> dict[str, Any]:
-    run = await asyncio.to_thread(svc.runner.create_run, config)
-    svc.manager.start(run.id)
+    run = await asyncio.to_thread(svc.runner.create_run, config, queued=True)
+    svc.wake()
     return await _in_session(svc, lambda s: _summary_json(s, run.id))
 
 
@@ -345,9 +324,27 @@ async def get_results(
 
 @router.post("/runs/{run_id}/resume", status_code=202)
 async def resume_run(run_id: str, svc: Svc) -> dict[str, Any]:
-    summary = await _in_session(svc, lambda s: _summary_json(s, run_id))
-    if summary["status"] != "completed":
-        svc.manager.start(run_id)
+    def requeue(session: Session) -> dict[str, Any]:
+        runqueue.enqueue(session, run_id, utcnow())
+        session.commit()
+        return _summary_json(session, run_id)
+
+    summary = await _in_session(svc, requeue)
+    svc.wake()
+    return summary
+
+
+@router.post("/runs/{run_id}/cancel", status_code=202)
+async def cancel_run(run_id: str, svc: Svc) -> dict[str, Any]:
+    def request(session: Session) -> dict[str, Any]:
+        runqueue.cancel(session, run_id, utcnow())
+        session.commit()
+        return _summary_json(session, run_id)
+
+    summary = await _in_session(svc, request)
+    metrics.RUNS_CANCELLED.inc()
+    if svc.worker is not None:
+        svc.worker.cancel(run_id)
     return summary
 
 
@@ -471,13 +468,29 @@ def create_app(
         sessions = make_session_factory(make_engine(settings.database_url))
     claude_client = claude or ClaudeClient(PriceTable(settings.prices), settings.anthropic_api_key)
     runner = Runner(sessions, settings, claude=claude_client, allow_import_paths=False)
-    svc = Services(settings, sessions, runner, RunManager(runner, settings.max_active_runs))
+    worker = None
+    if settings.max_active_runs:
+        worker = Worker(
+            sessions,
+            runner,
+            slots=settings.max_active_runs,
+            poll_seconds=settings.worker_poll_seconds,
+            drain_seconds=settings.drain_seconds,
+            listen=listen_url(settings.database_url),
+        )
+    svc = Services(settings, sessions, runner, worker)
 
     @asynccontextmanager
     async def lifespan(_: FastAPI) -> AsyncIterator[None]:
-        yield
-        await svc.manager.shutdown()
-        await claude_client.aclose()
+        stop = asyncio.Event()
+        serving = None if worker is None else asyncio.create_task(worker.serve(stop))
+        try:
+            yield
+        finally:
+            stop.set()
+            if serving is not None:
+                await serving
+            await claude_client.aclose()
 
     app = FastAPI(title="evalkit", version="1", lifespan=lifespan, docs_url=None, redoc_url=None)
     app.state.services = svc

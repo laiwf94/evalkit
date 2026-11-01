@@ -18,6 +18,10 @@ How a run stays correct when it is killed at any point:
 * Batch mode is the exception: a Message Batch is one paid request for the
   whole run, so a batch-mode run is executed by one process at a time, which
   holds a lease on the run row.
+* A run can be cancelled (``runqueue.cancel``) or a process asked to drain
+  (``request_drain``, on SIGTERM). A cancelled process saves the results it
+  has and stops at once; a draining one stops claiming, gives back the cases
+  it has not started and finishes the ones in flight, so no paid work is lost.
 """
 
 from __future__ import annotations
@@ -39,11 +43,11 @@ from datetime import timedelta
 from typing import Any
 
 from pydantic import TypeAdapter
-from sqlalchemy import ColumnElement, exists, false, func, or_, select, true, update
+from sqlalchemy import ColumnElement, case, exists, false, func, or_, select, true, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, sessionmaker
 
-from evalkit import cache, leases, metrics
+from evalkit import cache, leases, metrics, runqueue
 from evalkit.config import Settings
 from evalkit.datasets import Case, get_dataset, load_cases
 from evalkit.db.models import CaseLease, Dataset, Result, Run, as_utc, utcnow
@@ -73,7 +77,8 @@ log = logging.getLogger(__name__)
 WRITE_BATCH = 50
 WRITE_LINGER_SECONDS = 0.2
 MAX_ERROR_CHARS = 2000
-RESUMABLE = ("pending", "running", "interrupted", "failed")
+RESUMABLE = ("pending", "queued", "running", "interrupted", "failed")
+STOPPED = ("cancelling", "cancelled")
 MIN_CLAIM = 64
 MAX_CLAIM = 500
 # How soon to look again when unfinished cases are unowned but were not claimable
@@ -199,6 +204,18 @@ class _Context:
 _WorkQueue = asyncio.Queue[tuple[Case, int] | None]
 
 
+@dataclass
+class _Control:
+    """How other code reaches a run this process is executing."""
+
+    task: asyncio.Task[Any] | None
+    # Set when the run was cancelled, so the CancelledError means "stop for good".
+    cancelled: bool = False
+    exclusive: bool = False
+    # Set to drain: stop claiming, give back unstarted cases, finish the rest.
+    draining: asyncio.Event = field(default_factory=asyncio.Event)
+
+
 class Runner:
     def __init__(
         self,
@@ -225,7 +242,7 @@ class Runner:
         self.lease_ttl = lease_ttl or timedelta(seconds=settings.lease_seconds)
         # Renew well before expiry so one slow database round trip cannot lose the lease.
         self.heartbeat_seconds = heartbeat_seconds or self.lease_ttl.total_seconds() / 3
-        self._executing: set[str] = set()
+        self._active: dict[str, _Control] = {}
         # On PostgreSQL several processes may execute one run, so rate limits and
         # cool-downs live in the database where they all see them.
         self.shared_limits = (
@@ -238,8 +255,9 @@ class Runner:
             threading.Lock() if _dialect(sessions) == "sqlite" else contextlib.nullcontext()
         )
 
-    def create_run(self, config: RunConfig) -> Run:
-        """Validate ``config`` against the stored dataset and record a pending run."""
+    def create_run(self, config: RunConfig, *, queued: bool = False) -> Run:
+        """Validate ``config`` against the stored dataset and record the run:
+        ``pending`` for this process to execute, or ``queued`` for worker daemons."""
         build_scorers(
             config.scorers, allow_import_paths=self.allow_import_paths, claude=self.claude
         )
@@ -251,6 +269,7 @@ class Runner:
             cases = load_cases(session, dataset, config.filter.split, config.filter.tags)
             if not cases:
                 raise InvalidInputError("the filter selects no cases from the dataset")
+            now = utcnow()
             run = Run(
                 id=uuid.uuid4().hex,
                 label=config.label,
@@ -261,33 +280,78 @@ class Runner:
                 options=config.options.model_dump(mode="json"),
                 case_filter=config.filter.model_dump(mode="json"),
                 seed=config.options.seed,
-                status="pending",
+                status="queued" if queued else "pending",
+                queued_at=now if queued else None,
+                priority=config.queue.priority,
+                # A batch is one paid request for the whole run: one worker at a time.
+                max_workers=1 if config.options.mode == "batch" else config.queue.max_workers,
+                created_at=now,
             )
             session.add(run)
+            session.flush()
+            if queued:
+                runqueue.notify(session, "queued", run.id)
             session.commit()
             return run
+
+    @property
+    def executing(self) -> set[str]:
+        """Runs this process is executing now."""
+        return set(self._active)
+
+    def request_cancel(self, run_id: str) -> bool:
+        """Stop executing ``run_id`` because it was cancelled: results already
+        finished are saved, unfinished cases are given back. Returns whether this
+        process was executing it."""
+        control = self._active.get(run_id)
+        if control is None or control.task is None:
+            return False
+        if not control.cancelled:
+            control.cancelled = True
+            control.task.cancel()
+        return True
+
+    def request_drain(self, run_id: str) -> bool:
+        """Stop executing ``run_id`` without losing paid work: claim nothing more,
+        give back cases no worker has started, finish and save the ones in flight.
+        A batch-mode run stops at once (its batch id is saved, so a resume polls
+        the same batch). Returns whether this process was executing it."""
+        control = self._active.get(run_id)
+        if control is None:
+            return False
+        control.draining.set()
+        if control.exclusive and control.task is not None:
+            control.task.cancel()
+        return True
 
     async def execute(self, run_id: str) -> ExecutionReport:
         # The lease lets its owner re-claim a run, which is how a process resumes
         # its own failed run; this set stops it from executing one run twice at once.
-        if run_id in self._executing:
+        if run_id in self._active:
             raise ConflictError(f"run {run_id} is already executing in this process")
-        self._executing.add(run_id)
+        control = _Control(asyncio.current_task())
+        self._active[run_id] = control
         try:
-            return await self._execute(run_id)
+            return await self._execute(run_id, control)
         finally:
-            self._executing.discard(run_id)
+            del self._active[run_id]
 
-    async def _execute(self, run_id: str) -> ExecutionReport:
+    async def _execute(self, run_id: str, control: _Control) -> ExecutionReport:
         with log_context(run_id=run_id):
             run, exclusive = await asyncio.to_thread(self._start, run_id)
+            control.exclusive = exclusive
             if run.status == "completed":
                 return ExecutionReport(run_id, "completed", 0, 0, 0, 0)
+            if run.status in STOPPED:
+                final = await asyncio.to_thread(self._finish, run_id, "cancelled", "", exclusive)
+                return ExecutionReport(run_id, final, 0, 0, 0, 0)
             metrics.RUNS_ACTIVE.inc()
             status = "failed"
             try:
-                report = await self._execute_claimed(run, exclusive)
-                status = "completed"
+                report = await self._execute_claimed(run, exclusive, control)
+                status = report.status
+                if status != "completed":
+                    await asyncio.to_thread(self._finish, run_id, "interrupted", "", exclusive)
             except LeaseLostError:
                 status = "lease_lost"
                 log.warning("lease lost; another process now owns the run")
@@ -297,7 +361,14 @@ class Runner:
                 await asyncio.shield(
                     asyncio.to_thread(self._finish, run_id, "interrupted", "", exclusive)
                 )
-                raise
+                if not control.cancelled:
+                    raise
+                # Cancelled on request: that is an outcome, not an interruption.
+                if control.task is not None:
+                    control.task.uncancel()
+                status = "cancelled"
+                log.info("run cancelled")
+                return ExecutionReport(run_id, "cancelled", 0, 0, 0, 0)
             except Exception as exc:
                 message = clean_error(f"{type(exc).__name__}: {exc}")
                 await asyncio.to_thread(self._finish, run_id, "failed", message, exclusive)
@@ -306,10 +377,12 @@ class Runner:
             finally:
                 metrics.RUNS_ACTIVE.dec()
                 metrics.RUNS_FINISHED.labels(status).inc()
-            log.info("run completed", extra=asdict(report))
+            log.info("run stopped", extra=asdict(report))
             return report
 
-    async def _execute_claimed(self, run: Run, exclusive: bool) -> ExecutionReport:
+    async def _execute_claimed(
+        self, run: Run, exclusive: bool, control: _Control
+    ) -> ExecutionReport:
         ctx, done = await self._prepare(run)
         concurrency = ctx.config.options.concurrency
         results: asyncio.Queue[CaseResult | None] = asyncio.Queue(maxsize=WRITE_BATCH * 4)
@@ -319,7 +392,9 @@ class Runner:
             async with asyncio.TaskGroup() as group:
                 writer = group.create_task(self._writer(ctx, results, unsaved))
                 heartbeat = group.create_task(self._heartbeat(run.id, exclusive))
-                feeder = group.create_task(self._feed(ctx, run, exclusive, work, results))
+                feeder = group.create_task(
+                    self._feed(ctx, run, exclusive, work, results, stop=control.draining)
+                )
                 await asyncio.gather(
                     *(
                         group.create_task(self._worker(ctx, work, results))
@@ -339,12 +414,12 @@ class Runner:
         finally:
             await ctx.target.aclose()
         status = await asyncio.to_thread(self._complete, run.id, exclusive)
-        if status != "completed":
+        if status != "completed" and not control.draining.is_set():
             raise EvalkitError(f"run {run.id} still has unfinished cases")
         counts = ctx.counts
         return ExecutionReport(
             run.id,
-            "completed",
+            "completed" if status == "completed" else "interrupted",
             counts["executed"],
             counts["cached"],
             counts["errors"],
@@ -383,8 +458,11 @@ class Runner:
         exclusive: bool,
         work: _WorkQueue,
         results: asyncio.Queue[CaseResult | None],
+        *,
+        stop: asyncio.Event,
     ) -> None:
-        """Claim cases and queue them for the workers until none is left."""
+        """Claim cases and queue them for the workers until none is left, or until
+        ``stop`` is set (drain), when the cases no worker has started go back."""
         if exclusive:
             # One process holds the run, so it takes every case in one claim.
             claims = await asyncio.to_thread(self._claim_cases, run.id, len(ctx.pending) + 1)
@@ -401,7 +479,7 @@ class Runner:
                     work.put_nowait((case, fences[case.id]))
         else:
             size = claim_size(ctx.config.options.concurrency)
-            while True:
+            while not stop.is_set():
                 claims = await asyncio.to_thread(self._claim_cases, run.id, size)
                 for c in claims:
                     work.put_nowait((ctx.pending[c.case_id], c.fence))
@@ -411,20 +489,27 @@ class Runner:
                     # much more than one claim's worth of queued cases.
                     ctx.drained.clear()
                     if work.qsize() > ctx.low_water:
-                        await ctx.drained.wait()
+                        await wait_for_any(ctx.drained, stop)
                     continue
                 ctx.written.clear()
                 left = await asyncio.to_thread(self._outstanding, run.id)
                 if left.total:
-                    await asyncio.sleep(self._recheck_after(left))
+                    await wait_for_any(None, stop, self._recheck_after(left))
                 elif left.mine:
                     # Only this process's own cases are unfinished. Keep claiming
                     # until they are written: if one was taken over by a process
                     # that then died, it comes back here once that lease expires.
-                    with contextlib.suppress(TimeoutError):
-                        await asyncio.wait_for(ctx.written.wait(), self.heartbeat_seconds)
+                    await wait_for_any(ctx.written, stop, self.heartbeat_seconds)
                 else:
                     break
+            if stop.is_set():
+                unstarted = []
+                while not work.empty():
+                    item = work.get_nowait()
+                    if item is not None:
+                        unstarted.append(item[0].id)
+                await asyncio.to_thread(self._release_cases, run.id, unstarted)
+                log.info("draining", extra={"returned": len(unstarted)})
         for _ in range(ctx.config.options.concurrency):
             work.put_nowait(None)
 
@@ -710,7 +795,12 @@ class Runner:
     async def _heartbeat(self, run_id: str, exclusive: bool) -> None:
         while True:
             await asyncio.sleep(self.heartbeat_seconds)
-            renewed = await asyncio.to_thread(self._renew, run_id, exclusive)
+            renewed, status = await asyncio.to_thread(self._renew, run_id, exclusive)
+            if status in STOPPED:
+                # Cancelled from elsewhere (the API, another host): this is how a
+                # process without a NOTIFY listener finds out.
+                self.request_cancel(run_id)
+                return
             if not renewed:
                 raise LeaseLostError(f"run {run_id} is now owned by another process")
 
@@ -775,6 +865,11 @@ class Runner:
             session.commit()
             return claims
 
+    def _release_cases(self, run_id: str, case_ids: list[str]) -> None:
+        with self._write_turn, self.sessions() as session:
+            leases.release(session, run_id, self.owner, case_ids)
+            session.commit()
+
     def _outstanding(self, run_id: str) -> leases.Outstanding:
         with self.sessions() as session:
             return leases.outstanding(session, run_id, self.owner)
@@ -799,7 +894,9 @@ class Runner:
             )
             session.commit()
 
-    def _renew(self, run_id: str, exclusive: bool) -> bool:
+    def _renew(self, run_id: str, exclusive: bool) -> tuple[bool, str]:
+        """Extend this process's leases; returns whether it still holds the run
+        and the run's status, so a cancellation is noticed within one heartbeat."""
         now = utcnow()
         with self.sessions() as session:
             leases.renew(session, run_id, self.owner, ttl=self.lease_ttl, now=now)
@@ -813,7 +910,8 @@ class Runner:
                 )
                 renewed = bool(result.rowcount)  # type: ignore[attr-defined]
             session.commit()
-            return renewed
+            status = session.scalars(select(Run.status).where(Run.id == run_id)).one()
+            return renewed, status
 
     def _complete(self, run_id: str, exclusive: bool = False) -> str:
         """Mark the run completed if no case is left unfinished, and return its
@@ -825,7 +923,7 @@ class Runner:
                 update(Run)
                 .where(
                     Run.id == run_id,
-                    Run.status != "completed",
+                    Run.status.not_in(runqueue.FINAL),
                     self._holds_run(exclusive),
                     ~unfinished,
                 )
@@ -847,9 +945,10 @@ class Runner:
         # keep the run from finishing.
         return Run.lease_owner == self.owner if exclusive else true()
 
-    def _finish(self, run_id: str, status: str, error: str, exclusive: bool = False) -> None:
+    def _finish(self, run_id: str, status: str, error: str, exclusive: bool = False) -> str:
         """Stop this process's part in the run: give its unfinished cases back and,
-        unless another process is still working on the run, record ``status``."""
+        unless another process is still working on the run, record ``status`` (or
+        ``cancelled``, if the run was being cancelled). Returns the run's status."""
         now = utcnow()
         with self.sessions() as session:
             leases.release(session, run_id, self.owner)
@@ -859,18 +958,26 @@ class Runner:
                 CaseLease.owner.is_not(None),
                 CaseLease.expires_at >= now,
             )
+            cancelling = Run.status.in_(STOPPED)
             session.execute(
                 update(Run)
                 .where(
                     Run.id == run_id,
-                    Run.status != "completed",
+                    Run.status.not_in(runqueue.FINAL),
                     self._holds_run(exclusive),
                     ~others_working,
                 )
-                .values(status=status, error=error, lease_owner=None, lease_expires_at=None)
+                .values(
+                    status=case((cancelling, "cancelled"), else_=status),
+                    error=case((cancelling, ""), else_=error),
+                    finished_at=case((cancelling, now), else_=Run.finished_at),
+                    lease_owner=None,
+                    lease_expires_at=None,
+                )
                 .execution_options(synchronize_session=False)
             )
             session.commit()
+            return session.scalars(select(Run.status).where(Run.id == run_id)).one()
 
     def _load_cases(self, run: Run, config: StoredRun) -> tuple[list[Case], set[str]]:
         with self.sessions() as session:
@@ -929,6 +1036,22 @@ class Runner:
             log.warning("duplicate result skipped", extra={"case_id": result.case_id})
             return False
         return True
+
+
+async def wait_for_any(
+    event: asyncio.Event | None, stop: asyncio.Event, within: float | None = None
+) -> None:
+    """Wait for ``event`` (or only the time limit, when it is None), ``stop`` or
+    ``within`` seconds, whichever comes first."""
+    waiters = [asyncio.ensure_future(stop.wait())]
+    if event is not None:
+        waiters.append(asyncio.ensure_future(event.wait()))
+    try:
+        await asyncio.wait(waiters, timeout=within, return_when=asyncio.FIRST_COMPLETED)
+    finally:
+        for waiter in waiters:
+            waiter.cancel()
+        await asyncio.gather(*waiters, return_exceptions=True)
 
 
 def _dialect(sessions: sessionmaker[Session]) -> str | None:

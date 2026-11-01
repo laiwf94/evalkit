@@ -22,8 +22,10 @@ is discussed under [Bigger runs](#bigger-runs).
 datasets        (name, version) unique, (name, content_hash) unique
 dataset_cases   (dataset_id, case_id) unique; input, expected, tags, split, metadata (JSON)
 runs            target spec + target hash, scorer specs, options, filter, seed,
-                status, lease (owner, expires_at; batch mode only), batch_id
+                status, lease (owner, expires_at; batch mode only), batch_id,
+                queued_at, priority, max_workers
 case_leases     (run_id, case_id) key; position, owner, expires_at, fence, done
+run_workers     (run_id, worker_id) key; joined_at, expires_at: a worker daemon's slot
 results         (run_id, case_id) unique; redacted output, scores (JSON), tokens,
                 cost, judge tokens and cost, attempts, latency, error
 response_cache  key = sha256(target hash, input, redaction fingerprint)
@@ -120,6 +122,65 @@ the whole run, so a batch-mode run is held by one process at a time with a
 lease on the run row (a conditional UPDATE that succeeds only if the lease is
 free, its own, or expired); a second process gets `conflict`, and a process
 that finds the lease taken stops.
+
+### The run queue and worker daemons
+
+A run submitted through the API, or with `evalkit run --queue`, is `queued`.
+`evalkit worker` daemons execute queued runs, and so does a worker inside the
+API process with `EVALKIT_MAX_ACTIVE_RUNS` slots (0 turns it off, so the API
+only accepts runs). A run created by a plain `evalkit run` is `pending` and
+belongs to the process that created it; workers never pick it up.
+
+```text
+pending --(CLI executes)--------------------------> running --> completed
+queued  --(a worker takes a slot)-----------------> running --> completed
+running --(every process stops, cases left)-------> interrupted --(queued run)--> queued
+running --(cancel)--> cancelling --(last process stops)--> cancelled
+queued, pending, interrupted, failed --(cancel)--> cancelled
+interrupted, failed --(resume)--> queued
+```
+
+A worker has a number of run slots. When one is free it asks for the best
+run it can join: `queued`, or `running` with cases nobody holds (a dead
+worker's cases once their leases expire), under the run's `max_workers`,
+highest `priority` first and oldest first within a priority. A worker does not
+join a running run whose cases are all held by others: it would only wait.
+Taking a slot locks the run row with an UPDATE, counts the live slots and adds
+a `run_workers` row only if the cap allows. On PostgreSQL a second worker
+waits for the row lock and then, under READ COMMITTED, counts again with the
+first worker's slot in view, so eight workers racing for a run capped at three
+get exactly three. Slots carry an expiry that the worker renews every third of
+a lease length, so a dead worker's slot frees itself. A batch-mode run is
+capped at one worker, because its batch is one paid request.
+
+Inside a slot the worker calls the same runner as the CLI, so workers share a
+run through case leases. Workers wake on PostgreSQL `LISTEN evalkit_runs`:
+queuing a run, freeing a slot and requesting a cancel each send a NOTIFY in
+the transaction that makes the change, so it is delivered on commit and never
+before the change is visible. Workers also poll (every 5 s by default), which
+covers SQLite, a dropped notification connection (reconnected with backoff)
+and anything missed while disconnected.
+
+Cancelling marks the run `cancelling` and notifies. A worker executing it
+cancels its execution at once: results already finished are written, its
+leases are released, and the last process to stop marks the run `cancelled`.
+A process that gets no notification (a CLI process, or SQLite) sees the status
+at its next heartbeat, within a third of a lease length. If nobody is
+executing the run, the cancel makes it `cancelled` straight away; if the
+processes executing it died, or two stopped at the same moment and each saw
+the other still working, a worker's periodic sweep finishes the cancellation
+once no slot, case lease or run lease on it is live.
+
+On SIGTERM or SIGINT a worker drains. It takes no new slots; each of its runs
+stops claiming, gives back the cases still in its queue so other workers can
+claim them at once, and lets the cases in flight finish and be written, for up
+to `EVALKIT_DRAIN_SECONDS` (25 s, inside Kubernetes' default 30 s grace
+period). Calls still running after that are abandoned, and their cases are
+executed again by whoever takes them over. A run the worker leaves
+`interrupted` goes back to `queued`; if other processes still execute it, it
+stays `running`. A second signal skips the wait. The API's embedded worker
+drains the same way on shutdown, so a restarted single server picks its runs
+up again by itself.
 
 ### The response cache
 
@@ -320,7 +381,10 @@ band.
 |---|---|
 | Process killed mid-run | Finished, committed cases are kept. Other processes on the run, or a `run --resume`, take its cases over when its leases expire (30 s). |
 | A process stalls past its lease | Another process takes its cases over; the stalled process's results for them are refused. |
-| Ctrl-C or server shutdown | Queued results are written and the process's other leases released; the run is marked `interrupted` unless another process is still working on it. |
+| Ctrl-C | Queued results are written and the process's other leases released; the run is marked `interrupted` unless another process is still working on it. |
+| SIGTERM to a worker, or server shutdown | The worker drains: cases in flight finish and are written (up to 25 s), unstarted cases are released, and the run goes back to `queued` unless another process is still working on it. |
+| A worker is killed | Its slots expire after one lease length, its cases are taken over when their leases expire, and the run stays joinable by other workers. |
+| Run cancelled | Every process executing it stops within moments on PostgreSQL (a third of a lease without notifications); finished results are kept and the run ends `cancelled`. |
 | Two processes resume the same run | They share it. For a batch-mode run, the second fails with `conflict` while the first holds the lease. |
 | 429 or 529 from the API | Provider-wide cool-down for Retry-After, shared by every process on PostgreSQL, then retry; after the attempt limit the case is recorded as an error and scores 0. |
 | Target returns 4xx, redirect, non-JSON or an oversized body | Recorded as an error for that case, not retried. |
@@ -338,7 +402,11 @@ band.
 | JSONL line | 1 MiB | Checked before parsing. |
 | API request body | 16 MiB (configurable, max 256 MiB) | Checked by Content-Length and while reading. |
 | Workers per run | 1-256 | |
-| Concurrent runs per server | 2 (configurable, max 64) | Later runs wait as `pending`. |
+| Concurrent runs per server or worker | 2 (configurable, 0-64) | Later runs wait as `queued` for a free slot on any worker. |
+| Workers per run | `max_workers`, unlimited by default | Batch-mode runs: 1. |
+| Run priority | -1000 to 1000 | |
+| Worker poll interval | 5 s default | Fallback when no notification arrives. |
+| Drain on SIGTERM | 25 s default | Inside Kubernetes' default 30 s grace period. |
 | Scorers per run | 32 | |
 | Template, system prompt | 200,000 characters | |
 | Regex patterns | 1,000 characters, 250 ms per match | Patterns can come from case data. |

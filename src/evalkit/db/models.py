@@ -82,7 +82,10 @@ class DatasetCase(Base):
 
 class Run(Base):
     __tablename__ = "runs"
-    __table_args__ = (Index("ix_runs_created_at", "created_at"),)
+    __table_args__ = (
+        Index("ix_runs_created_at", "created_at"),
+        Index("ix_runs_queue", "status", "priority", "queued_at"),
+    )
 
     id: Mapped[str] = mapped_column(String(32), primary_key=True)
     label: Mapped[str] = mapped_column(String(128), default="")
@@ -99,6 +102,11 @@ class Run(Base):
     lease_owner: Mapped[str | None] = mapped_column(String(64), nullable=True)
     lease_expires_at: Mapped[datetime | None] = mapped_column(nullable=True)
     leases_seeded: Mapped[bool] = mapped_column(Boolean, default=False)
+    # Set when the run was submitted to the worker queue; CLI runs leave it empty.
+    queued_at: Mapped[datetime | None] = mapped_column(nullable=True)
+    priority: Mapped[int] = mapped_column(Integer, default=0)
+    # How many worker daemons may execute the run at once; None means no cap.
+    max_workers: Mapped[int | None] = mapped_column(Integer, nullable=True)
     created_at: Mapped[datetime] = mapped_column(default=utcnow)
     started_at: Mapped[datetime | None] = mapped_column(nullable=True)
     finished_at: Mapped[datetime | None] = mapped_column(nullable=True)
@@ -148,6 +156,19 @@ class CaseLease(Base):
     expires_at: Mapped[datetime | None] = mapped_column(nullable=True)
     fence: Mapped[int] = mapped_column(BigInteger, default=0)
     done: Mapped[bool] = mapped_column(Boolean, default=False)
+
+
+class RunWorker(Base):
+    """A worker daemon's slot on a run. It counts towards the run's ``max_workers``
+    while ``expires_at`` is in the future; the worker renews it with a heartbeat,
+    so the slot of a worker that died frees itself."""
+
+    __tablename__ = "run_workers"
+
+    run_id: Mapped[str] = mapped_column(ForeignKey("runs.id", ondelete="CASCADE"), primary_key=True)
+    worker_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    joined_at: Mapped[datetime] = mapped_column(default=utcnow)
+    expires_at: Mapped[datetime] = mapped_column()
 
 
 class CachedResponse(Base):

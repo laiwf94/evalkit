@@ -20,6 +20,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import signal
 import sys
 import tomllib
 from collections.abc import Callable, Sequence
@@ -33,7 +34,7 @@ from sqlalchemy import select
 from sqlalchemy.engine import make_url
 from sqlalchemy.orm import Session, sessionmaker
 
-from evalkit import __version__
+from evalkit import __version__, runqueue
 from evalkit.api import serve
 from evalkit.config import ConfigError, Settings
 from evalkit.datasets import (
@@ -45,7 +46,7 @@ from evalkit.datasets import (
     to_jsonl,
 )
 from evalkit.db import make_engine, make_session_factory, upgrade
-from evalkit.db.models import Run
+from evalkit.db.models import Run, utcnow
 from evalkit.errors import ConflictError, EvalkitError, NotFoundError, PreconditionError
 from evalkit.estimate import estimate
 from evalkit.llm import ClaudeClient
@@ -57,6 +58,7 @@ from evalkit.runspec import RunConfig
 from evalkit.scorers.calibration import calibrate, parse_labels, save_calibration
 from evalkit.scorers.judge import LLMJudge
 from evalkit.scorers.registry import JudgeSpec
+from evalkit.worker import Worker, listen_url
 
 EXIT_OK, EXIT_REGRESSION, EXIT_INPUT, EXIT_UNUSABLE, EXIT_INTERRUPTED = 0, 1, 2, 3, 130
 MAX_CONFIG_BYTES = 1024 * 1024
@@ -88,12 +90,12 @@ class App:
             )
         return self._claude
 
-    def runner(self, needs_claude: bool) -> Runner:
+    def runner(self, needs_claude: bool, *, allow_import_paths: bool = True) -> Runner:
         return Runner(
             self.sessions,
             self.settings,
             claude=self.claude() if needs_claude else None,
-            allow_import_paths=True,
+            allow_import_paths=allow_import_paths,
         )
 
     async def aclose(self) -> None:
@@ -155,6 +157,15 @@ async def cmd_run(args: argparse.Namespace, app: App) -> int:
         config = load_run_config(Path(args.config), app)
         if args.label is not None:
             config = config.model_copy(update={"label": args.label})
+        if args.queue:
+            # Worker daemons import scorers only from installed entry points.
+            queued = app.runner(needs_claude(config), allow_import_paths=False).create_run(
+                config, queued=True
+            )
+            _err(f"run {queued.id} queued")
+            with app.sessions() as session:
+                _emit(app.out, summarize(session, queued.id), args.json, _format_summary)
+            return EXIT_OK
         runner = app.runner(needs_claude(config))
         run_id = runner.create_run(config).id
         _err(f"run {run_id} started")
@@ -167,6 +178,48 @@ async def cmd_run(args: argparse.Namespace, app: App) -> int:
         summary = summarize(session, run_id)
     _emit(app.out, summary, args.json, _format_summary)
     return EXIT_OK if summary.status == "completed" else EXIT_UNUSABLE
+
+
+async def cmd_cancel(args: argparse.Namespace, app: App) -> int:
+    with app.sessions() as session:
+        status = runqueue.cancel(session, args.run, utcnow())
+        session.commit()
+    app.out.write(f"run {args.run} {status}\n")
+    return EXIT_OK
+
+
+async def cmd_worker(args: argparse.Namespace, app: App) -> int:
+    slots = app.settings.max_active_runs if args.runs is None else args.runs
+    if slots < 1:
+        raise CliError("a worker needs at least one run slot (--runs)", EXIT_INPUT)
+    runner = app.runner(needs_claude=True, allow_import_paths=False)
+    worker = Worker(
+        app.sessions,
+        runner,
+        slots=slots,
+        poll_seconds=app.settings.worker_poll_seconds,
+        drain_seconds=app.settings.drain_seconds,
+        listen=listen_url(app.settings.database_url),
+    )
+    stop = asyncio.Event()
+
+    def on_signal() -> None:
+        # The first signal drains; a second one stops waiting for cases in flight.
+        if stop.is_set():
+            worker.abort()
+        stop.set()
+
+    loop = asyncio.get_running_loop()
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        loop.add_signal_handler(sig, on_signal)
+    _err(f"worker {worker.id} started with {slots} run slot(s)")
+    try:
+        await worker.serve(stop)
+    finally:
+        for sig in (signal.SIGTERM, signal.SIGINT):
+            loop.remove_signal_handler(sig)
+    _err(f"worker {worker.id} stopped")
+    return EXIT_OK
 
 
 async def cmd_show(args: argparse.Namespace, app: App) -> int:
@@ -284,7 +337,20 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("config", nargs="?")
     run.add_argument("--label", help="label the run, e.g. a branch or commit")
     run.add_argument("--resume", metavar="RUN_ID", help="continue an interrupted run")
+    run.add_argument(
+        "--queue", action="store_true", help="queue the run for worker daemons and exit"
+    )
     run.set_defaults(handler=cmd_run)
+
+    cancel = sub.add_parser("cancel", help="cancel a queued or running run")
+    cancel.add_argument("run", help="run id")
+    cancel.set_defaults(handler=cmd_cancel)
+
+    work = sub.add_parser("worker", help="execute queued runs until SIGTERM, then drain")
+    work.add_argument(
+        "--runs", type=int, help="runs to execute at once (default EVALKIT_MAX_ACTIVE_RUNS)"
+    )
+    work.set_defaults(handler=cmd_worker)
 
     show = with_json(sub.add_parser("show", help="summarise a run"))
     show.add_argument("run", help="run id or label:NAME")
@@ -314,6 +380,12 @@ def build_parser() -> argparse.ArgumentParser:
     cal.add_argument("--concurrency", type=int, default=8)
     cal.set_defaults(handler=cmd_calibrate)
 
+    _add_maintenance_commands(sub)
+    sub.add_parser("serve", help="run the HTTP API (EVALKIT_HOST, EVALKIT_PORT)")
+    return parser
+
+
+def _add_maintenance_commands(sub: Any) -> None:
     ds = sub.add_parser("dataset", help="import, export or list datasets")
     ds_sub = ds.add_subparsers(dest="dataset_command", required=True)
     imp = ds_sub.add_parser("import")
@@ -330,9 +402,6 @@ def build_parser() -> argparse.ArgumentParser:
     db = sub.add_parser("db", help="database maintenance")
     db.add_argument("db_command", choices=["upgrade"])
     db.set_defaults(handler=cmd_db)
-
-    sub.add_parser("serve", help="run the HTTP API (EVALKIT_HOST, EVALKIT_PORT)")
-    return parser
 
 
 def main(argv: Sequence[str] | None = None, out: TextIO | None = None) -> int:
@@ -351,7 +420,9 @@ def main(argv: Sequence[str] | None = None, out: TextIO | None = None) -> int:
         except ConfigError as exc:
             _err(str(exc))
             return EXIT_INPUT
-    configure_logging("INFO" if args.verbose else "WARNING")
+    # A daemon's log is its record; one-shot commands stay quiet unless asked.
+    daemon = args.command == "worker"
+    configure_logging("INFO" if args.verbose else settings.log_level if daemon else "WARNING")
     scrubber.register(*settings.secret_values())
     try:
         return asyncio.run(_dispatch(args, settings, out))

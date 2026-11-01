@@ -9,7 +9,10 @@ a silent precedence rule.
     EVALKIT_HOST, EVALKIT_PORT  API listen address (default 127.0.0.1:8080)
     EVALKIT_API_TOKENS          comma-separated bearer tokens, 16+ chars each (secret)
     EVALKIT_MAX_BODY_BYTES      request body cap for the API (default 16 MiB)
-    EVALKIT_MAX_ACTIVE_RUNS     runs the API executes at once (default 2)
+    EVALKIT_MAX_ACTIVE_RUNS     runs the API or a worker executes at once (default 2; 0: the
+                                API only queues runs, for worker daemons to execute)
+    EVALKIT_WORKER_POLL_SECONDS how often an idle worker looks for queued runs (default 5)
+    EVALKIT_DRAIN_SECONDS       on SIGTERM, how long in-flight cases may take to finish (default 25)
     EVALKIT_LOG_LEVEL           DEBUG, INFO, WARNING or ERROR (default INFO)
     EVALKIT_LEASE_SECONDS       seconds before a dead runner's run can be resumed (default 30)
     EVALKIT_REDACTION_FILE      TOML file with a [redaction] table (default: all built-ins on)
@@ -54,7 +57,9 @@ class Settings(BaseModel):
     port: int = Field(default=8080, ge=1, le=65535)
     api_token_digests: tuple[bytes, ...] = ()
     max_body_bytes: int = Field(default=16 * 1024 * 1024, ge=1024, le=256 * 1024 * 1024)
-    max_active_runs: int = Field(default=2, ge=1, le=64)
+    max_active_runs: int = Field(default=2, ge=0, le=64)
+    worker_poll_seconds: float = Field(default=5.0, ge=0.05, le=300)
+    drain_seconds: float = Field(default=25.0, ge=0, le=3600)
     log_level: LogLevel = "INFO"
     lease_seconds: float = Field(default=30.0, ge=2, le=3600)
     anthropic_api_key: SecretStr | None = None
@@ -94,6 +99,8 @@ class Settings(BaseModel):
             "EVALKIT_MAX_ACTIVE_RUNS": "max_active_runs",
             "EVALKIT_LOG_LEVEL": "log_level",
             "EVALKIT_LEASE_SECONDS": "lease_seconds",
+            "EVALKIT_WORKER_POLL_SECONDS": "worker_poll_seconds",
+            "EVALKIT_DRAIN_SECONDS": "drain_seconds",
         }
         for var, field in plain.items():
             raw = env.get(var, "").strip()

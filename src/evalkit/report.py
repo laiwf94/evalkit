@@ -16,8 +16,9 @@ import numpy as np
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
+from evalkit import runqueue
 from evalkit.datasets import load_cases
-from evalkit.db.models import Dataset, Result, Run, as_utc
+from evalkit.db.models import Dataset, Result, Run, as_utc, utcnow
 from evalkit.errors import InvalidInputError, NotFoundError, PreconditionError
 from evalkit.stats import DEFAULT_RESAMPLES, Comparison, bootstrap_ci, compare_many
 
@@ -62,6 +63,9 @@ class RunSummary:
     latency_p95_ms: float | None
     created_at: datetime
     finished_at: datetime | None
+    priority: int = 0
+    max_workers: int | None = None
+    workers: int = 0  # worker daemons holding a slot on the run now
 
 
 @dataclass(frozen=True)
@@ -182,6 +186,9 @@ def summarize(session: Session, run_id: str, *, resamples: int = DEFAULT_RESAMPL
         latency_p95_ms=p95,
         created_at=as_utc(run.created_at),
         finished_at=as_utc(run.finished_at) if run.finished_at else None,
+        priority=run.priority,
+        max_workers=run.max_workers,
+        workers=runqueue.live_workers(session, run.id, utcnow()),
     )
 
 

@@ -1,6 +1,7 @@
 import asyncio
 import json
 from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
 
@@ -27,22 +28,39 @@ def settings(**kw: Any) -> Settings:
     return Settings.from_env({"EVALKIT_API_TOKENS": TOKEN, **kw})
 
 
+@asynccontextmanager
+async def serving(
+    sessions: sessionmaker[Session], **env: str
+) -> AsyncIterator[tuple[httpx2.AsyncClient, Any]]:
+    """The app with its lifespan running (which runs the embedded worker)."""
+    app = create_app(settings(**env), sessions=sessions, claude=FakeAnthropic().client())
+    transport = httpx2.ASGITransport(app=BodyLimit(app, 64 * 1024), raise_app_exceptions=False)
+    async with (
+        app.router.lifespan_context(app),
+        httpx2.AsyncClient(transport=transport, base_url="http://test") as c,
+    ):
+        yield c, app.state.services
+
+
 @pytest.fixture
 async def client(sessions: sessionmaker[Session]) -> AsyncIterator[httpx2.AsyncClient]:
-    app = create_app(settings(), sessions=sessions, claude=FakeAnthropic().client())
-    transport = httpx2.ASGITransport(app=BodyLimit(app, 64 * 1024), raise_app_exceptions=False)
-    async with httpx2.AsyncClient(transport=transport, base_url="http://test") as c:
+    async with serving(sessions) as (c, _):
         yield c
-    await app.state.services.manager.shutdown()
+
+
+async def wait_status(
+    c: httpx2.AsyncClient, run_id: str, statuses: tuple[str, ...]
+) -> dict[str, Any]:
+    for _ in range(1000):
+        body = (await c.get(f"/v1/runs/{run_id}", headers=AUTH)).json()
+        if body["status"] in statuses:
+            return dict(body)
+        await asyncio.sleep(0.01)
+    raise AssertionError(f"run did not reach {statuses}")
 
 
 async def wait_done(c: httpx2.AsyncClient, run_id: str) -> dict[str, Any]:
-    for _ in range(500):
-        body = (await c.get(f"/v1/runs/{run_id}", headers=AUTH)).json()
-        if body["status"] in ("completed", "failed"):
-            return dict(body)
-        await asyncio.sleep(0.01)
-    raise AssertionError("run did not finish")
+    return await wait_status(c, run_id, ("completed", "failed"))
 
 
 def run_body(**target: Any) -> dict[str, Any]:
@@ -184,7 +202,8 @@ async def test_compare_preconditions(
     assert r.status_code == 412
     assert r.json()["error"]["code"] == "failed_precondition"
     resumed = await client.post(f"/v1/runs/{pending.id}/resume", headers=AUTH)
-    assert resumed.json()["status"] == "pending"
+    assert resumed.status_code == 202
+    assert resumed.json()["status"] == "queued"
     assert (await wait_done(client, pending.id))["status"] == "completed"
 
 
@@ -232,27 +251,64 @@ async def test_health_reports_database_down() -> None:
 
 
 async def test_background_failures_and_shutdown(sessions: sessionmaker[Session]) -> None:
-    app = create_app(settings(), sessions=sessions, claude=FakeAnthropic().client())
-    svc = app.state.services
-    transport = httpx2.ASGITransport(app=app)
-    async with httpx2.AsyncClient(transport=transport, base_url="http://t") as c:
+    async with serving(sessions) as (c, svc):
         await c.post("/v1/datasets/qa", content=CASES, headers=AUTH)
-        slow = await c.post("/v1/runs", json=run_body(latency_ms=200), headers=AUTH)
-        await asyncio.sleep(0.05)
+        slow = await c.post("/v1/runs", json=run_body(latency_ms=300), headers=AUTH)
+        await wait_status(c, slow.json()["run_id"], ("running",))
 
         def broken_target(spec: Any) -> Any:
             raise RuntimeError("target exploded")
 
         svc.runner._target_factory = broken_target
         failing = await c.post("/v1/runs", json=run_body(seed=5), headers=AUTH)
-        # Only two runs may execute at once; both are now in flight.
-        await asyncio.sleep(0.1)
-        await svc.manager.shutdown()
-        statuses = {
-            (await c.get(f"/v1/runs/{rid}", headers=AUTH)).json()["status"]
-            for rid in (slow.json()["run_id"], failing.json()["run_id"])
-        }
-    assert statuses == {"interrupted", "failed"}
+        failed = await wait_done(c, failing.json()["run_id"])
+        assert "target exploded" in failed["error"]
+    # Shutdown drained the embedded worker: the slow run's eight cases in flight
+    # finished and were saved, the other four went back, and the run is queued
+    # for the next worker.
+    async with serving(sessions, EVALKIT_MAX_ACTIVE_RUNS="0") as (c, svc):
+        after = (await c.get(f"/v1/runs/{slow.json()['run_id']}", headers=AUTH)).json()
+        assert after["status"] == "queued"
+        assert after["completed"] == 8
+        assert after["workers"] == 0
+        assert svc.worker is None
+
+
+async def test_queue_cancel_and_resume(sessions: sessionmaker[Session]) -> None:
+    async with serving(sessions, EVALKIT_MAX_ACTIVE_RUNS="0") as (c, _):
+        await c.post("/v1/datasets/qa", content=CASES, headers=AUTH)
+        body = run_body() | {"queue": {"priority": 5, "max_workers": 2}}
+        queued = (await c.post("/v1/runs", json=body, headers=AUTH)).json()
+        assert queued["status"] == "queued"
+        assert (queued["priority"], queued["max_workers"]) == (5, 2)
+        bad = await c.post(
+            "/v1/runs", json=run_body() | {"queue": {"priority": 5000}}, headers=AUTH
+        )
+        assert bad.status_code == 400
+        cancelled = await c.post(f"/v1/runs/{queued['run_id']}/cancel", headers=AUTH)
+        assert cancelled.status_code == 202
+        # Nobody was executing it, so it is cancelled at once.
+        assert cancelled.json()["status"] == "cancelled"
+        again = await c.post(f"/v1/runs/{queued['run_id']}/cancel", headers=AUTH)
+        assert again.json()["status"] == "cancelled"
+        resumed = await c.post(f"/v1/runs/{queued['run_id']}/resume", headers=AUTH)
+        assert resumed.status_code == 409
+        assert (await c.post("/v1/runs/nope/cancel", headers=AUTH)).status_code == 404
+        assert (await c.post("/v1/runs/nope/resume", headers=AUTH)).status_code == 404
+
+    async with serving(sessions) as (c, _):
+        slow = (await c.post("/v1/runs", json=run_body(latency_ms=200), headers=AUTH)).json()
+        await wait_status(c, slow["run_id"], ("running",))
+        stopping = await c.post(f"/v1/runs/{slow['run_id']}/cancel", headers=AUTH)
+        assert stopping.json()["status"] in ("cancelling", "cancelled")
+        final = await wait_status(c, slow["run_id"], ("cancelled",))
+        assert final["finished_at"] is not None
+        assert final["completed"] < 12
+        done = (await c.post("/v1/runs", json=run_body(), headers=AUTH)).json()
+        await wait_done(c, done["run_id"])
+        refused = await c.post(f"/v1/runs/{done['run_id']}/cancel", headers=AUTH)
+        assert refused.status_code == 409
+        assert refused.json()["error"]["code"] == "conflict"
 
 
 async def test_unauthenticated_mode_on_loopback(sessions: sessionmaker[Session]) -> None:
@@ -292,7 +348,7 @@ def test_serve_starts_uvicorn(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -
 async def test_lifespan_closes_resources(sessions: sessionmaker[Session]) -> None:
     app = create_app(settings(), sessions=sessions, claude=FakeAnthropic().client())
     async with app.router.lifespan_context(app):
-        assert app.state.services.manager is not None
+        assert app.state.services.worker is not None
 
 
 async def test_body_limit_passes_other_scopes_and_disconnects() -> None:
