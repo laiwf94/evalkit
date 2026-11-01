@@ -53,11 +53,13 @@ from evalkit.logs import log_context, scrubber
 from evalkit.ratelimit import (
     Clock,
     Limiters,
-    ProviderLimiter,
+    RateLimit,
+    RateLimiter,
     RealClock,
     RetryStats,
     call_with_retries,
 )
+from evalkit.ratelimit_pg import PgRateLimiter
 from evalkit.redaction import Redactor
 from evalkit.runspec import CaseFilter, RunConfig, RunOptions
 from evalkit.scorers import Scorer, ScoreResult, ScorerSpec, build_scorers
@@ -177,7 +179,7 @@ class _Context:
     config: StoredRun
     target: Target
     scorers: Sequence[Scorer]
-    limiter: ProviderLimiter
+    limiter: RateLimiter
     rng: random.Random
     pending: dict[str, Case]
     keys: dict[str, str]
@@ -210,6 +212,7 @@ class Runner:
         target_factory: Callable[[Any], Target] | None = None,
         lease_ttl: timedelta | None = None,
         heartbeat_seconds: float | None = None,
+        shared_limits: bool | None = None,
     ) -> None:
         self.sessions = sessions
         self.settings = settings
@@ -223,11 +226,16 @@ class Runner:
         # Renew well before expiry so one slow database round trip cannot lose the lease.
         self.heartbeat_seconds = heartbeat_seconds or self.lease_ttl.total_seconds() / 3
         self._executing: set[str] = set()
+        # On PostgreSQL several processes may execute one run, so rate limits and
+        # cool-downs live in the database where they all see them.
+        self.shared_limits = (
+            _dialect(sessions) == "postgresql" if shared_limits is None else shared_limits
+        )
         # SQLite has one write lock per database, and a connection that finds it
         # taken backs off in sleeps of up to 100 ms. Claims and result writes from
         # this process take turns on a thread lock instead, which hands over at once.
         self._write_turn: contextlib.AbstractContextManager[Any] = (
-            threading.Lock() if _is_sqlite(sessions) else contextlib.nullcontext()
+            threading.Lock() if _dialect(sessions) == "sqlite" else contextlib.nullcontext()
         )
 
     def create_run(self, config: RunConfig) -> Run:
@@ -431,8 +439,10 @@ class Runner:
             for scorer in scorers:
                 if isinstance(scorer, LLMJudge):
                     scorer.cache = cache.VerdictStore(self.sessions)
+        for scorer in scorers:
+            if isinstance(scorer, LLMJudge):
+                scorer.limiter = self._limiter("anthropic:judge", RateLimit())
         target = self._build_target(config)
-        limiters = Limiters({target.provider: config.options.rate_limit}, self.clock)
         fingerprint = self.settings.redaction.fingerprint()
         keys = {
             c.id: cache.cache_key(run.target_hash, c.input, fingerprint) for c in pending.values()
@@ -450,7 +460,7 @@ class Runner:
             config=config,
             target=target,
             scorers=scorers,
-            limiter=limiters.get(target.provider),
+            limiter=self._limiter(target.provider, config.options.rate_limit),
             rng=random.Random(run.seed),  # noqa: S311 - retry jitter
             pending=pending,
             keys=keys,
@@ -458,6 +468,11 @@ class Runner:
             low_water=claim_size(config.options.concurrency) // 2,
         )
         return ctx, done
+
+    def _limiter(self, provider: str, limit: RateLimit) -> RateLimiter:
+        if self.shared_limits:
+            return PgRateLimiter(self.sessions, provider, limit, self.clock)
+        return Limiters({provider: limit}, self.clock).get(provider)
 
     async def _save_unwritten(
         self, run_id: str, queue: asyncio.Queue[CaseResult | None], unsaved: list[CaseResult]
@@ -916,9 +931,9 @@ class Runner:
         return True
 
 
-def _is_sqlite(sessions: sessionmaker[Session]) -> bool:
+def _dialect(sessions: sessionmaker[Session]) -> str | None:
     bind = sessions.kw.get("bind")
-    return bind is not None and bind.dialect.name == "sqlite"
+    return None if bind is None else str(bind.dialect.name)
 
 
 def _record(result: CaseResult, source: str, provider: str) -> None:

@@ -134,9 +134,37 @@ all. `use_cache = false` turns both off.
 ### Rate limits and retries
 
 Each provider (the Claude API, each HTTP endpoint,
-the judge) has a token bucket. When any call gets a Retry-After, the whole
-provider enters a cool-down that every worker waits out; without this, 32
-workers would each spend an attempt on the same 429. Failures without
+the judge) has a GCRA limiter: one number per provider, the theoretical arrival
+time, which a call advances by one interval (1 / rate) and which may run up to
+`burst - 1` intervals ahead. A call reserves a slot and sleeps until it, so in
+any window of `w` seconds at most `burst + w * rate` calls start. When any call
+gets a Retry-After, the whole provider enters a cool-down that every worker
+waits out; without this, 32 workers would each spend an attempt on the same
+429. The arrival time is also pushed past the end of the cool-down, so the
+burst does not all go out the moment it ends. A reserved slot that goes unused,
+because its caller was cancelled or a cool-down began while it slept, is handed
+back, but only while it is still the latest slot: handing back an earlier one
+would let a later caller share a slot that is already taken.
+
+On SQLite the limiter lives in memory. On PostgreSQL, where several processes
+may execute one run (and several runs one provider), it lives in a row of
+`rate_limits` (`ratelimit_pg.py`), so the rate and the cool-downs are fleet-wide:
+
+- An admission is one `UPDATE ... RETURNING` in autocommit. Callers in one
+  process that queue up while a statement is in flight are admitted together by
+  the next, which advances the row by one interval each, so one process can
+  admit about 50,000 calls a second (measured against PostgreSQL 16 in Docker)
+  rather than one per round trip.
+- Times are the database server's clock, and callers only sleep for the
+  difference between two readings of it, so worker clocks need not agree.
+- Every admission returns the current cool-down. A caller whose knowledge of it
+  is older than 100 ms when its slot arrives reads it again, so a 429 on one
+  worker pauses the others within about 100 ms. A provider with no configured
+  rate takes no slots and only shares cool-downs, with one primary-key read per
+  100 ms per process made in the background.
+- With 8 workers of 4 callers each on one key at 200 requests a second, the
+  end-to-end test measures 200.2 a second, and no 100 ms window exceeds the
+  limit. Failures without
 Retry-After back off exponentially with full jitter (base 0.5 s, cap 30 s).
 Retry-After is honoured up to 120 s by default so a misbehaving server cannot
 park a run for an hour. The SDK's own retries are turned off so there is
@@ -294,7 +322,7 @@ band.
 | A process stalls past its lease | Another process takes its cases over; the stalled process's results for them are refused. |
 | Ctrl-C or server shutdown | Queued results are written and the process's other leases released; the run is marked `interrupted` unless another process is still working on it. |
 | Two processes resume the same run | They share it. For a batch-mode run, the second fails with `conflict` while the first holds the lease. |
-| 429 or 529 from the API | Provider-wide cool-down for Retry-After, then retry; after the attempt limit the case is recorded as an error and scores 0. |
+| 429 or 529 from the API | Provider-wide cool-down for Retry-After, shared by every process on PostgreSQL, then retry; after the attempt limit the case is recorded as an error and scores 0. |
 | Target returns 4xx, redirect, non-JSON or an oversized body | Recorded as an error for that case, not retried. |
 | A scorer plugin raises | That score is `unscorable` with the message; the run continues. |
 | Redaction pattern times out | The stored output is replaced by `[REDACTION_FAILED]` and not cached. |
@@ -381,10 +409,6 @@ allowed newer versions because `pip-audit` flagged the older ones.
 ## Bigger runs
 
 Several things would change for many teams and much larger datasets.
-
-Token buckets are per process. With many workers on one API key they would move
-to a shared store (for example a Redis-backed GCRA limiter) so the provider
-limit is respected fleet-wide.
 
 Summaries are computed from the result rows on request, which is fine at tens of
 thousands of cases. Beyond that, the writer would maintain per-run aggregates as

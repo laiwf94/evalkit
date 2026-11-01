@@ -11,6 +11,7 @@ from sqlalchemy import (
     BigInteger,
     Boolean,
     DateTime,
+    Double,
     Float,
     ForeignKey,
     Index,
@@ -158,6 +159,17 @@ class CachedResponse(Base):
     stop_reason: Mapped[str | None] = mapped_column(String(32), nullable=True)
     usage: Mapped[dict[str, Any]] = mapped_column()
     created_at: Mapped[datetime] = mapped_column(default=utcnow)
+
+
+class RateLimitState(Base):
+    """The shared state of one provider's GCRA limiter (see ``ratelimit_pg.py``).
+    Both columns are seconds since the epoch on the database server's clock."""
+
+    __tablename__ = "rate_limits"
+
+    key: Mapped[str] = mapped_column(String(255), primary_key=True)
+    tat: Mapped[float] = mapped_column(Double)
+    cooldown_until: Mapped[float] = mapped_column(Double)
 
 
 class Calibration(Base):

@@ -91,6 +91,8 @@ labels with Cohen's kappa. Your own scorers plug in through an entry point.
 
 A run uses a bounded worker pool, per-provider rate limits, retries that honour
 Retry-After across all workers, and a response cache that makes reruns free.
+On PostgreSQL the rate limits and Retry-After cool-downs are shared by every
+process, so a fleet of workers on one API key stays within that key's limit.
 A run killed at any point resumes without repeating or re-paying for finished
 cases. Prompt targets can go through the Message Batches API at half price.
 
@@ -220,7 +222,8 @@ src/evalkit/leases.py      case leases: SKIP LOCKED claims and fenced result wri
 src/evalkit/stats.py       bootstrap, permutation test, effect size, Holm
 src/evalkit/report.py      run summaries and comparisons
 src/evalkit/estimate.py    cost estimates from token counts
-src/evalkit/ratelimit.py   token buckets, cool-downs, retries
+src/evalkit/ratelimit.py   GCRA limiter, cool-downs, retries
+src/evalkit/ratelimit_pg.py  the same limiter shared through PostgreSQL
 src/evalkit/redaction.py   PII redaction
 src/evalkit/api.py         HTTP API
 src/evalkit/cli.py         command line

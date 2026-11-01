@@ -33,7 +33,7 @@ from pydantic import BaseModel, Field, ValidationError
 
 from evalkit.datasets import Case, canonical_json, sha256_hex
 from evalkit.llm import ClaudeClient, Completion
-from evalkit.ratelimit import Limiters, RetryPolicy, RetryStats, call_with_retries
+from evalkit.ratelimit import Limiters, RateLimiter, RetryPolicy, RetryStats, call_with_retries
 from evalkit.scorers.base import Scorer, ScoreResult
 from evalkit.targets.base import TargetError, Usage
 
@@ -153,7 +153,7 @@ class LLMJudge(Scorer):
         self.effort = effort
         self.max_tokens = max_tokens
         self.retry = retry or RetryPolicy()
-        self._limiter = (limiters or Limiters()).get("anthropic:judge")
+        self.limiter: RateLimiter = (limiters or Limiters()).get("anthropic:judge")
         self.cache = cache
         template = _RUBRIC_SYSTEM if mode == "rubric" else _PAIRWISE_SYSTEM
         self.system = template.format(rubric=rubric)
@@ -204,7 +204,7 @@ class LLMJudge(Scorer):
                 effort=self.effort,
                 output_schema=schema,
             ),
-            limiter=self._limiter,
+            limiter=self.limiter,
             policy=self.retry,
             stats=RetryStats(),
         )

@@ -49,3 +49,8 @@ TOKENS = Counter(
     registry=REGISTRY,
 )
 COST = Counter("evalkit_cost_usd_total", "Spend in US dollars.", ["role"], registry=REGISTRY)
+RATE_LIMIT_REFUNDS = Counter(
+    "evalkit_rate_limit_refunds_total",
+    "Reserved rate-limit slots handed back unused (caller cancelled, or a cool-down began).",
+    registry=REGISTRY,
+)
