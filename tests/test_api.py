@@ -13,6 +13,7 @@ from evalkit import api
 from evalkit.api import BodyLimit, build, create_app
 from evalkit.config import ConfigError, Settings
 from evalkit.db import make_engine, make_session_factory
+from evalkit.targets.factory import build_target
 from tests.fake_anthropic import FakeAnthropic
 
 pytestmark = pytest.mark.anyio
@@ -253,8 +254,19 @@ async def test_health_reports_database_down() -> None:
 async def test_background_failures_and_shutdown(sessions: sessionmaker[Session]) -> None:
     async with serving(sessions) as (c, svc):
         await c.post("/v1/datasets/qa", content=CASES, headers=AUTH)
+        # A run is "running" before its target is built, so wait for the slow run's
+        # target itself before breaking the factory for the next run.
+        built = asyncio.Event()
+
+        def recording_target(spec: Any) -> Any:
+            target = build_target(spec, endpoints={}, claude=None)
+            built.set()
+            return target
+
+        svc.runner._target_factory = recording_target
         slow = await c.post("/v1/runs", json=run_body(latency_ms=300), headers=AUTH)
         await wait_status(c, slow.json()["run_id"], ("running",))
+        await asyncio.wait_for(built.wait(), 10)
 
         def broken_target(spec: Any) -> Any:
             raise RuntimeError("target exploded")
