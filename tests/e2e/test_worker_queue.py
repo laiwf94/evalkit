@@ -18,11 +18,11 @@ import httpx2
 import pytest
 from sqlalchemy import func, select, text
 
-from evalkit import runqueue
+from evalkit import aggregates, runqueue
 from evalkit.config import Settings
 from evalkit.datasets import Case, import_dataset
 from evalkit.db import make_engine, make_session_factory
-from evalkit.db.models import CaseLease, Result, Run, utcnow
+from evalkit.db.models import CaseLease, Result, Run, RunAggregate, utcnow
 from evalkit.runner import Runner
 from evalkit.runspec import RunConfig
 from tests.e2e.conftest import TOKEN, evalkit_env, free_port
@@ -195,6 +195,19 @@ def test_api_and_four_workers(postgres_url: str, tmp_path: Path) -> None:
             fences = list(s.scalars(select(CaseLease.fence).where(CaseLease.run_id == run_id)))
         assert len(ids) == len(set(ids)) == CASES
         assert max(fences) == 2, "the killed worker's cases were claimed again"
+        # Each worker added its results to its own aggregate shard, and the killed
+        # worker's uncommitted batch was never counted: the totals equal the results.
+        with sessions() as s:
+            check = aggregates.verify(s, run_id)
+            shards = s.scalar(
+                select(func.count()).select_from(RunAggregate).where(RunAggregate.run_id == run_id)
+            )
+        assert check.ok, check.problems
+        assert check.compacted
+        assert shards is not None
+        assert 2 <= shards <= 4
+        summary = client.get(f"/v1/runs/{run_id}").json()
+        assert summary["completed"] == summary["ok"] == CASES
 
         # SIGTERM drains: the other three exit cleanly and give their slots back.
         for proc in workers[1:]:

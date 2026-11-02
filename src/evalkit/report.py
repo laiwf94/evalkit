@@ -1,4 +1,5 @@
-"""Run summaries and run-to-run comparisons, computed from stored results.
+"""Run summaries and run-to-run comparisons, from per-run aggregates and compact
+score arrays (see ``aggregates.py``) rather than the result rows.
 
 Scoring policy: a case whose target call failed scores 0 on every metric (the
 system under test did not produce an answer, which is a failure the gate must
@@ -10,17 +11,29 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Any
 
 import numpy as np
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from evalkit import runqueue
-from evalkit.datasets import load_cases
+from evalkit import aggregates, runqueue
 from evalkit.db.models import Dataset, Result, Run, as_utc, utcnow
 from evalkit.errors import InvalidInputError, NotFoundError, PreconditionError
-from evalkit.stats import DEFAULT_RESAMPLES, Comparison, bootstrap_ci, compare_many
+from evalkit.stats import (
+    DEFAULT_RESAMPLES,
+    Comparison,
+    compare_aligned,
+    mean_interval,
+    normal_ci,
+)
+
+# A run that is not completed is summarised exactly from its results (bootstrap
+# intervals, about 30 ms per metric at this size) up to this many results, and
+# from its aggregates alone (normal intervals) above it. A completed run's
+# intervals are computed once, when it is compacted.
+LIVE_EXACT_MAX = 1_000
+# Latency percentiles of a larger running run come from its most recent results.
+LATENCY_SAMPLE = 5_000
 
 
 @dataclass(frozen=True)
@@ -90,12 +103,16 @@ def get_run(session: Session, run_id: str) -> Run:
 
 
 def scorer_names(run: Run) -> list[tuple[str, bool]]:
-    return [(s.get("name") or s["type"], bool(s.get("gate", True))) for s in run.scorers]
+    return [
+        (name, bool(s.get("gate", True)))
+        for name, s in zip(aggregates.metric_names(run), run.scorers, strict=True)
+    ]
 
 
 def metric_scores(session: Session, run: Run) -> tuple[dict[str, dict[str, float]], dict[str, int]]:
-    """Per metric, the score of every case that has one; and the unscorable counts."""
-    names = [n for n, _ in scorer_names(run)]
+    """Per metric, the score of every case that has one; and the unscorable counts.
+    Reads every result: only for runs small enough to summarise exactly."""
+    names = aggregates.metric_names(run)
     scores: dict[str, dict[str, float]] = {n: {} for n in names}
     unscorable = dict.fromkeys(names, 0)
     rows = session.execute(
@@ -103,61 +120,82 @@ def metric_scores(session: Session, run: Run) -> tuple[dict[str, dict[str, float
     )
     for case_id, status, case_scores in rows:
         for name in names:
-            if status != "ok":
-                scores[name][case_id] = 0.0
-                continue
-            value = (case_scores.get(name) or {}).get("value")
+            value = aggregates.score_of(status, case_scores, name)
             if value is None:
                 unscorable[name] += 1
             else:
-                scores[name][case_id] = float(value)
+                scores[name][case_id] = value
     return scores, unscorable
 
 
+def _live_metrics(
+    session: Session, run: Run, totals: aggregates.Totals, resamples: int
+) -> list[MetricSummary]:
+    """Metrics of a run that is not completed. Small runs are summarised exactly
+    from their results; larger ones from the aggregates alone."""
+    exact = totals.completed <= LIVE_EXACT_MAX
+    scores = metric_scores(session, run)[0] if exact else {}
+    out = []
+    for name, gate in scorer_names(run):
+        agg = totals.metrics.get(name, aggregates.MetricTotals())
+        if not agg.n:
+            out.append(MetricSummary(name, None, None, None, 0, agg.unscorable, gate))
+            continue
+        if exact:
+            by_case = scores[name]
+            values = [by_case[k] for k in sorted(by_case)]
+            ci = mean_interval(values, resamples=resamples, seed=run.seed)
+        else:
+            ci = normal_ci(agg.n, agg.total, agg.total_sq)
+        out.append(MetricSummary(name, ci.mean, ci.low, ci.high, ci.n, agg.unscorable, gate))
+    return out
+
+
+def _completed_metrics(
+    session: Session, run: Run, stored: dict[str, aggregates.MetricScores], resamples: int
+) -> list[MetricSummary]:
+    arrays = (
+        aggregates.load_scores(session, run, list(stored)) if resamples != DEFAULT_RESAMPLES else {}
+    )
+    out = []
+    for name, gate in scorer_names(run):
+        row = stored[name]
+        mean, low, high = row.mean, row.ci_low, row.ci_high
+        if arrays and row.n:
+            values = arrays[name]
+            ci = mean_interval(values[~np.isnan(values)], resamples=resamples, seed=run.seed)
+            mean, low, high = ci.mean, ci.low, ci.high
+        out.append(MetricSummary(name, mean, low, high, row.n, row.unscorable, gate))
+    return out
+
+
+def _live_latency(
+    session: Session, run: Run, totals: aggregates.Totals
+) -> tuple[float | None, float | None]:
+    """Latency percentiles of a run that is not completed: over every fresh result
+    of a small run, over the most recent ``LATENCY_SAMPLE`` of a large one."""
+    query = select(Result.latency_ms).where(
+        Result.run_id == run.id, Result.status == "ok", Result.cached.is_(False)
+    )
+    if totals.completed > LIVE_EXACT_MAX:
+        query = query.order_by(Result.id.desc()).limit(LATENCY_SAMPLE)
+    return aggregates.percentiles(list(session.scalars(query)))
+
+
 def summarize(session: Session, run_id: str, *, resamples: int = DEFAULT_RESAMPLES) -> RunSummary:
+    """A run's summary from its aggregates. A completed run reads only its
+    aggregates and compacted metrics, so the cost does not grow with its size."""
     run = get_run(session, run_id)
     dataset = session.get_one(Dataset, run.dataset_id)
-    split = run.case_filter.get("split")
-    tags = run.case_filter.get("tags") or ()
-    total = (
-        dataset.case_count
-        if not (split or tags)
-        else len(load_cases(session, dataset, split, tags))
-    )
-    rows = list(
-        session.execute(
-            select(
-                Result.status,
-                Result.cached,
-                Result.latency_ms,
-                Result.input_tokens,
-                Result.output_tokens,
-                Result.cache_read_tokens,
-                Result.cache_write_tokens,
-                Result.cost_usd,
-                Result.judge_input_tokens,
-                Result.judge_output_tokens,
-                Result.judge_cost_usd,
-            ).where(Result.run_id == run.id)
-        )
-    )
-    scores, unscorable = metric_scores(session, run)
-    metrics = []
-    for name, gate in scorer_names(run):
-        values = list(scores[name].values())
-        if values:
-            ci = bootstrap_ci(values, resamples=resamples, seed=run.seed)
-            metrics.append(
-                MetricSummary(name, ci.mean, ci.low, ci.high, ci.n, unscorable[name], gate)
-            )
-        else:
-            metrics.append(MetricSummary(name, None, None, None, 0, unscorable[name], gate))
-    fresh = [r.latency_ms for r in rows if r.status == "ok" and not r.cached]
-    p50, p95 = np.percentile(fresh, [50, 95]).tolist() if fresh else (None, None)
-
-    def total_of(index: int) -> Any:
-        return sum(r[index] for r in rows)
-
+    total = aggregates.cases_total(session, run)
+    totals = aggregates.read(session, run)
+    stored = aggregates.stored(session, run)
+    if stored is not None:
+        metrics = _completed_metrics(session, run, stored, resamples)
+        p50, p95 = run.latency_p50_ms, run.latency_p95_ms
+    else:
+        metrics = _live_metrics(session, run, totals, resamples)
+        p50, p95 = _live_latency(session, run, totals)
     return RunSummary(
         run_id=run.id,
         label=run.label,
@@ -169,19 +207,19 @@ def summarize(session: Session, run_id: str, *, resamples: int = DEFAULT_RESAMPL
         target_type=str(run.target_spec.get("type")),
         target_hash=run.target_hash,
         cases_total=total,
-        completed=len(rows),
-        ok=sum(1 for r in rows if r.status == "ok"),
-        errors=sum(1 for r in rows if r.status != "ok"),
-        cached=sum(1 for r in rows if r.cached),
+        completed=totals.completed,
+        ok=totals.ok,
+        errors=totals.errors,
+        cached=totals.cached,
         metrics=metrics,
-        input_tokens=total_of(3),
-        output_tokens=total_of(4),
-        cache_read_tokens=total_of(5),
-        cache_write_tokens=total_of(6),
-        cost_usd=float(total_of(7)),
-        judge_input_tokens=total_of(8),
-        judge_output_tokens=total_of(9),
-        judge_cost_usd=float(total_of(10)),
+        input_tokens=totals.input_tokens,
+        output_tokens=totals.output_tokens,
+        cache_read_tokens=totals.cache_read_tokens,
+        cache_write_tokens=totals.cache_write_tokens,
+        cost_usd=totals.cost_usd,
+        judge_input_tokens=totals.judge_input_tokens,
+        judge_output_tokens=totals.judge_output_tokens,
+        judge_cost_usd=totals.judge_cost_usd,
         latency_p50_ms=p50,
         latency_p95_ms=p95,
         created_at=as_utc(run.created_at),
@@ -214,9 +252,8 @@ def compare_runs(
         raise PreconditionError(
             "the runs used different dataset contents; results cannot be paired"
         )
-    base_scores, _ = metric_scores(session, base)
-    cand_scores, _ = metric_scores(session, cand)
-    shared = [n for n, _ in scorer_names(cand) if n in base_scores]
+    base_names = set(aggregates.metric_names(base))
+    shared = [n for n, _ in scorer_names(cand) if n in base_names]
     if metrics:
         unknown = [m for m in metrics if m not in shared]
         if unknown:
@@ -225,18 +262,20 @@ def compare_runs(
             )
         selected = metrics
     else:
-        selected = [n for n, gate in scorer_names(cand) if gate and n in base_scores]
+        selected = [n for n, gate in scorer_names(cand) if gate and n in base_names]
     if not selected:
         raise PreconditionError("the runs have no gated metric in common")
+    base_scores = aggregates.load_scores(session, base, selected)
+    cand_scores = aggregates.load_scores(session, cand, selected)
     usable = {
         name: (base_scores[name], cand_scores[name])
         for name in selected
-        if base_scores[name].keys() & cand_scores[name].keys()
+        if np.any(~np.isnan(base_scores[name]) & ~np.isnan(cand_scores[name]))
     }
     missing = [n for n in selected if n not in usable]
     if missing:
         raise PreconditionError(f"no case was scored in both runs for: {', '.join(missing)}")
-    comparisons = compare_many(
+    comparisons = compare_aligned(
         usable, alpha=alpha, min_effect=min_effect, resamples=resamples, seed=cand.seed
     )
     return CompareReport(

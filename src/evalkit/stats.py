@@ -7,7 +7,8 @@ regression on 100 cases that an unpaired test would need several hundred for.
 
 Methods, all seeded so a report can be reproduced exactly:
 
-* percentile bootstrap for the mean of one run (Efron & Tibshirani, 1993);
+* percentile bootstrap for the mean of one run (Efron & Tibshirani, 1993),
+  and above ``BOOTSTRAP_MAX_N`` values the normal interval it converges to;
 * paired bootstrap for the mean difference between two runs;
 * paired sign-flip permutation test for "is there any difference", exact for
   up to 16 pairs and Monte Carlo above that (Good, 2005);
@@ -18,8 +19,10 @@ Methods, all seeded so a report can be reproduced exactly:
 from __future__ import annotations
 
 import itertools
+import math
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
+from statistics import NormalDist
 from typing import Literal
 
 import numpy as np
@@ -32,6 +35,11 @@ EXACT_PERMUTATION_MAX_N = 16
 # Cap on resample-matrix elements held at once, so 10,000 resamples of 100,000
 # cases is processed in chunks instead of allocating 8 GB.
 _CHUNK_ELEMENTS = 2_000_000
+# Above this many values the interval for one run's mean is the normal interval
+# instead of the bootstrap. By then the bootstrap distribution of a mean of
+# bounded scores is normal to well within its own Monte Carlo noise, and 10,000
+# resamples of a million cases would take minutes.
+BOOTSTRAP_MAX_N = 20_000
 
 FloatArray = npt.NDArray[np.float64]
 
@@ -102,6 +110,44 @@ def bootstrap_ci(
     tail = (1 - confidence) / 2 * 100
     low, high = np.percentile(means, [tail, 100 - tail])
     return Interval(mean, float(low), float(high), int(arr.size))
+
+
+def normal_ci(n: int, total: float, total_sq: float, *, confidence: float = 0.95) -> Interval:
+    """Normal interval for the mean from a count, a sum and a sum of squares, which
+    is what per-run aggregates keep; the standard deviation uses n - 1."""
+    if n <= 0:
+        raise ValueError("cannot compute an interval for no values")
+    if not 0 < confidence < 1:
+        raise ValueError("confidence must be between 0 and 1")
+    mean = total / n
+    if n == 1:
+        return Interval(mean, mean, mean, 1)
+    variance = max(0.0, (total_sq - n * mean * mean) / (n - 1))
+    half = NormalDist().inv_cdf(1 - (1 - confidence) / 2) * math.sqrt(variance / n)
+    return Interval(mean, mean - half, mean + half, n)
+
+
+def mean_interval(
+    values: Sequence[float] | FloatArray,
+    *,
+    confidence: float = 0.95,
+    resamples: int = DEFAULT_RESAMPLES,
+    seed: int = 0,
+) -> Interval:
+    """The interval reported for one run's mean: the percentile bootstrap up to
+    ``BOOTSTRAP_MAX_N`` values, the normal interval above that."""
+    arr = _as_array(values)
+    if arr.size <= BOOTSTRAP_MAX_N:
+        return bootstrap_ci(arr, confidence=confidence, resamples=resamples, seed=seed)
+    mean = float(arr.mean())
+    centred = arr - mean
+    # Two-pass sums: exact enough even when every score is close to the mean.
+    return normal_ci(
+        int(arr.size),
+        mean * arr.size,
+        float(centred @ centred) + mean * mean * arr.size,
+        confidence=confidence,
+    )
 
 
 def permutation_test(
@@ -199,22 +245,56 @@ def compare_many(
     Everything else is "no detectable change": the data does not show a
     difference, which is not the same as showing there is none.
     """
+    aligned = {}
+    for name, (base, cand) in metrics.items():
+        # NaN marks a missing score below, so a given score must be finite.
+        _as_array(list(base.values()))
+        _as_array(list(cand.values()))
+        keys = sorted(base.keys() | cand.keys())
+        aligned[name] = (
+            np.array([base.get(k, math.nan) for k in keys], dtype=np.float64),
+            np.array([cand.get(k, math.nan) for k in keys], dtype=np.float64),
+        )
+    return compare_aligned(
+        aligned,
+        alpha=alpha,
+        min_effect=min_effect,
+        confidence=confidence,
+        resamples=resamples,
+        seed=seed,
+    )
+
+
+def compare_aligned(
+    metrics: Mapping[str, tuple[FloatArray, FloatArray]],
+    *,
+    alpha: float = 0.05,
+    min_effect: float = 0.0,
+    confidence: float = 0.95,
+    resamples: int = DEFAULT_RESAMPLES,
+    seed: int = 0,
+) -> list[Comparison]:
+    """``compare_many`` over score arrays that line up case by case (in case-id
+    order), with NaN where a run has no score for the case."""
     if not 0 < alpha < 1:
         raise ValueError("alpha must be between 0 and 1")
     if min_effect < 0:
         raise ValueError("min_effect must not be negative")
     rows = []
     for name, (base, cand) in metrics.items():
-        shared = sorted(base.keys() & cand.keys())
-        if not shared:
+        if base.shape != cand.shape or base.ndim != 1:
+            raise ValueError(f"metric {name!r}: score arrays do not line up")
+        has_b, has_c = ~np.isnan(base), ~np.isnan(cand)
+        both = has_b & has_c
+        if not both.any():
             raise ValueError(f"metric {name!r}: the runs share no scored cases")
-        b = np.array([base[k] for k in shared], dtype=np.float64)
-        c = np.array([cand[k] for k in shared], dtype=np.float64)
+        b = _as_array(base[both])
+        c = _as_array(cand[both])
         d = c - b
         ci = bootstrap_ci(d, confidence=confidence, resamples=resamples, seed=seed)
         p = permutation_test(d, resamples=resamples, seed=seed)
-        unpaired = len(base.keys() ^ cand.keys())
-        rows.append((name, len(shared), unpaired, b, c, ci, p, cohens_dz(d)))
+        unpaired = int(np.count_nonzero(has_b ^ has_c))
+        rows.append((name, int(b.size), unpaired, b, c, ci, p, cohens_dz(d)))
     adjusted = holm([r[6] for r in rows])
     out = []
     for (name, n, unpaired, b, c, ci, p, dz), p_adj in zip(rows, adjusted, strict=True):

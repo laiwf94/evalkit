@@ -4,11 +4,16 @@ from hypothesis import given, settings
 from hypothesis import strategies as st
 
 from evalkit.stats import (
+    BOOTSTRAP_MAX_N,
+    Interval,
     bootstrap_ci,
     cohens_dz,
     compare,
+    compare_aligned,
     compare_many,
     holm,
+    mean_interval,
+    normal_ci,
     permutation_test,
 )
 
@@ -167,3 +172,53 @@ def test_compare_validates_arguments() -> None:
         compare("m", s, s, alpha=0.0)
     with pytest.raises(ValueError, match="min_effect"):
         compare("m", s, s, min_effect=-1)
+
+
+def test_normal_ci_from_sums() -> None:
+    values = np.array([0.0, 1.0, 1.0, 0.5, 0.25])
+    ci = normal_ci(values.size, float(values.sum()), float(values @ values))
+    half = 1.959963984540054 * values.std(ddof=1) / np.sqrt(values.size)
+    assert (ci.mean, ci.low, ci.high, ci.n) == pytest.approx(
+        (values.mean(), values.mean() - half, values.mean() + half, 5)
+    )
+    assert normal_ci(1, 0.5, 0.25) == Interval(0.5, 0.5, 0.5, 1)
+    # Rounding cannot make the variance negative.
+    same = normal_ci(3, 0.3, 0.03 - 1e-12)
+    assert same.low == same.high == pytest.approx(0.1)
+    with pytest.raises(ValueError, match="no values"):
+        normal_ci(0, 0.0, 0.0)
+    with pytest.raises(ValueError, match="confidence"):
+        normal_ci(2, 1.0, 1.0, confidence=1.0)
+
+
+def test_mean_interval_switches_to_normal_above_the_bootstrap_limit() -> None:
+    rng = np.random.default_rng(0)
+    small = rng.integers(0, 2, size=500).astype(float)
+    assert mean_interval(small, resamples=200, seed=3) == bootstrap_ci(small, resamples=200, seed=3)
+    large = rng.integers(0, 2, size=BOOTSTRAP_MAX_N + 1).astype(float)
+    normal = mean_interval(large)
+    boot = bootstrap_ci(large, resamples=2000, seed=1)
+    width = boot.high - boot.low
+    assert normal.mean == pytest.approx(large.mean())
+    # The bootstrap at this size agrees with the normal interval to within its own noise.
+    assert abs(normal.low - boot.low) < 0.05 * width
+    assert abs(normal.high - boot.high) < 0.05 * width
+
+
+def test_compare_aligned_matches_compare_many_and_checks_shapes() -> None:
+    base = {"a": 1.0, "b": 0.0, "c": 1.0, "d": 0.5}
+    cand = {"b": 1.0, "c": 0.0, "d": 0.5, "e": 1.0}
+    keys = sorted(base.keys() | cand.keys())
+    aligned = (
+        np.array([base.get(k, np.nan) for k in keys]),
+        np.array([cand.get(k, np.nan) for k in keys]),
+    )
+    assert compare_aligned({"m": aligned}, resamples=200) == compare_many(
+        {"m": (base, cand)}, resamples=200
+    )
+    with pytest.raises(ValueError, match="do not line up"):
+        compare_aligned({"m": (np.zeros(3), np.zeros(4))})
+    with pytest.raises(ValueError, match="share no scored cases"):
+        compare_aligned({"m": (np.array([1.0, np.nan]), np.array([np.nan, 1.0]))})
+    with pytest.raises(ValueError, match="finite"):
+        compare_many({"m": ({"a": float("nan")}, {"a": 1.0})})

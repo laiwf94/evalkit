@@ -34,7 +34,7 @@ from sqlalchemy import select
 from sqlalchemy.engine import make_url
 from sqlalchemy.orm import Session, sessionmaker
 
-from evalkit import __version__, runqueue
+from evalkit import __version__, aggregates, runqueue
 from evalkit.api import serve
 from evalkit.config import ConfigError, Settings
 from evalkit.datasets import (
@@ -60,6 +60,7 @@ from evalkit.scorers.judge import LLMJudge
 from evalkit.scorers.registry import JudgeSpec
 from evalkit.worker import Worker, listen_url
 
+VERIFY = "verify"
 EXIT_OK, EXIT_REGRESSION, EXIT_INPUT, EXIT_UNUSABLE, EXIT_INTERRUPTED = 0, 1, 2, 3, 130
 MAX_CONFIG_BYTES = 1024 * 1024
 
@@ -141,6 +142,12 @@ def resolve_run(session: Session, ref: str) -> str:
 
 
 async def cmd_run(args: argparse.Namespace, app: App) -> int:
+    if args.config == VERIFY:
+        return await cmd_verify(args, app)
+    if args.run_id is not None:
+        raise CliError(f"unexpected argument {args.run_id!r}", EXIT_INPUT)
+    if args.repair:
+        raise CliError("--repair belongs to: evalkit run verify RUN_ID", EXIT_INPUT)
     if args.resume:
         with app.sessions() as session:
             run = session.get(Run, args.resume)
@@ -178,6 +185,17 @@ async def cmd_run(args: argparse.Namespace, app: App) -> int:
         summary = summarize(session, run_id)
     _emit(app.out, summary, args.json, _format_summary)
     return EXIT_OK if summary.status == "completed" else EXIT_UNUSABLE
+
+
+async def cmd_verify(args: argparse.Namespace, app: App) -> int:
+    """``evalkit run verify RUN_ID [--repair]``: recompute a run's aggregates and
+    score arrays from its results and report any difference (exit 3)."""
+    if args.run_id is None:
+        raise CliError("give the run to verify: evalkit run verify RUN_ID", EXIT_INPUT)
+    with app.sessions() as session:
+        report = aggregates.verify(session, args.run_id, repair=args.repair)
+    _emit(app.out, report, args.json, _format_verification)
+    return EXIT_OK if report.ok or report.repaired else EXIT_UNUSABLE
 
 
 async def cmd_cancel(args: argparse.Namespace, app: App) -> int:
@@ -333,8 +351,17 @@ def build_parser() -> argparse.ArgumentParser:
         p.add_argument("--json", action="store_true", help="print JSON instead of a table")
         return p
 
-    run = with_json(sub.add_parser("run", help="run an evaluation from a TOML config"))
-    run.add_argument("config", nargs="?")
+    run = with_json(
+        sub.add_parser(
+            "run",
+            help="run an evaluation from a TOML config, or check a run (run verify RUN_ID)",
+        )
+    )
+    run.add_argument("config", nargs="?", help="run config (TOML), or 'verify'")
+    run.add_argument("run_id", nargs="?", help="with 'verify': the run to check")
+    run.add_argument(
+        "--repair", action="store_true", help="with 'verify': rewrite what differs from results"
+    )
     run.add_argument("--label", help="label the run, e.g. a branch or commit")
     run.add_argument("--resume", metavar="RUN_ID", help="continue an interrupted run")
     run.add_argument(
@@ -533,6 +560,19 @@ def _format_summary(s: RunSummary) -> str:
         lines.append(f"latency p50 {s.latency_p50_ms:.0f} ms  p95 {s.latency_p95_ms:.0f} ms")
     if s.error:
         lines.append(f"error: {s.error}")
+    return "\n".join(lines) + "\n"
+
+
+def _format_verification(v: aggregates.Verification) -> str:
+    arrays = "score arrays checked" if v.compacted else "not compacted yet"
+    lines = [f"run {v.run_id}  {v.status}  {v.results} results  {arrays}"]
+    if v.ok:
+        lines.append("OK: aggregates match the results")
+    else:
+        lines.append(f"{len(v.problems)} difference(s):")
+        lines += [f"  {p}" for p in v.problems]
+        if v.repaired:
+            lines.append("repaired: aggregates rewritten from the results")
     return "\n".join(lines) + "\n"
 
 

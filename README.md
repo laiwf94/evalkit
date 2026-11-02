@@ -110,7 +110,11 @@ environment or secret files and are scrubbed from logs.
 
 ## Reading the verdict
 
-Each run reports means with bootstrap confidence intervals. Two runs are
+Each run reports means with bootstrap confidence intervals (normal intervals
+above 20,000 scored cases, where the two agree). Summaries come from per-run
+aggregates kept with every result write and from one compact score array per
+metric written when the run completes, so reading a run's summary costs the
+same at a hundred cases or a million. Two runs are
 compared pairwise, with a paired bootstrap interval and a sign-flip permutation
 test, giving a better / worse / no detectable change verdict and an effect
 size; Holm correction applies when several metrics are gated together.
@@ -125,6 +129,7 @@ size; Holm correction applies when several metrics are gated together.
 | `evalkit worker [--runs N]` | Execute queued runs until SIGTERM, then drain. |
 | `evalkit cancel RUN_ID` | Cancel a queued or running run. |
 | `evalkit show RUN` | Summary of a run. |
+| `evalkit run verify RUN_ID [--repair]` | Recompute a run's aggregates and score arrays from its results; exit 3 on any difference, or rewrite them with `--repair`. |
 | `evalkit compare BASE CAND` | Paired comparison per metric. |
 | `evalkit gate BASE CAND` | Same, and exit 1 if any gated metric is worse. |
 | `evalkit estimate CONFIG` | Cost estimate from token counts. |
@@ -203,12 +208,14 @@ over a fake HTTP transport that checks the exact request body; one opt-in test
 | Crash safety | A CLI run on PostgreSQL is killed with SIGKILL mid-run; a resume joins at once and takes the dead process's cases over when their leases expire, with every case recorded exactly once. Four processes share one run on PostgreSQL and one is SIGKILLed: the other three finish it, each case recorded and paid for once. Eight threads claiming at once get disjoint batches. In-process tests interrupt runs, take cases over from under a running process (its late results are refused) and check that finished work is saved and not repeated. |
 | SSRF | Loopback, private, link-local, metadata, CGNAT and IPv4-in-IPv6 addresses are refused; a DNS answer that changes after the check cannot redirect the request. |
 | End to end | Testcontainers PostgreSQL 16, the real server as a subprocess, a stand-in app over HTTP, the CLI gate against the same database. |
+| Aggregates | Summaries and comparisons from aggregates and score arrays equal those computed from the results; a Hypothesis test folds random result batches into random shards and checks the totals equal one recomputation; `run verify` finds tampered counts, sums, arrays and percentiles and `--repair` fixes them; on PostgreSQL the four-worker run with one SIGKILLed worker verifies clean. |
 | API and CLI | Every endpoint, error code and exit code, over ASGI and over the wire. |
 
 ```console
 $ ./scripts/check.sh                 # format, lint, mypy --strict, tests with coverage
 $ uv run pip-audit
 $ uv run python benchmarks/run.py
+$ uv run python benchmarks/summary.py --cases 1000000   # summary on a huge run
 ```
 
 ## Speed
@@ -246,6 +253,7 @@ src/evalkit/leases.py      case leases: SKIP LOCKED claims and fenced result wri
 src/evalkit/runqueue.py    the run queue: states, priorities, worker slots and caps, cancel
 src/evalkit/worker.py      the worker daemon: LISTEN/NOTIFY wake-up, heartbeats, SIGTERM drain
 src/evalkit/stats.py       bootstrap, permutation test, effect size, Holm
+src/evalkit/aggregates.py  per-run aggregates, compact score arrays, run verify
 src/evalkit/report.py      run summaries and comparisons
 src/evalkit/estimate.py    cost estimates from token counts
 src/evalkit/ratelimit.py   GCRA limiter, cool-downs, retries

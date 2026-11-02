@@ -23,11 +23,17 @@ datasets        (name, version) unique, (name, content_hash) unique
 dataset_cases   (dataset_id, case_id) unique; input, expected, tags, split, metadata (JSON)
 runs            target spec + target hash, scorer specs, options, filter, seed,
                 status, lease (owner, expires_at; batch mode only), batch_id,
-                queued_at, priority, max_workers
+                queued_at, priority, max_workers, cases_total,
+                latency p50 and p95 (set when the run is compacted)
 case_leases     (run_id, case_id) key; position, owner, expires_at, fence, done
 run_workers     (run_id, worker_id) key; joined_at, expires_at: a worker daemon's slot
 results         (run_id, case_id) unique; redacted output, scores (JSON), tokens,
                 cost, judge tokens and cost, attempts, latency, error
+run_aggregates  (run_id, shard) key; counts, token and cost sums of the results
+                written by one process (the shard)
+run_metric_aggregates  (run_id, shard, metric) key; n, sum, sum of squares, unscorable
+run_scores      (run_id, metric) key; a completed run's scores as one float64 array
+                in case-id order, n, unscorable, mean and interval
 response_cache  key = sha256(target hash, input, redaction fingerprint)
 judge_calibrations  judge hash, kappa, weighted kappa, agreement, confusion matrix
 ```
@@ -181,6 +187,40 @@ executed again by whoever takes them over. A run the worker leaves
 stays `running`. A second signal skips the wait. The API's embedded worker
 drains the same way on shutdown, so a restarted single server picks its runs
 up again by itself.
+
+### Run aggregates and score arrays
+
+A summary must not read every result: a million-case run would take seconds
+per request. The transaction that writes a batch of results also adds the
+batch's counts (completed, ok, errors, cached, fresh), token and cost sums, and
+each metric's count, sum, sum of squares and unscorable count to the run's
+aggregates, with one `INSERT ... ON CONFLICT DO UPDATE` per table. The rows are
+sharded by the writing process's owner id, so eight workers on one run never
+wait on one hot row; the totals are a `SUM` over a handful of shard rows. A
+refused result (a lease taken over) is never added, and a process killed before
+its commit adds nothing, so the totals always equal the results.
+
+When the process that completes the run wins the compare-and-set, it writes
+`run_scores`: one row per metric holding every case's score as a float64 array
+in case-id order (NaN for a case not selected or unscorable), the summary
+interval computed once, and the exact latency p50 and p95. Case-id order is a
+Python sort, independent of database collation, and it is the order the paired
+comparison has always resampled in, so verdicts are unchanged. Two runs over the
+same dataset content line up element by element, so a comparison reads one row
+per metric per run. If that write fails, or the run completed before migration
+0005, the first summary or comparison writes it instead.
+
+A summary of a completed run reads the run row, its shard rows and the
+`run_scores` metadata, never the results. A run that is not completed is
+summarised exactly from its results up to 1,000 of them; above that its
+intervals are normal intervals from the aggregates, and its latency percentiles
+come from its most recent 5,000 fresh results (index `(run_id, id)`).
+
+`evalkit run verify RUN_ID` recomputes all of this from the results in one
+repeatable-read snapshot and lists every difference (exit 3); `--repair`
+replaces the aggregates with the recomputation and rewrites the arrays, and is
+refused while the run is queued, running or cancelling. Migration 0005 fills in
+aggregates for runs that already had results.
 
 ### The response cache
 
@@ -343,6 +383,12 @@ which is why a paired test detects a regression with a fraction of the cases an
 unpaired test would need (Berg-Kirkpatrick et al., *An Empirical Investigation
 of Statistical Significance in NLP*).
 
+Above 20,000 scored cases the interval for one run is the normal interval
+(mean plus or minus 1.96 standard errors) instead of the bootstrap described
+next: at that size the bootstrap distribution of a mean of bounded scores is
+normal to within its own Monte Carlo noise (the test suite checks they agree to
+5% of the width), and 10,000 resamples of a million cases would take minutes.
+
 The interval for one run is a percentile bootstrap of the mean with 10,000
 resamples (Efron & Tibshirani, *An Introduction to the Bootstrap*): simple and
 distribution-free. It runs slightly narrow for small n; the coverage test
@@ -398,7 +444,7 @@ band.
 
 | Limit | Value | Why |
 |---|---|---|
-| Cases per dataset | 100,000 | Bounds import memory and summary cost. |
+| Cases per dataset | 100,000 | Bounds import memory. Summaries no longer grow with run size. |
 | JSONL line | 1 MiB | Checked before parsing. |
 | API request body | 16 MiB (configurable, max 256 MiB) | Checked by Content-Length and while reading. |
 | Workers per run | 1-256 | |
@@ -477,10 +523,6 @@ allowed newer versions because `pip-audit` flagged the older ones.
 ## Bigger runs
 
 Several things would change for many teams and much larger datasets.
-
-Summaries are computed from the result rows on request, which is fine at tens of
-thousands of cases. Beyond that, the writer would maintain per-run aggregates as
-results are committed.
 
 The response cache grows without bound. A last-used timestamp and a sweep by
 age, or partitioning by month, would bound it.

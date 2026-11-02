@@ -16,6 +16,7 @@ from sqlalchemy import (
     ForeignKey,
     Index,
     Integer,
+    LargeBinary,
     String,
     Text,
     UniqueConstraint,
@@ -107,6 +108,11 @@ class Run(Base):
     priority: Mapped[int] = mapped_column(Integer, default=0)
     # How many worker daemons may execute the run at once; None means no cap.
     max_workers: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    # How many cases the run's filter selects; set at creation (older runs: on first read).
+    cases_total: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    # Exact percentiles of fresh successful latencies, set when the run is compacted.
+    latency_p50_ms: Mapped[float | None] = mapped_column(Float, nullable=True)
+    latency_p95_ms: Mapped[float | None] = mapped_column(Float, nullable=True)
     created_at: Mapped[datetime] = mapped_column(default=utcnow)
     started_at: Mapped[datetime | None] = mapped_column(nullable=True)
     finished_at: Mapped[datetime | None] = mapped_column(nullable=True)
@@ -116,7 +122,10 @@ class Run(Base):
 
 class Result(Base):
     __tablename__ = "results"
-    __table_args__ = (UniqueConstraint("run_id", "case_id", name="uq_results_run_case"),)
+    __table_args__ = (
+        UniqueConstraint("run_id", "case_id", name="uq_results_run_case"),
+        Index("ix_results_run_recent", "run_id", "id"),
+    )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     run_id: Mapped[str] = mapped_column(ForeignKey("runs.id", ondelete="CASCADE"))
@@ -138,6 +147,67 @@ class Result(Base):
     scores: Mapped[dict[str, Any]] = mapped_column(default=dict)
     error: Mapped[str] = mapped_column(Text, default="")
     created_at: Mapped[datetime] = mapped_column(default=utcnow)
+
+
+class RunAggregate(Base):
+    """Running totals of one run's results, kept in the transaction that writes them.
+    Each writing process has its own ``shard`` row, so processes never wait on each
+    other's aggregate updates; a run's totals are the sum over its shards."""
+
+    __tablename__ = "run_aggregates"
+
+    run_id: Mapped[str] = mapped_column(ForeignKey("runs.id", ondelete="CASCADE"), primary_key=True)
+    shard: Mapped[str] = mapped_column(String(64), primary_key=True)
+    completed: Mapped[int] = mapped_column(BigInteger)
+    ok: Mapped[int] = mapped_column(BigInteger)
+    errors: Mapped[int] = mapped_column(BigInteger)
+    cached: Mapped[int] = mapped_column(BigInteger)
+    # Successful results that were not served from the response cache.
+    fresh: Mapped[int] = mapped_column(BigInteger)
+    input_tokens: Mapped[int] = mapped_column(BigInteger)
+    output_tokens: Mapped[int] = mapped_column(BigInteger)
+    cache_read_tokens: Mapped[int] = mapped_column(BigInteger)
+    cache_write_tokens: Mapped[int] = mapped_column(BigInteger)
+    cost_usd: Mapped[float] = mapped_column(Double)
+    judge_input_tokens: Mapped[int] = mapped_column(BigInteger)
+    judge_output_tokens: Mapped[int] = mapped_column(BigInteger)
+    judge_cost_usd: Mapped[float] = mapped_column(Double)
+
+
+class RunMetricAggregate(Base):
+    """Running count, sum and sum of squares of one metric's scores, per shard."""
+
+    __tablename__ = "run_metric_aggregates"
+
+    run_id: Mapped[str] = mapped_column(ForeignKey("runs.id", ondelete="CASCADE"), primary_key=True)
+    shard: Mapped[str] = mapped_column(String(64), primary_key=True)
+    metric: Mapped[str] = mapped_column(String(128), primary_key=True)
+    n: Mapped[int] = mapped_column(BigInteger)
+    total: Mapped[float] = mapped_column(Double)
+    total_sq: Mapped[float] = mapped_column(Double)
+    unscorable: Mapped[int] = mapped_column(BigInteger)
+
+
+class RunScores(Base):
+    """One metric's scores for every case of a completed run, as one array.
+
+    ``scores`` is little-endian float64, one value per case of the run's dataset in
+    case-id order, NaN where the case has no score (not selected, or unscorable).
+    Two runs over the same dataset content line up element by element, so a paired
+    comparison reads one row per metric per run. ``mean``, ``ci_low`` and ``ci_high``
+    are the run summary's interval, computed once when the row is written."""
+
+    __tablename__ = "run_scores"
+
+    run_id: Mapped[str] = mapped_column(ForeignKey("runs.id", ondelete="CASCADE"), primary_key=True)
+    metric: Mapped[str] = mapped_column(String(128), primary_key=True)
+    case_count: Mapped[int] = mapped_column(Integer)
+    n: Mapped[int] = mapped_column(Integer)
+    unscorable: Mapped[int] = mapped_column(Integer)
+    mean: Mapped[float | None] = mapped_column(Double, nullable=True)
+    ci_low: Mapped[float | None] = mapped_column(Double, nullable=True)
+    ci_high: Mapped[float | None] = mapped_column(Double, nullable=True)
+    scores: Mapped[bytes] = mapped_column(LargeBinary)
 
 
 class CaseLease(Base):

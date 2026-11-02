@@ -47,7 +47,7 @@ from sqlalchemy import ColumnElement, case, exists, false, func, or_, select, tr
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, sessionmaker
 
-from evalkit import cache, leases, metrics, runqueue
+from evalkit import aggregates, cache, leases, metrics, runqueue
 from evalkit.config import Settings
 from evalkit.datasets import Case, get_dataset, load_cases
 from evalkit.db.models import CaseLease, Dataset, Result, Run, as_utc, utcnow
@@ -243,6 +243,8 @@ class Runner:
         # Renew well before expiry so one slow database round trip cannot lose the lease.
         self.heartbeat_seconds = heartbeat_seconds or self.lease_ttl.total_seconds() / 3
         self._active: dict[str, _Control] = {}
+        # Each run's metric names, for the aggregates written with its results.
+        self._metrics: dict[str, list[str]] = {}
         # On PostgreSQL several processes may execute one run, so rate limits and
         # cool-downs live in the database where they all see them.
         self.shared_limits = (
@@ -285,6 +287,7 @@ class Runner:
                 priority=config.queue.priority,
                 # A batch is one paid request for the whole run: one worker at a time.
                 max_workers=1 if config.options.mode == "batch" else config.queue.max_workers,
+                cases_total=len(cases),
                 created_at=now,
             )
             session.add(run)
@@ -919,7 +922,7 @@ class Runner:
         processes finish together exactly one of them completes the run."""
         with self.sessions() as session:
             unfinished = exists().where(CaseLease.run_id == run_id, CaseLease.done == false())
-            session.execute(
+            completed = session.execute(
                 update(Run)
                 .where(
                     Run.id == run_id,
@@ -937,6 +940,15 @@ class Runner:
                 .execution_options(synchronize_session=False)
             )
             session.commit()
+            if completed.rowcount:  # type: ignore[attr-defined]
+                # This process completed the run: write its score arrays now, so the
+                # first summary or comparison does not have to. A failure here is
+                # not the run's failure; the next reader compacts it instead.
+                try:
+                    aggregates.compact(session, session.get_one(Run, run_id))
+                except Exception:
+                    session.rollback()
+                    log.exception("compacting run scores failed", extra={"run_id": run_id})
             return session.scalars(select(Run.status).where(Run.id == run_id)).one()
 
     def _holds_run(self, exclusive: bool) -> ColumnElement[bool]:
@@ -994,22 +1006,26 @@ class Runner:
 
     def _write(self, run_id: str, batch: list[CaseResult]) -> int:
         """Save results whose lease this process still holds, in the transaction
-        that marks those leases done. Returns how many were refused because the
-        case had been taken over by another process."""
+        that marks those leases done and adds them to the run's aggregates. Returns
+        how many were refused because the case had been taken over by another
+        process."""
+        names = self._metric_names(run_id)
         entries = [r.cache_entry for r in batch if r.cache_entry is not None]
         with self._write_turn, self.sessions() as session:
             try:
                 accepted = leases.finish(
                     session, run_id, self.owner, [(r.case_id, r.fence) for r in batch]
                 )
-                session.add_all(Result(**r.row(run_id)) for r in batch if r.case_id in accepted)
+                saved = [r for r in batch if r.case_id in accepted]
+                session.add_all(Result(**r.row(run_id)) for r in saved)
+                aggregates.add(session, run_id, self.owner, aggregates.fold(saved, names))
                 cache.store(session, entries)
                 session.commit()
             except IntegrityError:
                 # A result for one of these cases already exists (written outside
                 # the lease protocol). Save the rest one by one and keep stored rows.
                 session.rollback()
-                accepted = {r.case_id for r in batch if self._write_one(session, run_id, r)}
+                accepted = {r.case_id for r in batch if self._write_one(session, run_id, names, r)}
                 cache.store(session, entries)
                 session.commit()
         refused = len(batch) - len(accepted)
@@ -1020,13 +1036,25 @@ class Runner:
             )
         return refused
 
-    def _write_one(self, session: Session, run_id: str, result: CaseResult) -> bool:
+    def _metric_names(self, run_id: str) -> list[str]:
+        names = self._metrics.get(run_id)
+        if names is None:
+            with self.sessions() as session:
+                names = aggregates.metric_names(session.get_one(Run, run_id))
+            self._metrics[run_id] = names
+        return names
+
+    def _write_one(
+        self, session: Session, run_id: str, names: list[str], result: CaseResult
+    ) -> bool:
         claim = [(result.case_id, result.fence)]
         if not leases.finish(session, run_id, self.owner, claim):
             session.rollback()
             return False
         try:
             session.add(Result(**result.row(run_id)))
+            session.flush()
+            aggregates.add(session, run_id, self.owner, aggregates.fold([result], names))
             session.commit()
         except IntegrityError:
             session.rollback()
