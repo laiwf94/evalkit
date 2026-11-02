@@ -362,15 +362,18 @@ def compact(session: Session, run: Run) -> None:
     arrays = build_arrays(session, run)
     rows = summary_rows(run, arrays)
     p50, p95 = percentiles(arrays.latencies)
-    session.execute(delete(RunScores).where(RunScores.run_id == run.id))
-    session.add_all(rows)
-    session.execute(
-        update(Run)
-        .where(Run.id == run.id)
-        .values(latency_p50_ms=p50, latency_p95_ms=p95)
-        .execution_options(synchronize_session=False)
-    )
     try:
+        session.execute(delete(RunScores).where(RunScores.run_id == run.id))
+        session.add_all(rows)
+        # Flush here: a concurrent compaction's rows surface as a unique violation
+        # on this insert (on PostgreSQL), whichever statement would autoflush it.
+        session.flush()
+        session.execute(
+            update(Run)
+            .where(Run.id == run.id)
+            .values(latency_p50_ms=p50, latency_p95_ms=p95)
+            .execution_options(synchronize_session=False)
+        )
         session.commit()
     except IntegrityError:
         session.rollback()

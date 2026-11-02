@@ -237,6 +237,26 @@ def test_a_failed_compaction_does_not_fail_the_run(
         assert s.scalars(select(RunScores).where(RunScores.run_id == run_id)).all()
 
 
+def test_losing_a_compaction_race_is_not_an_error(
+    sessions: sessionmaker[Session], dataset: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    run_id = execute(sessions, config(accuracy=0.7))
+    real = aggregates.summary_rows
+
+    def clashing(run: Run, arrays: aggregates.Arrays, **kw: Any) -> list[RunScores]:
+        # Another process's row for the same key, as a concurrent compaction makes.
+        rows = real(run, arrays, **kw)
+        twin = RunScores(**{c: getattr(rows[0], c) for c in ("run_id", "metric", "case_count",
+                         "n", "unscorable", "mean", "ci_low", "ci_high", "scores")})  # fmt: skip
+        return [*rows, twin]
+
+    monkeypatch.setattr(aggregates, "summary_rows", clashing)
+    with sessions() as s:
+        aggregates.compact(s, s.get_one(Run, run_id))
+        # Nothing of the losing attempt was kept; the earlier rows still stand.
+        assert len(s.scalars(select(RunScores).where(RunScores.run_id == run_id)).all()) == 2
+
+
 def test_two_processes_write_their_own_shards(
     sessions: sessionmaker[Session], dataset: str
 ) -> None:

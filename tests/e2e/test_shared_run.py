@@ -1,5 +1,6 @@
 """Several processes on one run against PostgreSQL: disjoint claims, one killed."""
 
+import asyncio
 import json
 import os
 import signal
@@ -11,12 +12,15 @@ from datetime import timedelta
 from pathlib import Path
 
 import pytest
-from sqlalchemy import func, select
+from sqlalchemy import delete, func, select
 
-from evalkit import leases
+from evalkit import aggregates, leases
+from evalkit.config import Settings
 from evalkit.datasets import Case, import_dataset
 from evalkit.db import make_engine, make_session_factory
-from evalkit.db.models import CaseLease, Result, Run, utcnow
+from evalkit.db.models import CaseLease, Result, Run, RunScores, utcnow
+from evalkit.runner import Runner
+from evalkit.runspec import RunConfig
 from tests.e2e.conftest import evalkit_env
 
 pytestmark = pytest.mark.e2e
@@ -153,4 +157,49 @@ def test_four_processes_one_killed(postgres_url: str, tmp_path: Path) -> None:
     assert tokens == sum(max(1, len(f"q{i}") // 4) for i in range(CASES))
     # The killed process held cases; they were claimed again after its leases expired.
     assert max(fences) == 2
+    engine.dispose()
+
+
+def test_concurrent_compactions_of_one_run(postgres_url: str) -> None:
+    """Every process that reads a completed run without score arrays compacts it;
+    on PostgreSQL the losers of that race must give way, not fail the request."""
+    engine = make_engine(postgres_url)
+    sessions = make_session_factory(engine)
+    with sessions() as s:
+        import_dataset(s, "compact-race", [Case(id=f"r{i}", input=str(i), expected="x")
+                                           for i in range(300)])  # fmt: skip
+    runner = Runner(sessions, Settings.from_env({}))
+    run = runner.create_run(
+        RunConfig.model_validate(
+            {
+                "dataset": {"name": "compact-race"},
+                "target": {"type": "fake", "accuracy": 0.5},
+                "scorers": [{"type": "exact"}, {"type": "token_f1"}],
+            }
+        )
+    )
+    asyncio.run(runner.execute(run.id))
+    errors: list[BaseException] = []
+    for _ in range(5):
+        with sessions() as s:
+            s.execute(delete(RunScores).where(RunScores.run_id == run.id))
+            s.commit()
+        barrier = threading.Barrier(8)
+
+        def compact(barrier: threading.Barrier = barrier) -> None:
+            try:
+                with sessions() as s:
+                    barrier.wait()
+                    aggregates.stored(s, s.get_one(Run, run.id))
+            except BaseException as exc:
+                errors.append(exc)
+
+        threads = [threading.Thread(target=compact) for _ in range(8)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+    assert errors == []
+    with sessions() as s:
+        assert aggregates.verify(s, run.id).ok
     engine.dispose()
