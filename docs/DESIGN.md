@@ -34,7 +34,8 @@ run_aggregates  (run_id, shard) key; counts, token and cost sums of the results
 run_metric_aggregates  (run_id, shard, metric) key; n, sum, sum of squares, unscorable
 run_scores      (run_id, metric) key; a completed run's scores as one float64 array
                 in case-id order, n, unscorable, mean and interval
-response_cache  key = sha256(target hash, input, redaction fingerprint)
+response_cache  key = sha256(target hash, input, redaction fingerprint); output (or
+                its blob digest), created_at, last_used_at, size_bytes
 judge_calibrations  judge hash, kappa, weighted kappa, agreement, confusion matrix
 ```
 
@@ -231,6 +232,56 @@ is an output whose redaction timed out, so a rerun retries both. Judge verdicts
 go in the same table, keyed by the judge configuration and the exact prompt, so
 a rerun of an unchanged target with an unchanged judge makes no API calls at
 all. `use_cache = false` turns both off.
+
+The cache is bounded by a sweep. Each entry records its output's size in UTF-8
+bytes and when it was last used; a lookup refreshes that at most once an hour,
+so a hot entry costs one write an hour rather than one per run, and the
+up-front lookup of a run stays one read per 500 cases. `cache.sweep` first
+deletes entries unused for longer than the maximum age, then walks the rest in
+least-recently-used order (index `(last_used_at, key)`) and deletes until the
+total size is at most the maximum. It deletes 1,000 keys per transaction, and
+each delete only removes entries whose last use is no newer than when the sweep
+read them, so an entry a run uses in the meantime survives. `--dry-run`
+reports exactly what a real sweep would remove. `evalkit cache sweep` runs it
+on demand; when `EVALKIT_CACHE_MAX_AGE` or `EVALKIT_CACHE_MAX_BYTES` is set,
+every worker daemon runs it each `EVALKIT_CACHE_SWEEP_SECONDS`, and on
+PostgreSQL a session advisory lock lets only one of them do it at a time (the
+others skip that round). Deleting an entry never changes a run that already
+used it: the run's own results hold the output.
+
+### Blobs
+
+Cached outputs of `EVALKIT_BLOB_MIN_BYTES` (64 KiB) or more go to a
+content-addressed blob store when `EVALKIT_BLOB_URL` names one; the row keeps
+an empty output, the SHA-256 digest and the size. A blob's name is the hash of
+its bytes, so writes are idempotent and two writers of the same output agree on
+its name, and every read is checked against it. Blobs are laid out as
+`sha256/ab/cd/<digest>`.
+
+- **Filesystem** (`file:///path`): written to `tmp/`, fsynced, renamed into
+  place and the directory fsynced, so a reader never sees a partial blob.
+- **S3-compatible** (`s3+https://host[:port]/bucket[/prefix]`): MinIO, Ceph,
+  SeaweedFS, versitygw and the like, path-style. Requests are signed in
+  `blobs.py` with signature version 4 (about 60 lines of `hmac` and `hashlib`
+  instead of a vendor SDK and its dependencies). The signed payload hash of a
+  PUT is the blob's own digest, so the server rejects a body altered in
+  transit. 5xx answers and connection failures are retried twice.
+
+The blob is written before the row that refers to it is committed. If the
+store cannot be written, the output is cached inline instead. A row whose blob
+is missing or corrupt is deleted on lookup and counts as a miss, so the next
+fresh output replaces it; a store that is unreachable is a miss and keeps the
+row.
+
+Garbage collection (after each sweep, and in `evalkit cache sweep`) lists the
+store a page of 1,000 at a time, asks the database which of the page's digests
+some entry still refers to (index on `output_blob`), and deletes the others
+that were last written before the grace period (`EVALKIT_BLOB_GRACE`, 1 hour).
+A repeated put refreshes a blob's modification time, so a blob that a run is
+about to refer to again is never old enough to collect, and on the filesystem
+the time is checked again just before the delete. Temporary files left by a
+crash are removed after the same grace period. `evalkit cache scrub` reads
+every blob and lists the ones whose bytes no longer match their name.
 
 ### Rate limits and retries
 
@@ -436,6 +487,8 @@ band.
 | Target returns 4xx, redirect, non-JSON or an oversized body | Recorded as an error for that case, not retried. |
 | A scorer plugin raises | That score is `unscorable` with the message; the run continues. |
 | Redaction pattern times out | The stored output is replaced by `[REDACTION_FAILED]` and not cached. |
+| Blob store unavailable | Long outputs are cached inline; a cache entry whose blob cannot be read is a miss and the case runs again. A missing or corrupt blob drops its entry. |
+| Two processes sweep the cache | On PostgreSQL the second one skips the round (advisory lock); on SQLite the deletes are idempotent. |
 | Judge refuses, runs out of tokens or returns bad JSON | That score is `unscorable` with the reason. |
 | Database unavailable | `/healthz` returns 503; a running run fails and can be resumed. |
 | Runs compared over different dataset contents | `failed_precondition` (CLI exit 3), never a misleading verdict. |
@@ -467,6 +520,9 @@ band.
 | Result page | 500 | |
 | Case lease | 30 s default | Time before a dead process's cases are taken over. |
 | Cases per claim | 4 per worker, 64-500 | Bounds what a dead process strands for one lease length. |
+| Response cache | unbounded by default; `EVALKIT_CACHE_MAX_AGE`, `EVALKIT_CACHE_MAX_BYTES` | Swept hourly by workers when set. |
+| Cached output kept inline | under 64 KiB when a blob store is configured | `EVALKIT_BLOB_MIN_BYTES`. |
+| Unreferenced blob kept | 1 hour | Covers the gap between writing a blob and committing its row. |
 
 ## Running it as a shared service
 
@@ -491,7 +547,10 @@ API keys come from environment variables or `*_FILE` secret files. Bearer
 tokens are stored as SHA-256 digests and compared with `hmac.compare_digest`
 against every configured digest, without stopping early. Known secret values
 and credential-shaped strings are scrubbed from every log line, and endpoint
-secret headers are excluded from the target hash and never stored. Outputs are
+secret headers are excluded from the target hash and never stored. Blob store
+credentials have their own variables (a URL with credentials in it is refused)
+and are scrubbed like the rest; blob names are checked to be SHA-256 digests
+before they become a path or a key. Outputs are
 redacted before they are stored, cached or sent to the judge, and a pattern
 that times out fails closed.
 
@@ -524,8 +583,5 @@ allowed newer versions because `pip-audit` flagged the older ones.
 
 Several things would change for many teams and much larger datasets.
 
-The response cache grows without bound. A last-used timestamp and a sweep by
-age, or partitioning by month, would bound it.
-
-Long outputs would move to object storage, keyed by content hash, with only the
-reference left in the results table.
+Long outputs in the results table would move to the blob store as cached
+outputs already can, with only the digest left in the row.

@@ -73,7 +73,7 @@ async def estimate(
             raise InvalidInputError("the filter selects no cases from the dataset")
         fingerprint = settings.redaction.fingerprint()
         keys = {c.id: cache.cache_key(target_id, c.input, fingerprint) for c in cases}
-        hits = cache.lookup(session, list(keys.values())) if config.options.use_cache else {}
+        hits = cache.existing(session, list(keys.values())) if config.options.use_cache else set()
     uncached = [c for c in cases if keys[c.id] not in hits]
     batch = config.options.mode == "batch"
     result = Estimate(cases=len(cases), cached_cases=len(cases) - len(uncached), batch=batch)

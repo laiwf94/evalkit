@@ -62,3 +62,20 @@ RUNS_CANCELLED = Counter(
     "Cancellations requested through the API or the CLI.",
     registry=REGISTRY,
 )
+CACHE_SWEPT = Counter(
+    "evalkit_cache_swept_total",
+    "Response cache entries deleted by a sweep (too old, or over the size limit).",
+    registry=REGISTRY,
+)
+BLOBS_COLLECTED = Counter(
+    "evalkit_blobs_collected_total",
+    "Unreferenced blobs deleted by garbage collection.",
+    registry=REGISTRY,
+)
+BLOB_FAILURES = Counter(
+    "evalkit_blob_failures_total",
+    "Blob store problems: write (output cached inline), unreachable (read later), "
+    "unusable (missing or corrupt blob; entry dropped).",
+    ["reason"],
+    registry=REGISTRY,
+)

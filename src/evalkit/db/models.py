@@ -242,7 +242,11 @@ class RunWorker(Base):
 
 
 class CachedResponse(Base):
+    """One cached output. ``output`` is empty when the text is in the blob store
+    under ``output_blob``; ``size_bytes`` is the output's UTF-8 size either way."""
+
     __tablename__ = "response_cache"
+    __table_args__ = (Index("ix_response_cache_last_used", "last_used_at", "key"),)
 
     key: Mapped[str] = mapped_column(String(64), primary_key=True)
     target_hash: Mapped[str] = mapped_column(String(64), index=True)
@@ -250,6 +254,9 @@ class CachedResponse(Base):
     stop_reason: Mapped[str | None] = mapped_column(String(32), nullable=True)
     usage: Mapped[dict[str, Any]] = mapped_column()
     created_at: Mapped[datetime] = mapped_column(default=utcnow)
+    last_used_at: Mapped[datetime] = mapped_column(default=utcnow)
+    size_bytes: Mapped[int] = mapped_column(BigInteger, default=0)
+    output_blob: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
 
 
 class RateLimitState(Base):

@@ -21,6 +21,11 @@ results it has. Each run is left ``queued`` for another worker (unless other
 processes are still executing it), and the worker's slots are given back. A
 second signal skips the wait.
 
+When ``EVALKIT_CACHE_MAX_AGE`` or ``EVALKIT_CACHE_MAX_BYTES`` is set, or a blob
+store is configured, the worker also sweeps the response cache and collects
+unreferenced blobs every ``EVALKIT_CACHE_SWEEP_SECONDS`` (``cache.maintain``).
+On PostgreSQL an advisory lock lets one worker at a time do it.
+
 A worker started inside the API process (``EVALKIT_MAX_ACTIVE_RUNS`` slots) is
 the same class, so a single ``evalkit serve`` still executes what it accepts.
 """
@@ -29,13 +34,14 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from datetime import timedelta
 
 import psycopg
 from psycopg import sql
 from sqlalchemy.engine import make_url
 from sqlalchemy.orm import Session, sessionmaker
 
-from evalkit import metrics, runqueue
+from evalkit import cache, metrics, runqueue
 from evalkit.db.models import utcnow
 from evalkit.logs import log_context
 from evalkit.runner import Runner, wait_for_any
@@ -52,6 +58,10 @@ def listen_url(database_url: str) -> str | None:
     if url.get_backend_name() != "postgresql":
         return None
     return url.set(drivername="postgresql").render_as_string(hide_password=False)
+
+
+def _seconds(value: float | None) -> timedelta | None:
+    return None if value is None else timedelta(seconds=value)
 
 
 class Worker:
@@ -81,6 +91,9 @@ class Worker:
         self._wake = asyncio.Event()
         self._tasks: dict[str, asyncio.Task[None]] = {}
         self._stopping = False
+        settings = runner.settings
+        # Sweep the response cache and collect blobs when there is anything to bound.
+        self.maintain_cache = settings.cache_limited or runner.blobs is not None
 
     @property
     def runs(self) -> set[str]:
@@ -103,6 +116,8 @@ class Worker:
     async def serve(self, stop: asyncio.Event) -> None:
         """Execute queued runs until ``stop`` is set, then drain."""
         background = [asyncio.create_task(self._heartbeat(), name="worker-heartbeat")]
+        if self.maintain_cache:
+            background.append(asyncio.create_task(self._maintain_cache(), name="worker-cache"))
         if self.listen is not None:
             background.append(asyncio.create_task(self._listen(self.listen), name="worker-listen"))
         log.info("worker started", extra={"worker": self.id, "slots": self.slots})
@@ -225,6 +240,33 @@ class Worker:
         with self.sessions() as session:
             runqueue.renew_slots(session, self.id, run_ids, ttl=self.ttl, now=utcnow())
             session.commit()
+
+    async def _maintain_cache(self) -> None:
+        settings = self.runner.settings
+        while True:
+            try:
+                done = await asyncio.to_thread(
+                    cache.maintain,
+                    self.sessions,
+                    self.runner.blobs,
+                    max_age=_seconds(settings.cache_max_age_seconds),
+                    max_bytes=settings.cache_max_bytes,
+                    grace=timedelta(seconds=settings.blob_grace_seconds),
+                )
+                if not done.skipped and (
+                    done.sweep.removed or (done.blobs is not None and done.blobs.removed)
+                ):
+                    log.info(
+                        "swept the response cache",
+                        extra={
+                            "entries": done.sweep.removed,
+                            "bytes": done.sweep.removed_bytes,
+                            "blobs": done.blobs.removed if done.blobs else 0,
+                        },
+                    )
+            except Exception:
+                log.warning("cannot sweep the response cache; trying later", exc_info=True)
+            await asyncio.sleep(settings.cache_sweep_seconds)
 
     def _sweep(self) -> None:
         with self.sessions() as session:

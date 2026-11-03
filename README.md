@@ -100,6 +100,13 @@ run (up to a per-run cap), a cancel stops every one of them within moments, and
 a worker sent SIGTERM finishes the cases it has in flight, hands the rest back
 and exits. Prompt targets can go through the Message Batches API at half price.
 
+The response cache stays bounded: entries record when they were last used and
+how big they are, and `evalkit cache sweep` (or every worker, when a limit is
+set) removes entries unused for longer than a maximum age and then the least
+recently used ones above a maximum size. Long outputs can be kept in a
+content-addressed blob store, a directory or any S3-compatible bucket, with
+only the digest in the database; every read checks the bytes against it.
+
 Tokens and dollars are counted per case and per run, including prompt cache
 reads and writes and judge calls, and `evalkit estimate` prices a run before
 you start it, using the token counting endpoint.
@@ -135,6 +142,8 @@ size; Holm correction applies when several metrics are gated together.
 | `evalkit estimate CONFIG` | Cost estimate from token counts. |
 | `evalkit calibrate --judge J LABELS` | Judge agreement with human labels. |
 | `evalkit dataset import/export/list` | Manage datasets. |
+| `evalkit cache sweep [--max-age 30d] [--max-size 20GiB] [--dry-run]` | Delete old and least recently used cache entries, then unreferenced blobs. |
+| `evalkit cache scrub` | Read every blob and check it against its digest; exit 3 if any is corrupt. |
 | `evalkit serve`, `evalkit db upgrade` | Run the API; migrate PostgreSQL. |
 
 `RUN` is a run id or `label:NAME` for the newest completed run with that
@@ -173,6 +182,15 @@ the default Kubernetes grace period of 30 seconds. A run's `[queue]` table (or
 `"queue"` in the API body) sets `priority` (higher first, -1000 to 1000) and
 `max_workers` (how many workers may share it).
 
+To bound the response cache, set `EVALKIT_CACHE_MAX_AGE` (for example `30d`)
+and/or `EVALKIT_CACHE_MAX_BYTES` (`20GiB`); workers then sweep every
+`EVALKIT_CACHE_SWEEP_SECONDS` (3600), one at a time. To keep long outputs out
+of the database, point `EVALKIT_BLOB_URL` at a directory (`file:///var/lib/evalkit/blobs`)
+or a bucket (`s3+https://minio.internal:9000/evalkit/blobs`, with
+`EVALKIT_BLOB_ACCESS_KEY` and `EVALKIT_BLOB_SECRET_KEY`); cached outputs of
+`EVALKIT_BLOB_MIN_BYTES` (64 KiB) or more go there. Unreferenced blobs are
+collected once they are older than `EVALKIT_BLOB_GRACE` (1h).
+
 Every `/v1` route takes `Authorization: Bearer <token>`.
 
 | Endpoint | Purpose |
@@ -209,6 +227,7 @@ over a fake HTTP transport that checks the exact request body; one opt-in test
 | SSRF | Loopback, private, link-local, metadata, CGNAT and IPv4-in-IPv6 addresses are refused; a DNS answer that changes after the check cannot redirect the request. |
 | End to end | Testcontainers PostgreSQL 16, the real server as a subprocess, a stand-in app over HTTP, the CLI gate against the same database. |
 | Aggregates | Summaries and comparisons from aggregates and score arrays equal those computed from the results; a Hypothesis test folds random result batches into random shards and checks the totals equal one recomputation; `run verify` finds tampered counts, sums, arrays and percentiles and `--repair` fixes them; on PostgreSQL the four-worker run with one SIGKILLed worker verifies clean. |
+| Cache and blobs | A Hypothesis test sweeps random caches by age and size and checks the dry run reports exactly what the real sweep removes, that what is left fits the limit and is always the most recently used. An entry used between the sweep's read and its delete survives. Both blob backends round-trip random bytes; tampered blobs are refused; garbage collection never removes a referenced or recent blob (Hypothesis) and spares one written again mid-scan. Requests are signed in our own code and checked by an in-memory S3 server that recomputes every signature, and on a real S3-compatible server (versitygw in Testcontainers) together with a sweep and collection on PostgreSQL. |
 | API and CLI | Every endpoint, error code and exit code, over ASGI and over the wire. |
 
 ```console
@@ -249,6 +268,8 @@ src/evalkit/targets/       prompt, HTTP (SSRF-safe) and fake targets; templates
 src/evalkit/scorers/       built-in scorers, plugin registry, LLM judge, calibration
 src/evalkit/llm.py         the Claude client: caching, structured output, fallback, cost
 src/evalkit/runner.py      worker pool, cache, resume, run completion, batch mode, cancel, drain
+src/evalkit/cache.py       response cache: keys, last use, sweep by age and size, blob offload
+src/evalkit/blobs.py       content-addressed blobs: filesystem and S3 backends, signing, GC
 src/evalkit/leases.py      case leases: SKIP LOCKED claims and fenced result writes
 src/evalkit/runqueue.py    the run queue: states, priorities, worker slots and caps, cancel
 src/evalkit/worker.py      the worker daemon: LISTEN/NOTIFY wake-up, heartbeats, SIGTERM drain

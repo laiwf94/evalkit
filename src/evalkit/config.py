@@ -18,6 +18,16 @@ a silent precedence rule.
     EVALKIT_REDACTION_FILE      TOML file with a [redaction] table (default: all built-ins on)
     EVALKIT_PRICES_FILE         TOML [prices.<model>] tables overriding the built-in prices
     EVALKIT_HTTP_TARGETS_FILE   TOML [endpoints.<name>] tables: the only URLs HTTP targets may call
+    EVALKIT_CACHE_MAX_AGE       sweep cache entries unused for this long, e.g. 30d (default: never)
+    EVALKIT_CACHE_MAX_BYTES     sweep least recently used entries above this size, e.g. 20GiB
+    EVALKIT_CACHE_SWEEP_SECONDS how often worker daemons sweep when a limit is set (default 3600)
+    EVALKIT_BLOB_URL            blob store for long cached outputs: file:///path or
+                                s3+https://host[:port]/bucket[/prefix] (default: none)
+    EVALKIT_BLOB_ACCESS_KEY,    S3 credentials for the blob store (secrets)
+    EVALKIT_BLOB_SECRET_KEY
+    EVALKIT_BLOB_REGION         S3 signing region (default us-east-1)
+    EVALKIT_BLOB_MIN_BYTES      cached outputs this long go to the blob store (default 64 KiB)
+    EVALKIT_BLOB_GRACE          garbage collection keeps unreferenced blobs this new (default 1h)
     ANTHROPIC_API_KEY           Claude API key (secret)
 """
 
@@ -34,6 +44,7 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, SecretStr, ValidationError
 
+from evalkit.blobs import BlobStore, open_store
 from evalkit.pricing import ModelPrice
 from evalkit.redaction import RedactionConfig
 from evalkit.targets.http import HttpEndpoint
@@ -66,6 +77,19 @@ class Settings(BaseModel):
     redaction: RedactionConfig = RedactionConfig()
     prices: dict[str, ModelPrice] = Field(default_factory=dict)
     http_endpoints: dict[str, HttpEndpoint] = Field(default_factory=dict)
+    cache_max_age_seconds: float | None = Field(default=None, gt=0)
+    cache_max_bytes: int | None = Field(default=None, ge=0)
+    cache_sweep_seconds: float = Field(default=3600.0, ge=1, le=7 * 86400)
+    blob_url: str | None = None
+    blob_access_key: SecretStr | None = None
+    blob_secret_key: SecretStr | None = None
+    blob_region: str = Field(default="us-east-1", pattern=r"^[a-z0-9-]{1,64}$")
+    blob_min_bytes: int = Field(default=64 * 1024, ge=0)
+    blob_grace_seconds: float = Field(default=3600.0, ge=0)
+
+    @property
+    def cache_limited(self) -> bool:
+        return self.cache_max_age_seconds is not None or self.cache_max_bytes is not None
 
     @property
     def auth_enabled(self) -> bool:
@@ -85,6 +109,9 @@ class Settings(BaseModel):
         values = [self.anthropic_api_key.get_secret_value()] if self.anthropic_api_key else []
         for endpoint in self.http_endpoints.values():
             values.extend(v.get_secret_value() for v in endpoint.secret_headers.values())
+        values.extend(
+            s.get_secret_value() for s in (self.blob_access_key, self.blob_secret_key) if s
+        )
         return values
 
     @classmethod
@@ -101,11 +128,34 @@ class Settings(BaseModel):
             "EVALKIT_LEASE_SECONDS": "lease_seconds",
             "EVALKIT_WORKER_POLL_SECONDS": "worker_poll_seconds",
             "EVALKIT_DRAIN_SECONDS": "drain_seconds",
+            "EVALKIT_CACHE_SWEEP_SECONDS": "cache_sweep_seconds",
+            "EVALKIT_BLOB_URL": "blob_url",
+            "EVALKIT_BLOB_REGION": "blob_region",
         }
         for var, field in plain.items():
             raw = env.get(var, "").strip()
             if raw:
                 values[field] = raw.upper() if field == "log_level" else raw
+
+        for var, field, parse in (
+            ("EVALKIT_CACHE_MAX_AGE", "cache_max_age_seconds", parse_duration),
+            ("EVALKIT_CACHE_MAX_BYTES", "cache_max_bytes", parse_size),
+            ("EVALKIT_BLOB_MIN_BYTES", "blob_min_bytes", parse_size),
+            ("EVALKIT_BLOB_GRACE", "blob_grace_seconds", parse_duration),
+        ):
+            raw = env.get(var, "").strip()
+            if raw:
+                try:
+                    values[field] = parse(raw)
+                except ValueError as exc:
+                    raise ConfigError(f"{var}: {exc}") from None
+        for var, field in (
+            ("EVALKIT_BLOB_ACCESS_KEY", "blob_access_key"),
+            ("EVALKIT_BLOB_SECRET_KEY", "blob_secret_key"),
+        ):
+            secret = read_secret(env, var)
+            if secret is not None:
+                values[field] = SecretStr(secret)
 
         tokens = read_secret(env, "EVALKIT_API_TOKENS")
         if tokens is not None:
@@ -125,12 +175,54 @@ class Settings(BaseModel):
             values["http_endpoints"] = _endpoints(env, load_toml_table(endpoints_file, "endpoints"))
 
         try:
-            return cls.model_validate(values)
+            settings = cls.model_validate(values)
         except ValidationError as exc:
             problems = "; ".join(
                 f"{'.'.join(str(p) for p in e['loc'])}: {e['msg']}" for e in exc.errors()
             )
             raise ConfigError(f"invalid configuration: {problems}") from None
+        if settings.blob_url is not None:
+            # Fail at start-up, not at the first long output.
+            try:
+                store = settings.open_blob_store()
+                if store is not None:
+                    store.close()
+            except ValueError as exc:
+                raise ConfigError(f"EVALKIT_BLOB_URL: {exc}") from None
+        return settings
+
+    def open_blob_store(self) -> BlobStore | None:
+        if self.blob_url is None:
+            return None
+        return open_store(
+            self.blob_url,
+            access_key=self.blob_access_key.get_secret_value() if self.blob_access_key else None,
+            secret_key=self.blob_secret_key.get_secret_value() if self.blob_secret_key else None,
+            region=self.blob_region,
+        )
+
+
+_SIZE = re.compile(r"^(\d+(?:\.\d+)?)\s*([KMGT]i?B|B)?$", re.IGNORECASE)
+_SIZE_UNITS = {"": 1, "b": 1, "kb": 10**3, "mb": 10**6, "gb": 10**9, "tb": 10**12}
+_SIZE_UNITS.update({"kib": 2**10, "mib": 2**20, "gib": 2**30, "tib": 2**40})
+_DURATION = re.compile(r"^(\d+(?:\.\d+)?)\s*([smhdw]?)$", re.IGNORECASE)
+_DURATION_UNITS = {"": 1, "s": 1, "m": 60, "h": 3600, "d": 86400, "w": 7 * 86400}
+
+
+def parse_size(raw: str) -> int:
+    """Bytes from ``1048576``, ``500MB`` or ``20GiB``."""
+    match = _SIZE.fullmatch(raw.strip())
+    if not match:
+        raise ValueError(f"{raw!r} is not a size such as 500MB or 20GiB")
+    return int(float(match.group(1)) * _SIZE_UNITS[(match.group(2) or "").lower()])
+
+
+def parse_duration(raw: str) -> float:
+    """Seconds from ``90``, ``45m``, ``12h``, ``30d`` or ``2w``."""
+    match = _DURATION.fullmatch(raw.strip())
+    if not match or float(match.group(1)) <= 0:
+        raise ValueError(f"{raw!r} is not a duration such as 45m, 12h or 30d")
+    return float(match.group(1)) * _DURATION_UNITS[match.group(2).lower()]
 
 
 def load_toml_table(path: str, table: str) -> dict[str, object]:

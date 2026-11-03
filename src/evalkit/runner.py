@@ -48,6 +48,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, sessionmaker
 
 from evalkit import aggregates, cache, leases, metrics, runqueue
+from evalkit.blobs import BlobStore
 from evalkit.config import Settings
 from evalkit.datasets import Case, get_dataset, load_cases
 from evalkit.db.models import CaseLease, Dataset, Result, Run, as_utc, utcnow
@@ -230,8 +231,11 @@ class Runner:
         lease_ttl: timedelta | None = None,
         heartbeat_seconds: float | None = None,
         shared_limits: bool | None = None,
+        blob_store: BlobStore | None = None,
     ) -> None:
         self.sessions = sessions
+        # Long cached outputs go to the blob store when one is configured.
+        self.blobs = blob_store if blob_store is not None else settings.open_blob_store()
         self.settings = settings
         self.claude = claude
         self.clock = clock or RealClock()
@@ -1002,7 +1006,9 @@ class Runner:
 
     def _cache_lookup(self, keys: list[str]) -> dict[str, Any]:
         with self.sessions() as session:
-            return cache.lookup(session, keys)
+            hits = cache.lookup(session, keys, self.blobs)
+            session.commit()
+            return dict(hits)
 
     def _write(self, run_id: str, batch: list[CaseResult]) -> int:
         """Save results whose lease this process still holds, in the transaction
@@ -1010,7 +1016,11 @@ class Runner:
         how many were refused because the case had been taken over by another
         process."""
         names = self._metric_names(run_id)
-        entries = [r.cache_entry for r in batch if r.cache_entry is not None]
+        entries = cache.offload(
+            (r.cache_entry for r in batch if r.cache_entry is not None),
+            self.blobs,
+            self.settings.blob_min_bytes,
+        )
         with self._write_turn, self.sessions() as session:
             try:
                 accepted = leases.finish(

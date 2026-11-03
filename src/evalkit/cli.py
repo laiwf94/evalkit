@@ -25,7 +25,7 @@ import sys
 import tomllib
 from collections.abc import Callable, Sequence
 from dataclasses import asdict, is_dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, TextIO
 
@@ -34,9 +34,9 @@ from sqlalchemy import select
 from sqlalchemy.engine import make_url
 from sqlalchemy.orm import Session, sessionmaker
 
-from evalkit import __version__, aggregates, runqueue
+from evalkit import __version__, aggregates, blobs, cache, runqueue
 from evalkit.api import serve
-from evalkit.config import ConfigError, Settings
+from evalkit.config import ConfigError, Settings, parse_duration, parse_size
 from evalkit.datasets import (
     get_dataset,
     import_dataset,
@@ -240,6 +240,96 @@ async def cmd_worker(args: argparse.Namespace, app: App) -> int:
     return EXIT_OK
 
 
+async def cmd_cache(args: argparse.Namespace, app: App) -> int:
+    """``evalkit cache sweep`` bounds the response cache and collects blobs;
+    ``evalkit cache scrub`` reads every blob and checks it against its digest."""
+    settings = app.settings
+    store = settings.open_blob_store()
+    try:
+        if args.cache_command == "scrub":
+            if store is None:
+                raise CliError("no blob store is configured (EVALKIT_BLOB_URL)", EXIT_INPUT)
+            scrubbed = await asyncio.to_thread(blobs.scrub, store)
+            _emit(app.out, scrubbed, args.json, _format_scrub)
+            return EXIT_UNUSABLE if scrubbed.corrupt else EXIT_OK
+        max_age = _option(args.max_age, parse_duration, "--max-age")
+        max_bytes = _option(args.max_size, parse_size, "--max-size")
+        grace = _option(args.blob_grace, parse_duration, "--blob-grace")
+        if max_age is None:
+            max_age = settings.cache_max_age_seconds
+        if max_bytes is None:
+            max_bytes = settings.cache_max_bytes
+        if max_age is None and max_bytes is None and store is None:
+            raise CliError(
+                "nothing to sweep: give --max-age or --max-size "
+                "(or set EVALKIT_CACHE_MAX_AGE, EVALKIT_CACHE_MAX_BYTES or EVALKIT_BLOB_URL)",
+                EXIT_INPUT,
+            )
+        done = await asyncio.to_thread(
+            cache.maintain,
+            app.sessions,
+            store,
+            max_age=None if max_age is None else timedelta(seconds=max_age),
+            max_bytes=max_bytes,
+            grace=timedelta(seconds=settings.blob_grace_seconds if grace is None else grace),
+            dry_run=args.dry_run,
+        )
+        if done.skipped:
+            raise CliError("another process is sweeping the cache; try again later", EXIT_UNUSABLE)
+        _emit(app.out, done, args.json, _format_maintenance)
+        return EXIT_OK
+    finally:
+        if store is not None:
+            store.close()
+
+
+def _option[T](raw: str | None, parse: Callable[[str], T], flag: str) -> T | None:
+    if raw is None:
+        return None
+    try:
+        return parse(raw)
+    except ValueError as exc:
+        raise CliError(f"{flag}: {exc}", EXIT_INPUT) from None
+
+
+def _format_maintenance(done: cache.Maintenance) -> str:
+    s = done.sweep
+    verb = "would remove" if s.dry_run else "removed"
+    lines = [
+        f"cache: {verb} {s.removed:,} entries ({_bytes(s.removed_bytes)}), "
+        f"{s.kept:,} left ({_bytes(s.kept_bytes)})"
+    ]
+    if done.blobs is not None:
+        b = done.blobs
+        lines.append(
+            f"blobs: scanned {b.scanned:,}, {verb} {b.removed:,} ({_bytes(b.removed_bytes)}), "
+            f"kept {b.referenced:,} referenced and {b.recent:,} within the grace period"
+            + (
+                f", removed {b.incomplete_removed} unfinished writes"
+                if b.incomplete_removed
+                else ""
+            )
+        )
+    return "\n".join(lines) + "\n"
+
+
+def _format_scrub(report: blobs.ScrubReport) -> str:
+    lines = [f"blobs: checked {report.scanned:,}, corrupt {len(report.corrupt):,}"]
+    lines.extend(f"  corrupt {digest}" for digest in report.corrupt)
+    return "\n".join(lines) + "\n"
+
+
+def _bytes(n: int) -> str:
+    if n < 1024:
+        return f"{n} B"
+    value, unit = n / 1024, "KiB"
+    for bigger in ("MiB", "GiB", "TiB"):
+        if value < 1024:
+            break
+        value, unit = value / 1024, bigger
+    return f"{value:.1f} {unit}"
+
+
 async def cmd_show(args: argparse.Namespace, app: App) -> int:
     with app.sessions() as session:
         summary = summarize(session, resolve_run(session, args.run))
@@ -425,6 +515,22 @@ def _add_maintenance_commands(sub: Any) -> None:
     exp.add_argument("-o", "--output")
     ds_sub.add_parser("list")
     ds.set_defaults(handler=cmd_dataset)
+
+    cache_cmd = sub.add_parser("cache", help="bound the response cache and check blobs")
+    cache_sub = cache_cmd.add_subparsers(dest="cache_command", required=True)
+    sweep = cache_sub.add_parser(
+        "sweep", help="delete old and least recently used entries, then unreferenced blobs"
+    )
+    sweep.add_argument("--max-age", help="remove entries unused this long, e.g. 30d")
+    sweep.add_argument("--max-size", help="then keep at most this much, e.g. 20GiB")
+    sweep.add_argument(
+        "--blob-grace", help="keep unreferenced blobs newer than this (default EVALKIT_BLOB_GRACE)"
+    )
+    sweep.add_argument("--dry-run", action="store_true", help="report without deleting")
+    sweep.add_argument("--json", action="store_true", help="print JSON instead of a table")
+    scrub = cache_sub.add_parser("scrub", help="read every blob and check its hash")
+    scrub.add_argument("--json", action="store_true", help="print JSON instead of a table")
+    cache_cmd.set_defaults(handler=cmd_cache)
 
     db = sub.add_parser("db", help="database maintenance")
     db.add_argument("db_command", choices=["upgrade"])
