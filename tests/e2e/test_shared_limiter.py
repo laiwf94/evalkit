@@ -5,18 +5,25 @@ would; they meet only in the ``rate_limits`` row.
 """
 
 import asyncio
+import itertools
+import random
 import threading
 import time
 
 import pytest
+from hypothesis import given, settings
+from hypothesis import strategies as st
 
 from evalkit.db import make_engine, make_session_factory
 from evalkit.ratelimit import Gcra, RateLimit
 from evalkit.ratelimit_pg import PgRateLimiter
+from tests.fakeclock import FakeClock
+from tests.test_ratelimit import LIMITS, OPS, Op, drive
 
 pytestmark = pytest.mark.e2e
 WORKERS = 8
 CALLERS = 4  # concurrent callers in each worker, like a worker pool
+keys = itertools.count()
 
 
 def run_workers(
@@ -91,3 +98,28 @@ def test_a_cool_down_on_one_worker_pauses_all_of_them(postgres_url: str) -> None
     quiet = [t for t in starts if at + PgRateLimiter.peek_seconds + 0.02 < t < at + 0.5]
     assert quiet == []
     assert any(t >= at + 0.5 for t in starts)
+
+
+def test_the_postgresql_statements_never_exceed_the_rate(postgres_url: str) -> None:
+    """The property tests/test_ratelimit_pg.py checks on SQLite, run through
+    PostgreSQL's own statements (``greatest``, double precision arithmetic): over
+    random admissions, refunds and cool-downs, no window of w seconds sees more
+    than burst + w * rate starts and no start falls inside a cool-down. A fake
+    clock stands in for the server's, so the schedule is exact."""
+    engine = make_engine(postgres_url)
+    sessions = make_session_factory(engine)
+
+    @settings(max_examples=60, deadline=None)
+    @given(limit=LIMITS, ops=OPS, seed=st.integers(0, 2**16))
+    def check(limit: RateLimit, ops: list[Op], seed: int) -> None:
+        clock = FakeClock()
+        clock.now = 1000.0
+        limiter = PgRateLimiter(
+            sessions, f"property{next(keys)}", limit, clock, now=clock.monotonic, peek_seconds=0
+        )
+        asyncio.run(drive(limiter, clock, ops, random.Random(seed)))
+
+    try:
+        check()
+    finally:
+        engine.dispose()
