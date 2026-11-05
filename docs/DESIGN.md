@@ -189,6 +189,15 @@ stays `running`. A second signal skips the wait. The API's embedded worker
 drains the same way on shutdown, so a restarted single server picks its runs
 up again by itself.
 
+`tests/e2e/test_containers.py` checks all of this with the image as shipped:
+an API container that only queues, eight worker containers and an
+S3-compatible blob store, all on one PostgreSQL database, calling a provider
+that records every request. Eight workers share a rate-limited run and all
+pause on one 429; four share the next run and one is killed with SIGKILL,
+after which every case has exactly one result and only cases claimed again
+reached the provider twice; a third run is cancelled while three workers
+execute it; and every container exits 0 on SIGTERM.
+
 ### Run aggregates and score arrays
 
 A summary must not read every result: a million-case run would take seconds
@@ -316,7 +325,10 @@ may execute one run (and several runs one provider), it lives in a row of
   100 ms per process made in the background.
 - With 8 workers of 4 callers each on one key at 200 requests a second, the
   end-to-end test measures 200.2 a second, and no 100 ms window exceeds the
-  limit. Failures without
+  limit. With the shipped image as eight worker containers calling an HTTP
+  provider, the provider itself counts 199.8 to 201.1 calls a second, and
+  after a 429 with Retry-After: 1 the next call from any worker comes 1.01 to
+  1.04 s later. Failures without
 Retry-After back off exponentially with full jitter (base 0.5 s, cap 30 s).
 Retry-After is honoured up to 120 s by default so a misbehaving server cannot
 park a run for an hour. The SDK's own retries are turned off so there is
@@ -500,7 +512,7 @@ band.
 | Cases per dataset | 100,000 | Bounds import memory. Summaries no longer grow with run size. |
 | JSONL line | 1 MiB | Checked before parsing. |
 | API request body | 16 MiB (configurable, max 256 MiB) | Checked by Content-Length and while reading. |
-| Workers per run | 1-256 | |
+| Concurrent cases per process (`concurrency`) | 1-256 | |
 | Concurrent runs per server or worker | 2 (configurable, 0-64) | Later runs wait as `queued` for a free slot on any worker. |
 | Workers per run | `max_workers`, unlimited by default | Batch-mode runs: 1. |
 | Run priority | -1000 to 1000 | |
@@ -577,7 +589,7 @@ allowed newer versions because `pip-audit` flagged the older ones.
 | `regex` | Per-match time limits; the standard `re` module has none. |
 | `jsonschema`, `referencing` | Draft 2020-12 validation without remote reference retrieval. |
 | `prometheus-client` | Standard metrics exposition. |
-| dev: `pytest`, `hypothesis`, `testcontainers`, `ruff`, `mypy`, `pip-audit` | Tests, property tests, real PostgreSQL in tests, lint and format, types, vulnerability audit. |
+| dev: `pytest`, `hypothesis`, `testcontainers`, `ruff`, `mypy`, `pip-audit` | Tests, property tests, real PostgreSQL, S3 and the image itself in tests, lint and format, types, vulnerability audit. |
 
 ## Bigger runs
 

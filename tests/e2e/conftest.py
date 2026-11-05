@@ -1,4 +1,10 @@
-"""PostgreSQL in a container, a real evalkit server and a stand-in app under test."""
+"""PostgreSQL and an S3-compatible store in containers, a real evalkit server and
+a stand-in app under test.
+
+The MinIO image is no longer published on Docker Hub, so the S3 store is
+versitygw (Apache 2.0), an S3-compatible gateway that speaks the same
+path-style protocol and signature version 4.
+"""
 
 import json
 import os
@@ -19,6 +25,8 @@ from evalkit.db import make_engine, upgrade
 pytestmark = pytest.mark.e2e
 
 TOKEN = "e2e-token-0123456789abcdef"
+S3_IMAGE = "versity/versitygw:v1.8.0"
+ACCESS, SECRET = "evalkit-access", "evalkit-secret-0123456789"
 
 
 def docker_available() -> bool:
@@ -43,6 +51,33 @@ def postgres_url() -> Iterator[str]:
         upgrade(engine)
         engine.dispose()
         yield url
+
+
+@pytest.fixture(scope="module")
+def s3_endpoint() -> Iterator[str]:
+    if not docker_available():
+        pytest.skip("Docker is not available")
+    os.environ.setdefault("TESTCONTAINERS_RYUK_DISABLED", "true")
+    from testcontainers.core.container import DockerContainer
+
+    container = (
+        DockerContainer(S3_IMAGE)
+        .with_env("ROOT_ACCESS_KEY", ACCESS)
+        .with_env("ROOT_SECRET_KEY", SECRET)
+        .with_kwargs(entrypoint="/bin/sh")
+        .with_command(["-c", "mkdir -p /data && exec versitygw posix /data"])
+        .with_exposed_ports(7070)
+    )
+    with container:
+        endpoint = f"http://{container.get_container_host_ip()}:{container.get_exposed_port(7070)}"
+        deadline = time.monotonic() + 30
+        while time.monotonic() < deadline:
+            try:
+                httpx2.get(endpoint, timeout=1)
+                break
+            except httpx2.TransportError:
+                time.sleep(0.1)
+        yield endpoint
 
 
 def free_port() -> int:
