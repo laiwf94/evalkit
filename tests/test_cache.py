@@ -553,8 +553,11 @@ def test_worker_sweeps_the_cache(
     async def go() -> None:
         stop = asyncio.Event()
         task = asyncio.create_task(worker.serve(stop))
+        # Wait for the log line, not for the row: the row is gone as soon as the
+        # sweep commits, and stopping the worker then can cancel the sweep's
+        # thread await before it logs.
         for _ in range(200):
-            if "old" not in rows(sessions):
+            if "swept the response cache" in caplog.text:
                 break
             await asyncio.sleep(0.02)
         stop.set()
