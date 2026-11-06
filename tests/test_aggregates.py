@@ -23,6 +23,7 @@ from evalkit.db.models import (
     Result,
     Run,
     RunAggregate,
+    RunLatencyBucket,
     RunMetricAggregate,
     RunScores,
 )
@@ -290,25 +291,31 @@ def test_running_run_summary_small_and_large(
         scores = reference_scores(s, run.id)["exact"]
         ci = bootstrap_ci([scores[k] for k in sorted(scores)], resamples=400, seed=run.seed)
         assert (exact.metrics[0].ci_low, exact.metrics[0].ci_high) == (ci.low, ci.high)
-        # Above the exact limit, only the aggregates and a latency sample are read.
-        monkeypatch.setattr(report, "LIVE_EXACT_MAX", 10)
-        monkeypatch.setattr(report, "LATENCY_SAMPLE", 5)
-        large = summarize(s, run.id)
-        totals = aggregates.recompute(s, s.get_one(Run, run.id)).metrics["exact"]
-        expected = normal_ci(totals.n, totals.total, totals.total_sq)
-        recent = list(
+        fresh = list(
             s.scalars(
-                select(Result.latency_ms)
-                .where(Result.run_id == run.id, Result.status == "ok")
-                .order_by(Result.id.desc())
-                .limit(5)
+                select(Result.latency_ms).where(
+                    Result.run_id == run.id, Result.status == "ok", Result.cached.is_(False)
+                )
             )
         )
+        assert (exact.latency_p50_ms, exact.latency_p95_ms) == aggregates.percentiles(fresh)
+        # Above the exact limit, only the aggregates are read, the latency histogram
+        # included: deleting the results changes nothing.
+        monkeypatch.setattr(report, "LIVE_EXACT_MAX", 10)
+        s.execute(delete(Result).where(Result.run_id == run.id))
+        large = summarize(s, run.id)
+        s.rollback()
+        totals = aggregates.recompute(s, s.get_one(Run, run.id)).metrics["exact"]
+        expected = normal_ci(totals.n, totals.total, totals.total_sq)
     got = large.metrics[0]
     assert (got.mean, got.ci_low, got.ci_high) == pytest.approx(
         (expected.mean, expected.low, expected.high)
     )
-    assert large.latency_p50_ms == pytest.approx(float(np.percentile(recent, 50)))
+    # Every fresh result is in the percentiles, within the histogram's accuracy.
+    for value, want in zip(
+        (large.latency_p50_ms, large.latency_p95_ms), aggregates.percentiles(fresh), strict=True
+    ):
+        assert value == pytest.approx(want, rel=aggregates.LATENCY_ACCURACY, abs=1e-3)
     assert exact.metrics[1].n == large.metrics[1].n
 
 
@@ -391,6 +398,11 @@ def test_verify_finds_and_repairs_drift(sessions: sessionmaker[Session], dataset
             .values(scores=aggregates.encode(np.zeros(60)), n=3, mean=0.123)
         )
         s.execute(update(Run).where(Run.id == run_id).values(latency_p95_ms=-1.0, cases_total=59))
+        s.execute(
+            update(RunLatencyBucket)
+            .where(RunLatencyBucket.run_id == run_id)
+            .values(count=RunLatencyBucket.count + 1)
+        )
         s.commit()
     with sessions() as s:
         found = aggregates.verify(s, run_id)
@@ -405,6 +417,7 @@ def test_verify_finds_and_repairs_drift(sessions: sessionmaker[Session], dataset
         "exact.mean: stored 0.123",
         "latency_p95_ms: stored -1.0",
         "cases_total: stored 59",
+        "latency histogram: ",
     ):
         assert fragment in joined
     with sessions() as s:
@@ -590,6 +603,9 @@ def test_migration_backfills_aggregates_for_existing_runs(tmp_path: Path) -> Non
     assert summary.cases_total == 6
     assert summary.metrics[0].mean == pytest.approx(0.5)
     assert summary.latency_p50_ms == pytest.approx(30.0)
+    # Migration 0007 counted the four fresh results (the error and the cached one
+    # are left out) into the same shard.
+    assert totals.latency == {aggregates.latency_bucket(ms): 1 for ms in (10.0, 20.0, 40.0, 50.0)}
 
 
 # Properties -------------------------------------------------------------------
@@ -600,6 +616,7 @@ _result = st.builds(
     case_id=st.just("c"),
     status=st.sampled_from(["ok", "ok", "ok", "error"]),
     cached=st.booleans(),
+    latency_ms=st.floats(0, 1e6, allow_nan=False),
     input_tokens=st.integers(0, 10_000),
     output_tokens=st.integers(0, 10_000),
     cost_usd=st.floats(0, 1, allow_nan=False),
@@ -627,6 +644,7 @@ def test_aggregates_over_shards_equal_one_fold_of_everything(
             run = s.get_one(Run, run.id)
         run.scorers = [{"type": "exact", "name": "a"}, {"type": "exact", "name": "b"}]
         s.execute(delete(RunMetricAggregate))
+        s.execute(delete(RunLatencyBucket))
         s.execute(delete(RunAggregate))
         for shard, batch in batches:
             aggregates.add(s, run.id, shard, aggregates.fold(batch, names))
@@ -641,3 +659,4 @@ def test_aggregates_over_shards_equal_one_fold_of_everything(
         assert (g.n, g.unscorable) == (w.n, w.unscorable)
         assert g.total == pytest.approx(w.total, rel=1e-12, abs=1e-12)
         assert g.total_sq == pytest.approx(w.total_sq, rel=1e-12, abs=1e-12)
+    assert got.latency == want.latency

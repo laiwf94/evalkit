@@ -9,6 +9,11 @@ Writes a dataset and a run with one result per case straight into the database
 aggregates, then times ``GET /v1/runs/{id}`` while the run is running and after
 it completed, and times reading one metric's score array, which is what a
 comparison reads per metric.
+
+Exits 1 if either GET's p99 is over ``--max-p99-ms`` (50 ms, the roadmap's target
+for a one-million-case run), or if the running run's latency percentiles, which
+come from the aggregates' latency histogram, are further than
+``aggregates.LATENCY_ACCURACY`` from the exact percentiles over every fresh result.
 """
 
 from __future__ import annotations
@@ -25,7 +30,7 @@ from pathlib import Path
 
 import httpx2
 import numpy as np
-from sqlalchemy import insert, select, update
+from sqlalchemy import insert, select, true, update
 from sqlalchemy.orm import Session, sessionmaker
 
 from evalkit import aggregates
@@ -120,11 +125,53 @@ async def time_get(
     return float(p50), float(p99), body
 
 
+def check_latency(
+    sessions: sessionmaker[Session], run_id: str, body: dict[str, object]
+) -> list[str]:
+    """Compare the running run's latency percentiles with the exact ones over every
+    fresh result."""
+    with sessions() as s:
+        fresh = list(
+            s.scalars(
+                select(Result.latency_ms).where(
+                    Result.run_id == run_id, Result.status == "ok", Result.cached.isnot(true())
+                )
+            )
+        )
+    failures = []
+    for name, want in zip(("p50", "p95"), aggregates.percentiles(fresh), strict=True):
+        got = body[f"latency_{name}_ms"]
+        if not isinstance(got, float) or want is None:
+            return [f"latency {name}: summary {got!r}, exact {want!r}"]
+        error = abs(got - want) / want
+        print(f"latency {name} while running: {got:.2f} ms, exact {want:.2f} ms ({error:.3%} off)")
+        if error > aggregates.LATENCY_ACCURACY:
+            failures.append(f"latency {name} {error:.3%} off the exact value")
+    return failures
+
+
+def time_score_array(sessions: sessionmaker[Session], run_id: str) -> None:
+    with sessions() as s:
+        run = s.get_one(Run, run_id)
+        times = []
+        for _ in range(10):
+            start = time.perf_counter()
+            arrays = aggregates.load_scores(s, run, ["exact"])
+            times.append((time.perf_counter() - start) * 1000)
+        size = s.scalar(select(Run.cases_total).where(Run.id == run_id))
+    print(
+        f"one metric's score array ({arrays['exact'].nbytes / 1e6:.1f} MB, {size:,} cases): "
+        f"median {float(np.median(times)):.1f} ms"
+    )
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--cases", type=int, default=100_000)
     parser.add_argument("--requests", type=int, default=50)
+    parser.add_argument("--max-p99-ms", type=float, default=50.0)
     args = parser.parse_args()
+    failures: list[str] = []
     url = os.environ.get("EVALKIT_BENCH_DATABASE_URL")
     tmp = None
     if url is None:
@@ -151,6 +198,9 @@ def main() -> None:
     print(f"GET /v1/runs/{{id}} while running:   p50 {p50:.1f} ms  p99 {p99:.1f} ms")
     if body["completed"] != args.cases:
         raise SystemExit(f"summary counted {body['completed']} results, not {args.cases}")
+    if p99 > args.max_p99_ms:
+        failures.append(f"running run p99 {p99:.1f} ms > {args.max_p99_ms:g} ms")
+    failures += check_latency(sessions, run_id, body)
 
     with sessions() as s:
         s.execute(update(Run).where(Run.id == run_id).values(status="completed"))
@@ -161,23 +211,16 @@ def main() -> None:
 
     p50, p99, body = asyncio.run(time_get(app, run_id, args.requests))
     print(f"GET /v1/runs/{{id}} when completed:  p50 {p50:.1f} ms  p99 {p99:.1f} ms")
+    if p99 > args.max_p99_ms:
+        failures.append(f"completed run p99 {p99:.1f} ms > {args.max_p99_ms:g} ms")
     print(json.dumps(body["metrics"], indent=None))
 
-    with sessions() as s:
-        run = s.get_one(Run, run_id)
-        times = []
-        for _ in range(10):
-            start = time.perf_counter()
-            arrays = aggregates.load_scores(s, run, ["exact"])
-            times.append((time.perf_counter() - start) * 1000)
-        size = s.scalar(select(Run.cases_total).where(Run.id == run_id))
-    print(
-        f"one metric's score array ({arrays['exact'].nbytes / 1e6:.1f} MB, {size:,} cases): "
-        f"median {float(np.median(times)):.1f} ms"
-    )
+    time_score_array(sessions, run_id)
     engine.dispose()
     if tmp is not None:
         tmp.cleanup()
+    if failures:
+        raise SystemExit("; ".join(failures))
 
 
 if __name__ == "__main__":

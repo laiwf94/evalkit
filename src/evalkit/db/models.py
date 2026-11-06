@@ -122,10 +122,7 @@ class Run(Base):
 
 class Result(Base):
     __tablename__ = "results"
-    __table_args__ = (
-        UniqueConstraint("run_id", "case_id", name="uq_results_run_case"),
-        Index("ix_results_run_recent", "run_id", "id"),
-    )
+    __table_args__ = (UniqueConstraint("run_id", "case_id", name="uq_results_run_case"),)
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     run_id: Mapped[str] = mapped_column(ForeignKey("runs.id", ondelete="CASCADE"))
@@ -186,6 +183,19 @@ class RunMetricAggregate(Base):
     total: Mapped[float] = mapped_column(Double)
     total_sq: Mapped[float] = mapped_column(Double)
     unscorable: Mapped[int] = mapped_column(BigInteger)
+
+
+class RunLatencyBucket(Base):
+    """How many fresh successful results of one run, written by one process (the
+    shard), had a latency in one logarithmic bucket (see ``aggregates.latency_bucket``).
+    A running run's latency percentiles come from these rows, not from its results."""
+
+    __tablename__ = "run_latency_buckets"
+
+    run_id: Mapped[str] = mapped_column(ForeignKey("runs.id", ondelete="CASCADE"), primary_key=True)
+    shard: Mapped[str] = mapped_column(String(64), primary_key=True)
+    bucket: Mapped[int] = mapped_column(Integer, primary_key=True)
+    count: Mapped[int] = mapped_column(BigInteger)
 
 
 class RunScores(Base):

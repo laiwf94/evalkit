@@ -41,9 +41,11 @@ scale-out work of week 1 of the roadmap (#22).
   SIGTERM, and stop on `POST /v1/runs/{id}/cancel` or `evalkit cancel`.
 - **Aggregates and score arrays.** Every result write adds to per-writer
   aggregate shards, and a completed run keeps one compact score array per metric,
-  so `GET /v1/runs/{id}` on a one-million-case run answers in about 13 ms at p99
-  and a comparison reads one row per metric. `evalkit run verify [--repair]`
-  recomputes and checks them.
+  so `GET /v1/runs/{id}` on a one-million-case run answers in under 8 ms at p99
+  both while it is running and after it completed, and a comparison reads one
+  row per metric. A running run's latency percentiles come from a logarithmic
+  latency histogram kept with the aggregates, within 1% of the exact values.
+  `evalkit run verify [--repair]` recomputes and checks all of them.
 - **A bounded cache and blobs.** The response cache records last use and is swept
   by age and size (`evalkit cache sweep`, or by workers). Long cached outputs go to
   a content-addressed blob store on a filesystem or an S3-compatible server, with

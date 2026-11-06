@@ -32,6 +32,8 @@ results         (run_id, case_id) unique; redacted output, scores (JSON), tokens
 run_aggregates  (run_id, shard) key; counts, token and cost sums of the results
                 written by one process (the shard)
 run_metric_aggregates  (run_id, shard, metric) key; n, sum, sum of squares, unscorable
+run_latency_buckets  (run_id, shard, bucket) key; count of fresh successful results
+                whose latency falls in one logarithmic bucket
 run_scores      (run_id, metric) key; a completed run's scores as one float64 array
                 in case-id order, n, unscorable, mean and interval
 response_cache  key = sha256(target hash, input, redaction fingerprint); output (or
@@ -204,7 +206,8 @@ A summary must not read every result: a million-case run would take seconds
 per request. The transaction that writes a batch of results also adds the
 batch's counts (completed, ok, errors, cached, fresh), token and cost sums, and
 each metric's count, sum, sum of squares and unscorable count to the run's
-aggregates, with one `INSERT ... ON CONFLICT DO UPDATE` per table. The rows are
+aggregates, and counts its fresh successful results per latency bucket, with one
+`INSERT ... ON CONFLICT DO UPDATE` per table. The rows are
 sharded by the writing process's owner id, so eight workers on one run never
 wait on one hot row; the totals are a `SUM` over a handful of shard rows. A
 refused result (a lease taken over) is never added, and a process killed before
@@ -224,13 +227,31 @@ A summary of a completed run reads the run row, its shard rows and the
 `run_scores` metadata, never the results. A run that is not completed is
 summarised exactly from its results up to 1,000 of them; above that its
 intervals are normal intervals from the aggregates, and its latency percentiles
-come from its most recent 5,000 fresh results (index `(run_id, id)`).
+come from the latency histogram, so it reads no results either.
+
+The histogram's buckets are logarithmic: bucket *i* holds latencies in
+(γ^(i-1), γ^i] milliseconds with γ = 1.02, and stands for 2γ^i/(γ+1), which is
+within 0.99% of every latency in it (the bucketing of DDSketch). Latencies under
+1 µs share one bucket. The percentiles interpolate between order statistics as
+`numpy.percentile` does, with each order statistic replaced by its bucket's
+value, so each is within 0.99% of the exact percentile over all of the run's
+fresh results; a Hypothesis test checks that bound. Production latencies spread
+over a few hundred buckets at most, so a summary sums a few hundred rows
+whatever the run's size, and a batch of results writes one row per distinct
+bucket in it. On a one-million-case run on PostgreSQL 16, `GET /v1/runs/{id}`
+answers at p99 in 7.6 ms while the run is running and 7.8 ms once it completed
+(`benchmarks/summary.py`, which fails above 50 ms or above 0.99% from the exact
+percentiles). Before the histogram, the running case read the 5,000 most recent
+results and took 70 to 80 ms at p99. A completed run keeps the exact
+percentiles that compaction computes from the results.
 
 `evalkit run verify RUN_ID` recomputes all of this from the results in one
 repeatable-read snapshot and lists every difference (exit 3); `--repair`
 replaces the aggregates with the recomputation and rewrites the arrays, and is
 refused while the run is queued, running or cancelling. Migration 0005 fills in
-aggregates for runs that already had results.
+aggregates for runs that already had results, and migration 0007 their latency
+histograms (and drops the `(run_id, id)` index on results that only the old
+recent-results read used).
 
 ### The response cache
 

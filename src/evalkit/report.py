@@ -32,8 +32,6 @@ from evalkit.stats import (
 # from its aggregates alone (normal intervals) above it. A completed run's
 # intervals are computed once, when it is compacted.
 LIVE_EXACT_MAX = 1_000
-# Latency percentiles of a larger running run come from its most recent results.
-LATENCY_SAMPLE = 5_000
 
 
 @dataclass(frozen=True)
@@ -172,13 +170,15 @@ def _completed_metrics(
 def _live_latency(
     session: Session, run: Run, totals: aggregates.Totals
 ) -> tuple[float | None, float | None]:
-    """Latency percentiles of a run that is not completed: over every fresh result
-    of a small run, over the most recent ``LATENCY_SAMPLE`` of a large one."""
+    """Latency percentiles of a run that is not completed, over all its fresh
+    results: exact for a small run, from the aggregates' latency histogram (within
+    ``aggregates.LATENCY_ACCURACY``) for a larger one."""
+    if totals.completed > LIVE_EXACT_MAX:
+        found = aggregates.histogram_percentiles(totals.latency)
+        return (None, None) if found is None else (found[0], found[1])
     query = select(Result.latency_ms).where(
         Result.run_id == run.id, Result.status == "ok", Result.cached.is_(False)
     )
-    if totals.completed > LIVE_EXACT_MAX:
-        query = query.order_by(Result.id.desc()).limit(LATENCY_SAMPLE)
     return aggregates.percentiles(list(session.scalars(query)))
 
 

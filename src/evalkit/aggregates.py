@@ -7,6 +7,10 @@ A run summary used to read every result row. Now:
   unscorable count to the run's aggregates. Each writing process adds to its own
   ``shard`` row (its owner id), so processes never queue on one hot row, and a
   run's totals are the sum over its few shard rows.
+* The same transaction counts the batch's fresh successful results per
+  logarithmic latency bucket (``run_latency_buckets``, also per shard), so a
+  running run's latency percentiles cost a read of a few hundred bucket rows and
+  are within ``LATENCY_ACCURACY`` (1%) of the exact ones over all its results.
 * When a run completes, ``compact`` writes each metric's scores as one array
   (``run_scores``), in case-id order over the run's dataset, together with the
   summary interval and the exact latency percentiles. Comparing two runs reads
@@ -24,7 +28,8 @@ Scoring policy (also in ``report.py``): a case whose target call failed scores
 from __future__ import annotations
 
 import math
-from collections.abc import Iterable, Sequence
+from collections import Counter
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, field, fields
 from typing import Any
 
@@ -41,6 +46,7 @@ from evalkit.db.models import (
     Result,
     Run,
     RunAggregate,
+    RunLatencyBucket,
     RunMetricAggregate,
     RunScores,
 )
@@ -54,6 +60,30 @@ SCORE_DTYPE = np.dtype("<f8")
 # recomputation: the two add the same numbers in a different order.
 FLOAT_TOLERANCE = 1e-9
 _READ_CHUNK = 5000
+
+# Latency histogram buckets. Bucket ``i`` holds latencies in (GAMMA**(i-1),
+# GAMMA**i] milliseconds and stands for 2 * GAMMA**i / (GAMMA + 1), which is within
+# LATENCY_ACCURACY of every latency in it (relative error, as in DDSketch).
+# Latencies at or below the floor share the floor's bucket (an absolute error of
+# about a microsecond), and anything above the ceiling the ceiling's. Migration 0007
+# keeps a frozen copy of these numbers; changing them needs a new migration that
+# rebuilds every histogram.
+LATENCY_GAMMA = 1.02
+LATENCY_ACCURACY = (LATENCY_GAMMA - 1) / (LATENCY_GAMMA + 1)
+LATENCY_FLOOR_MS = 1e-3
+LATENCY_CEIL_MS = 1e9
+_LOG_GAMMA = math.log(LATENCY_GAMMA)
+
+
+def latency_bucket(latency_ms: float) -> int:
+    """The histogram bucket of one latency (NaN goes to the floor's bucket)."""
+    value = min(latency_ms, LATENCY_CEIL_MS) if latency_ms > LATENCY_FLOOR_MS else LATENCY_FLOOR_MS
+    return math.ceil(math.log(value) / _LOG_GAMMA)
+
+
+def bucket_value(bucket: int) -> float:
+    """The latency a bucket stands for."""
+    return 2 * LATENCY_GAMMA**bucket / (LATENCY_GAMMA + 1)
 
 
 @dataclass
@@ -86,12 +116,14 @@ class Totals:
     judge_output_tokens: int = 0
     judge_cost_usd: float = 0.0
     metrics: dict[str, MetricTotals] = field(default_factory=dict)
+    # Fresh successful results per latency bucket.
+    latency: dict[int, int] = field(default_factory=dict)
 
     def counters(self) -> dict[str, int | float]:
-        return {f.name: getattr(self, f.name) for f in fields(self) if f.name != "metrics"}
+        return {name: getattr(self, name) for name in COUNTERS}
 
 
-COUNTERS = tuple(f.name for f in fields(Totals) if f.name != "metrics")
+COUNTERS = tuple(f.name for f in fields(Totals) if f.name not in ("metrics", "latency"))
 SUMMED = COUNTERS[5:]
 
 
@@ -109,15 +141,18 @@ def score_of(status: str, scores: dict[str, Any], name: str) -> float | None:
 
 def fold(rows: Iterable[Any], metrics: Sequence[str]) -> Totals:
     """Totals of result-shaped rows: anything with ``status``, ``cached``,
-    ``scores`` and the token and cost attributes of a result."""
+    ``latency_ms``, ``scores`` and the token and cost attributes of a result."""
     out = Totals(metrics={name: MetricTotals() for name in metrics})
+    latency: Counter[int] = Counter()
     for row in rows:
         ok = row.status == "ok"
         out.completed += 1
         out.ok += ok
         out.errors += not ok
         out.cached += bool(row.cached)
-        out.fresh += ok and not row.cached
+        if ok and not row.cached:
+            out.fresh += 1
+            latency[latency_bucket(row.latency_ms)] += 1
         for name in SUMMED:
             setattr(out, name, getattr(out, name) + getattr(row, name))
         for name in metrics:
@@ -129,6 +164,7 @@ def fold(rows: Iterable[Any], metrics: Sequence[str]) -> Totals:
                 agg.n += 1
                 agg.total += value
                 agg.total_sq += value * value
+    out.latency = dict(latency)
     return out
 
 
@@ -163,6 +199,18 @@ def add(session: Session, run_id: str, shard: str, totals: Totals) -> None:
             ],
             ["n", "total", "total_sq", "unscorable"],
         )
+    if totals.latency:
+        # In bucket order, so two writers to one shard always lock rows in one order.
+        _upsert(
+            session,
+            RunLatencyBucket.__table__,  # type: ignore[arg-type]
+            ("run_id", "shard", "bucket"),
+            [
+                {"run_id": run_id, "shard": shard, "bucket": bucket, "count": count}
+                for bucket, count in sorted(totals.latency.items())
+            ],
+            ["count"],
+        )
 
 
 def _upsert(
@@ -183,7 +231,8 @@ def _upsert(
 
 
 def read(session: Session, run: Run) -> Totals:
-    """The run's totals: its shard rows summed. A few rows, whatever the run's size."""
+    """The run's totals: its shard rows summed. A few rows per shard (a few hundred
+    for the latency histogram), whatever the run's size."""
     sums = session.execute(
         select(*(func.coalesce(func.sum(RunAggregate.__table__.c[n]), 0) for n in COUNTERS)).where(
             RunAggregate.run_id == run.id
@@ -206,6 +255,14 @@ def read(session: Session, run: Run) -> Totals:
     )
     for name, n, total, total_sq, unscorable in rows:
         out.metrics[name] = MetricTotals(int(n), float(total), float(total_sq), int(unscorable))
+    out.latency = {
+        int(bucket): int(count)
+        for bucket, count in session.execute(
+            select(RunLatencyBucket.bucket, func.sum(RunLatencyBucket.count))
+            .where(RunLatencyBucket.run_id == run.id)
+            .group_by(RunLatencyBucket.bucket)
+        )
+    }
     return out
 
 
@@ -221,7 +278,7 @@ def _result_rows(session: Session, run_id: str, *columns: Any) -> Iterable[Any]:
 
 def recompute(session: Session, run: Run) -> Totals:
     """The run's totals computed from its results, in one streaming pass."""
-    columns: list[Any] = [Result.status, Result.cached, Result.scores]
+    columns: list[Any] = [Result.status, Result.cached, Result.latency_ms, Result.scores]
     columns += [Result.__table__.c[name] for name in SUMMED]
     return fold(_result_rows(session, run.id, *columns), metric_names(run))
 
@@ -231,6 +288,7 @@ def rebuild(session: Session, run: Run) -> Totals:
     safe while no process is writing results for the run."""
     totals = recompute(session, run)
     session.execute(delete(RunMetricAggregate).where(RunMetricAggregate.run_id == run.id))
+    session.execute(delete(RunLatencyBucket).where(RunLatencyBucket.run_id == run.id))
     session.execute(delete(RunAggregate).where(RunAggregate.run_id == run.id))
     add(session, run.id, REBUILD_SHARD, totals)
     return totals
@@ -322,6 +380,31 @@ def percentiles(latencies: FloatArray | Sequence[float]) -> tuple[float | None, 
         return None, None
     p50, p95 = np.percentile(np.asarray(latencies, dtype=np.float64), [50, 95]).tolist()
     return float(p50), float(p95)
+
+
+def histogram_percentiles(
+    histogram: Mapping[int, int], qs: Sequence[float] = (50, 95)
+) -> list[float] | None:
+    """Percentiles of the latencies a histogram counts, the way ``np.percentile``
+    interpolates between order statistics, with each order statistic replaced by
+    its bucket's value. Each is within ``LATENCY_ACCURACY`` of the exact percentile
+    (or about a microsecond off it, for latencies under ``LATENCY_FLOOR_MS``). None for
+    an empty histogram."""
+    items = sorted((b, c) for b, c in histogram.items() if c > 0)
+    if not items:
+        return None
+    buckets = np.array([b for b, _ in items], dtype=np.int64)
+    ends = np.cumsum([c for _, c in items])  # rank one past each bucket's last value
+    n = int(ends[-1])
+    out = []
+    for q in qs:
+        rank = (n - 1) * q / 100
+        lo, hi = math.floor(rank), math.ceil(rank)
+        v_lo, v_hi = (
+            bucket_value(int(buckets[np.searchsorted(ends, k, side="right")])) for k in (lo, hi)
+        )
+        out.append(v_lo + (rank - lo) * (v_hi - v_lo))
+    return out
 
 
 def summary_rows(
@@ -466,6 +549,16 @@ def check(session: Session, run: Run) -> tuple[int, bool, list[str]]:
                     f"{name}.{attr}: stored {getattr(got, attr)!r}, "
                     f"results give {getattr(actual_metric, attr)!r}"
                 )
+    if have.latency != want.latency:
+        wrong = sorted(
+            b for b in set(have.latency) | set(want.latency)
+            if have.latency.get(b, 0) != want.latency.get(b, 0)
+        )  # fmt: skip
+        problems.append(
+            f"latency histogram: {len(wrong)} bucket(s) differ, stored "
+            f"{sum(have.latency.values())} fresh results, results give "
+            f"{sum(want.latency.values())}"
+        )
     if run.cases_total is not None:
         dataset = session.get_one(Dataset, run.dataset_id)
         selected = len(
