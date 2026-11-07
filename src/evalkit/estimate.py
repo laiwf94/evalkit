@@ -20,8 +20,8 @@ from evalkit import cache
 from evalkit.config import Settings
 from evalkit.datasets import Case, get_dataset, load_cases
 from evalkit.errors import InvalidInputError
-from evalkit.llm import ClaudeClient
 from evalkit.pricing import TokenCounts
+from evalkit.providers.anthropic import ClaudeClient
 from evalkit.ratelimit import Limiters, RetryStats, call_with_retries
 from evalkit.runspec import RunConfig
 from evalkit.scorers import build_scorers

@@ -364,9 +364,31 @@ window between the batch being created and its id being committed is the one
 place a crash can cost a duplicate batch. Entries that errored, expired or were
 cancelled go through the normal online path.
 
+## Providers
+
+Prompt targets, judges and estimates reach a model through the `Provider`
+protocol in `providers/base.py`. It has five operations: `complete` (one prompt,
+one completion with usage and cost), `count_tokens`, `embed`, `price` (USD for a
+set of token counts on one model) and `classify_error`. A provider is a class
+with those methods and a short `name`; rate limits and cool-downs are keyed by
+that name, so two targets on the same provider share them.
+
+Every failure a provider raises is a `ProviderError`, which is a `TargetError`
+carrying an `ErrorKind`, the provider's name and the HTTP status where there was
+one. The kind, not the status code, decides whether a retry can help:
+`rate_limited`, `overloaded`, `server`, `conflict`, `timeout` and `connection`
+are retried; `auth`, `not_found`, `invalid_request`, `safety_block`,
+`malformed_response`, `unsupported` and `unknown` fail the case at once.
+`kind_for_status` gives the usual HTTP mapping (429 rate limited, 503 and 529
+overloaded, 408 and 504 timeout, 500 and 502 server, 409 conflict, 401 and 403
+auth, 404 not found, 400, 413 and 422 invalid). Unusual statuses such as 501
+are `unknown` and not retried, which keeps exactly the set of statuses the
+Claude client retried before kinds existed. Cancellation is never classified:
+it passes through so a drain or a cancelled run stops at once.
+
 ## Calling Claude
 
-All model calls go through one client (`llm.py`):
+All Claude calls go through one provider (`providers/anthropic.py`):
 
 - The system prompt carries `cache_control`. It is the same for every case of a
   run (the prompt target's system prompt, the judge's rubric), so after the
@@ -391,6 +413,8 @@ All model calls go through one client (`llm.py`):
   and batch requests are priced at half.
 - Requests with `max_tokens` above 16,000 are streamed, because the SDK refuses
   non-streaming requests that may take longer than ten minutes.
+- The Claude API has no embeddings endpoint, so `embed` fails with
+  `unsupported` without sending a request.
 
 The pinned SDK (1.x) sends API version `2023-06-01`. No request sends the
 sampling parameters that the newer API version removes, so moving to the 2.x SDK

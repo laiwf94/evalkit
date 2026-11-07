@@ -32,7 +32,8 @@ from typing import Any, Literal, Protocol
 from pydantic import BaseModel, Field, ValidationError
 
 from evalkit.datasets import Case, canonical_json, sha256_hex
-from evalkit.llm import ClaudeClient, Completion
+from evalkit.providers.anthropic import ClaudeClient
+from evalkit.providers.base import Completion
 from evalkit.ratelimit import Limiters, RateLimiter, RetryPolicy, RetryStats, call_with_retries
 from evalkit.scorers.base import Scorer, ScoreResult
 from evalkit.targets.base import TargetError, Usage

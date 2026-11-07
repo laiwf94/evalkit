@@ -10,8 +10,8 @@ import anthropic
 import httpx2
 from pydantic import SecretStr
 
-from evalkit.llm import ClaudeClient
 from evalkit.pricing import PriceTable
+from evalkit.providers.anthropic import ClaudeClient
 
 Reply = httpx2.Response | Callable[[dict[str, Any]], httpx2.Response]
 

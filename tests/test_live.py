@@ -10,8 +10,8 @@ import pytest
 
 from evalkit.config import Settings
 from evalkit.datasets import Case
-from evalkit.llm import ClaudeClient
 from evalkit.pricing import PriceTable
+from evalkit.providers.anthropic import ClaudeClient
 from evalkit.targets import PromptTargetSpec
 from evalkit.targets.prompt import PromptTarget
 

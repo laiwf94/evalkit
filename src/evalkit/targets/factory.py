@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from evalkit.errors import InvalidInputError
-from evalkit.llm import ClaudeClient
+from evalkit.providers.anthropic import ClaudeClient
 from evalkit.targets.base import Target
 from evalkit.targets.fake import FakeTarget
 from evalkit.targets.http import HttpEndpoint, HttpTarget

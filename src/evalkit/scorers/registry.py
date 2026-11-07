@@ -18,7 +18,7 @@ from jsonschema.exceptions import SchemaError
 from pydantic import BaseModel, ConfigDict, Field, JsonValue
 
 from evalkit.errors import InvalidInputError
-from evalkit.llm import ClaudeClient
+from evalkit.providers.anthropic import ClaudeClient
 from evalkit.scorers.base import Scorer
 from evalkit.scorers.builtin import ExactMatch, JsonSchemaMatch, NumericMatch, RegexMatch, TokenF1
 from evalkit.scorers.judge import LLMJudge

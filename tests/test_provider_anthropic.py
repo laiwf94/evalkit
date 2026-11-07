@@ -7,8 +7,9 @@ import pytest
 from evalkit.config import ConfigError, Settings
 from evalkit.datasets import Case
 from evalkit.errors import InvalidInputError
-from evalkit.llm import FALLBACK_BETA, ClaudeClient
 from evalkit.pricing import ModelPrice, PriceTable, TokenCounts
+from evalkit.providers import ErrorKind, ProviderError
+from evalkit.providers.anthropic import FALLBACK_BETA, ClaudeClient
 from evalkit.targets import PromptTargetSpec, TargetError
 from evalkit.targets.prompt import PromptTarget
 from tests.fake_anthropic import FakeAnthropic, error_reply, json_reply, message, sse_reply
@@ -142,23 +143,39 @@ def test_fallback_iterations_are_priced_by_the_model_that_ran() -> None:
 
 
 @pytest.mark.parametrize(
-    ("reply", "retryable", "retry_after"),
+    ("reply", "kind", "retryable", "retry_after"),
     [
-        (error_reply(429, "rate_limit_error", {"retry-after": "7"}), True, 7.0),
-        (error_reply(529, "overloaded_error"), True, None),
-        (error_reply(500), True, None),
-        (error_reply(503, headers={"retry-after": "2"}), True, 2.0),
-        (error_reply(400, "invalid_request_error"), False, None),
-        (error_reply(401, "authentication_error"), False, None),
-        (error_reply(404, "not_found_error", {"request-id": "req_9"}), False, None),
+        (
+            error_reply(429, "rate_limit_error", {"retry-after": "7"}),
+            ErrorKind.RATE_LIMITED,
+            True,
+            7.0,
+        ),
+        (error_reply(529, "overloaded_error"), ErrorKind.OVERLOADED, True, None),
+        (error_reply(500), ErrorKind.SERVER, True, None),
+        (error_reply(503, headers={"retry-after": "2"}), ErrorKind.OVERLOADED, True, 2.0),
+        (error_reply(400, "invalid_request_error"), ErrorKind.INVALID_REQUEST, False, None),
+        (error_reply(401, "authentication_error"), ErrorKind.AUTH, False, None),
+        (error_reply(403, "permission_error"), ErrorKind.AUTH, False, None),
+        (
+            error_reply(404, "not_found_error", {"request-id": "req_9"}),
+            ErrorKind.NOT_FOUND,
+            False,
+            None,
+        ),
+        (error_reply(413, "request_too_large"), ErrorKind.INVALID_REQUEST, False, None),
     ],
 )
-def test_errors_map_to_target_errors(
-    reply: Any, retryable: bool, retry_after: float | None
+def test_errors_map_to_provider_errors(
+    reply: Any, kind: ErrorKind, retryable: bool, retry_after: float | None
 ) -> None:
     fake = FakeAnthropic(reply)
-    with pytest.raises(TargetError) as info:
+    with pytest.raises(ProviderError) as info:
         run(fake.client().complete(model="claude-opus-5-5", prompt="x"))
+    assert isinstance(info.value, TargetError)
+    assert info.value.kind is kind
+    assert info.value.provider == "anthropic"
+    assert info.value.status == reply.status_code
     assert info.value.retryable is retryable
     assert info.value.retry_after == retry_after
     assert "sk-ant-test" not in info.value.message
@@ -179,11 +196,17 @@ def test_connection_errors_and_timeouts_are_retryable() -> None:
     def slow(_: dict[str, Any]) -> httpx2.Response:
         raise httpx2.ReadTimeout("slow")
 
-    for reply, message_part in ((boom, "cannot reach"), (slow, "timed out")):
+    cases = (
+        (boom, "cannot reach", ErrorKind.CONNECTION),
+        (slow, "timed out", ErrorKind.TIMEOUT),
+    )
+    for reply, message_part, kind in cases:
         fake = FakeAnthropic(reply)
-        with pytest.raises(TargetError, match=message_part) as info:
+        with pytest.raises(ProviderError, match=message_part) as info:
             run(fake.client().complete(model="claude-opus-5-5", prompt="x"))
         assert info.value.retryable
+        assert info.value.kind is kind
+        assert info.value.status is None
 
 
 def test_unknown_model_is_rejected_before_any_request() -> None:
@@ -291,6 +314,7 @@ def test_unparseable_responses_are_case_errors() -> None:
     )
     wrong_shape = httpx2.Response(200, json={"unexpected": True})
     for reply in (bad_json, wrong_shape):
-        with pytest.raises(TargetError, match="unexpected response") as info:
+        with pytest.raises(ProviderError, match="unexpected response") as info:
             run(FakeAnthropic(reply).client().complete(model="claude-opus-5-5", prompt="x"))
         assert not info.value.retryable
+        assert info.value.kind is ErrorKind.MALFORMED_RESPONSE

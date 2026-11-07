@@ -3,17 +3,17 @@
 from __future__ import annotations
 
 from evalkit.datasets import Case
-from evalkit.llm import ClaudeClient
+from evalkit.providers.anthropic import ClaudeClient
 from evalkit.targets.base import Generation, Target
 from evalkit.targets.specs import PromptTargetSpec
 from evalkit.targets.template import render
 
 
 class PromptTarget(Target):
-    provider = "anthropic"
-
     def __init__(self, spec: PromptTargetSpec, client: ClaudeClient) -> None:
         client.prices.require(spec.model)
+        # Rate limits and cool-downs are shared per provider.
+        self.provider = client.name
         self.spec = spec
         self.client = client
 

@@ -53,8 +53,8 @@ from evalkit.config import Settings
 from evalkit.datasets import Case, get_dataset, load_cases
 from evalkit.db.models import CaseLease, Dataset, Result, Run, as_utc, utcnow
 from evalkit.errors import ConflictError, EvalkitError, InvalidInputError, NotFoundError
-from evalkit.llm import ClaudeClient
 from evalkit.logs import log_context, scrubber
+from evalkit.providers.anthropic import ClaudeClient
 from evalkit.ratelimit import (
     Clock,
     Limiters,

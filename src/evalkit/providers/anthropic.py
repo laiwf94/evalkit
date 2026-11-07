@@ -1,7 +1,8 @@
-"""The one place that talks to the Claude API.
+"""The Claude API provider.
 
-Prompt targets, the judge and token counting all go through ``ClaudeClient``,
-so request shape, refusal handling, usage and cost are decided once:
+Prompt targets, the judge and token counting on Claude models all go through
+``ClaudeClient``, so request shape, refusal handling, usage and cost are
+decided once:
 
 * SDK retries are off (``max_retries=0``). Retries belong to the run's retry
   policy, which shares a cool-down across workers when the API sends
@@ -15,14 +16,14 @@ so request shape, refusal handling, usage and cost are decided once:
   that actually ran it.
 * Requests with a large ``max_tokens`` are streamed, because the SDK refuses
   non-streaming requests that may run past ten minutes.
+* The Claude API has no embeddings endpoint, so ``embed`` raises an
+  ``unsupported`` error; embeddings come from another provider.
 """
 
 from __future__ import annotations
 
 import contextlib
-import json
-from collections.abc import AsyncIterator
-from dataclasses import dataclass
+from collections.abc import AsyncIterator, Sequence
 from typing import Any
 
 import anthropic
@@ -30,8 +31,17 @@ import httpx2
 from pydantic import SecretStr
 
 from evalkit.pricing import PriceTable, TokenCounts
+from evalkit.providers.base import (
+    Completion,
+    Embeddings,
+    ErrorKind,
+    ProviderError,
+    kind_for_status,
+)
 from evalkit.ratelimit import parse_retry_after
-from evalkit.targets.base import TargetError, Usage
+from evalkit.targets.base import Usage
+
+PROVIDER = "anthropic"
 
 FALLBACK_BETA = "server-side-fallback-2026-07-01"
 # Models that accept fallbacks="default" on the Claude API.
@@ -39,22 +49,13 @@ FALLBACK_MODELS = frozenset(
     {"claude-fable-5-1", "claude-opus-5-5", "claude-opus-5", "claude-sonnet-5-5"}
 )
 STREAMING_THRESHOLD = 16_000
-_RETRYABLE_STATUS = frozenset({408, 409, 429, 500, 502, 503, 504, 529})
-
-
-@dataclass(frozen=True)
-class Completion:
-    text: str
-    stop_reason: str | None
-    usage: Usage
-    model: str
-    refusal_category: str | None = None
-
-    def json(self) -> Any:
-        return json.loads(self.text)
 
 
 class ClaudeClient:
+    """The ``Provider`` for the Claude API, over the official SDK."""
+
+    name = PROVIDER
+
     def __init__(
         self,
         prices: PriceTable,
@@ -127,7 +128,7 @@ class ClaudeClient:
         if fallbacks and model in FALLBACK_MODELS:
             params["betas"] = [FALLBACK_BETA]
             params["fallbacks"] = "default"
-        async with _mapped_errors():
+        async with self._mapped_errors():
             if max_tokens > STREAMING_THRESHOLD:
                 async with self._client.beta.messages.stream(**params) as stream:
                     message = await stream.get_final_message()
@@ -136,9 +137,7 @@ class ClaudeClient:
         try:
             return self.completion_from_message(message, requested_model=model)
         except (TypeError, AttributeError) as exc:
-            raise TargetError(
-                f"unexpected response from the Claude API: {exc}", retryable=False
-            ) from None
+            raise self.classify_error(exc) from None
 
     def completion_from_message(
         self, message: Any, *, requested_model: str, batch: bool = False
@@ -164,13 +163,11 @@ class ClaudeClient:
         priced = [it for it in iterations if it.type in ("message", "fallback_message")]
         if priced:
             cost = sum(
-                self.prices.cost(
-                    getattr(it, "model", None) or requested_model, _counts(it), batch=batch
-                )
+                self.price(getattr(it, "model", None) or requested_model, _counts(it), batch=batch)
                 for it in priced
             )
         else:
-            cost = self.prices.cost(requested_model, counts, batch=batch)
+            cost = self.price(requested_model, counts, batch=batch)
         return Usage(
             counts.input_tokens,
             counts.output_tokens,
@@ -181,16 +178,16 @@ class ClaudeClient:
 
     async def create_batch(self, requests: list[dict[str, Any]]) -> Any:
         """Submit Messages requests as one Message Batch (half price, results within 24 h)."""
-        async with _mapped_errors():
+        async with self._mapped_errors():
             return await self._client.messages.batches.create(requests=requests)  # type: ignore[arg-type]
 
     async def get_batch(self, batch_id: str) -> Any:
-        async with _mapped_errors():
+        async with self._mapped_errors():
             return await self._client.messages.batches.retrieve(batch_id)
 
     async def batch_results(self, batch_id: str) -> list[Any]:
         """All result entries of an ended batch. Results arrive in any order; match on custom_id."""
-        async with _mapped_errors():
+        async with self._mapped_errors():
             decoder = await self._client.messages.batches.results(batch_id)
             return [entry async for entry in decoder]
 
@@ -202,30 +199,61 @@ class ClaudeClient:
         }
         if system:
             params["system"] = system
-        async with _mapped_errors():
+        async with self._mapped_errors():
             result = await self._client.messages.count_tokens(**params)
         return int(result.input_tokens)
 
+    async def embed(self, *, model: str, texts: Sequence[str]) -> Embeddings:
+        raise ProviderError(
+            "the Claude API has no embeddings endpoint; configure an embedding provider",
+            kind=ErrorKind.UNSUPPORTED,
+            provider=PROVIDER,
+        )
+
+    def price(self, model: str, tokens: TokenCounts, *, batch: bool = False) -> float:
+        return self.prices.cost(model, tokens, batch=batch)
+
+    def classify_error(self, exc: BaseException) -> ProviderError:
+        """Map SDK and transport exceptions onto error kinds the retry policy understands."""
+        match exc:
+            case ProviderError():
+                return exc
+            case anthropic.APIStatusError():
+                return _status_error(exc)
+            case anthropic.APITimeoutError():
+                return ProviderError(
+                    "Claude API request timed out", kind=ErrorKind.TIMEOUT, provider=PROVIDER
+                )
+            case anthropic.APIConnectionError():
+                return ProviderError(
+                    f"cannot reach the Claude API: {exc}",
+                    kind=ErrorKind.CONNECTION,
+                    provider=PROVIDER,
+                )
+            case anthropic.APIError() | ValueError() | TypeError() | AttributeError():
+                # A response the SDK cannot parse: specific to this case, not worth retrying.
+                return ProviderError(
+                    f"unexpected response from the Claude API: {exc}",
+                    kind=ErrorKind.MALFORMED_RESPONSE,
+                    provider=PROVIDER,
+                )
+            case _:
+                return ProviderError(
+                    f"Claude API call failed: {type(exc).__name__}: {exc}",
+                    kind=ErrorKind.UNKNOWN,
+                    provider=PROVIDER,
+                )
+
+    @contextlib.asynccontextmanager
+    async def _mapped_errors(self) -> AsyncIterator[None]:
+        """Turn SDK exceptions into ProviderErrors. Cancellation passes through."""
+        try:
+            yield
+        except (anthropic.APIError, ValueError) as exc:
+            raise self.classify_error(exc) from None
+
     async def aclose(self) -> None:
         await self._client.close()
-
-
-@contextlib.asynccontextmanager
-async def _mapped_errors() -> AsyncIterator[None]:
-    """Turn SDK exceptions into TargetErrors that the retry policy understands."""
-    try:
-        yield
-    except anthropic.APIStatusError as exc:
-        raise _status_error(exc) from None
-    except anthropic.APITimeoutError:
-        raise TargetError("Claude API request timed out", retryable=True) from None
-    except anthropic.APIConnectionError as exc:
-        raise TargetError(f"cannot reach the Claude API: {exc}", retryable=True) from None
-    except (anthropic.APIError, ValueError) as exc:
-        # A response the SDK cannot parse: specific to this case, not worth retrying.
-        raise TargetError(
-            f"unexpected response from the Claude API: {exc}", retryable=False
-        ) from None
 
 
 def _counts(usage: Any) -> TokenCounts:
@@ -237,13 +265,15 @@ def _counts(usage: Any) -> TokenCounts:
     )
 
 
-def _status_error(exc: anthropic.APIStatusError) -> TargetError:
+def _status_error(exc: anthropic.APIStatusError) -> ProviderError:
     status = exc.status_code
     retry_after = parse_retry_after(exc.response.headers.get("retry-after"))
     request_id = exc.response.headers.get("request-id", "")
     suffix = f" (request {request_id})" if request_id else ""
-    return TargetError(
+    return ProviderError(
         f"Claude API returned {status}: {exc.message}{suffix}",
-        retryable=status in _RETRYABLE_STATUS,
+        kind=kind_for_status(status),
+        provider=PROVIDER,
+        status=status,
         retry_after=retry_after,
     )

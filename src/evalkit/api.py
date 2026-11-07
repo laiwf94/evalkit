@@ -57,9 +57,9 @@ from evalkit.datasets import (
 from evalkit.db import make_engine, make_session_factory, upgrade
 from evalkit.db.models import Dataset, Result, Run, as_utc, utcnow
 from evalkit.errors import EvalkitError, NotFoundError
-from evalkit.llm import ClaudeClient
 from evalkit.logs import configure_logging, log_context, scrubber
 from evalkit.pricing import PriceTable
+from evalkit.providers.anthropic import ClaudeClient
 from evalkit.report import compare_runs, summarize
 from evalkit.runner import Runner
 from evalkit.runspec import RunConfig

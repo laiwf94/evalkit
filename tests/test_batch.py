@@ -14,8 +14,8 @@ from evalkit.config import Settings
 from evalkit.datasets import Case, import_dataset
 from evalkit.db.models import CaseLease, Result, Run, utcnow
 from evalkit.errors import ConflictError, InvalidInputError
-from evalkit.llm import ClaudeClient
 from evalkit.pricing import PriceTable
+from evalkit.providers.anthropic import ClaudeClient
 from evalkit.report import summarize
 from evalkit.runner import LeaseLostError, Runner, batch_custom_id
 from evalkit.runspec import RunConfig

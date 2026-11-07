@@ -49,9 +49,9 @@ from evalkit.db import make_engine, make_session_factory, upgrade
 from evalkit.db.models import Run, utcnow
 from evalkit.errors import ConflictError, EvalkitError, NotFoundError, PreconditionError
 from evalkit.estimate import estimate
-from evalkit.llm import ClaudeClient
 from evalkit.logs import configure_logging, scrubber
 from evalkit.pricing import PriceTable
+from evalkit.providers.anthropic import ClaudeClient
 from evalkit.report import CompareReport, RunSummary, compare_runs, summarize
 from evalkit.runner import Runner
 from evalkit.runspec import RunConfig

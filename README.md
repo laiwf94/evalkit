@@ -269,7 +269,8 @@ and what would change at larger scale is in [docs/DESIGN.md](docs/DESIGN.md).
 src/evalkit/datasets.py    JSONL parsing, content hashing, versioned storage
 src/evalkit/targets/       prompt, HTTP (SSRF-safe) and fake targets; templates
 src/evalkit/scorers/       built-in scorers, plugin registry, LLM judge, calibration
-src/evalkit/llm.py         the Claude client: caching, structured output, fallback, cost
+src/evalkit/providers/     the Provider protocol and error kinds; the Claude client (caching,
+                           structured output, fallback, cost)
 src/evalkit/runner.py      worker pool, cache, resume, run completion, batch mode, cancel, drain
 src/evalkit/cache.py       response cache: keys, last use, sweep by age and size, blob offload
 src/evalkit/blobs.py       content-addressed blobs: filesystem and S3 backends, signing, GC
