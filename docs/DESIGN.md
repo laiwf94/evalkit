@@ -344,9 +344,14 @@ may execute one run (and several runs one provider), it lives in a row of
   worker pauses the others within about 100 ms. A provider with no configured
   rate takes no slots and only shares cool-downs, with one primary-key read per
   100 ms per process made in the background.
-- With 8 workers of 4 callers each on one key at 200 requests a second, the
-  end-to-end test measures 200.2 a second, and no 100 ms window exceeds the
-  limit. With the shipped image as eight worker containers calling an HTTP
+- With 8 worker processes of 4 callers each on one key at 200 requests a
+  second, the end-to-end test measures 199.6 to 200.1 a second. The slots the
+  workers are given never put more than burst + w × rate in any window, with
+  no allowance for jitter, and no call starts before its slot. Calls do start
+  up to 20-40 ms after their slots when a worker's one connection is busy with
+  a statement that waited for the row lock, so a 100 ms window can briefly see
+  a few calls more than the limit; the test bounds that by the measured
+  lateness rather than by a fixed allowance. With the shipped image as eight worker containers calling an HTTP
   provider, the provider itself counts 199.8 to 201.1 calls a second, and
   after a 429 with Retry-After: 1 the next call from any worker comes 1.01 to
   1.04 s later. Failures without
