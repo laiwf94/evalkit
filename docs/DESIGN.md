@@ -391,6 +391,41 @@ are `unknown` and not retried, which keeps exactly the set of statuses the
 Claude client retried before kinds existed. Cancellation is never classified:
 it passes through so a drain or a cancelled run stops at once.
 
+### OpenAI-compatible servers and Gemini
+
+`providers/openai_compat.py` and `providers/gemini.py` call their APIs as plain
+JSON over httpx2, with no vendor SDK: two SDKs would add more dependency weight
+than both clients put together, and raw HTTP keeps every request byte under
+test. They share `providers/_http.py`, which sends one JSON body, follows no
+redirects (a wrong base URL fails instead of posting the prompt elsewhere),
+reads at most 64 MiB of the answer, and turns timeouts, connection failures,
+error statuses and unparseable bodies into error kinds. Neither client retries:
+retries stay with the run's retry policy, and `Retry-After`, OpenAI's
+`retry-after-ms` and Gemini's `RetryInfo.retryDelay` become the retry delay.
+
+The OpenAI-compatible client covers OpenAI and the servers that copy its chat
+completions format (vLLM, llama.cpp, Ollama, LiteLLM). Its `name` is set per
+server, so each server has its own rate limits and cool-downs. `max_tokens` is
+sent as `max_completion_tokens`, or `max_tokens` for older servers. A JSON
+schema goes in `response_format` and is marked `strict` only when strict mode
+can accept it (every object closed and every property required), so a looser
+schema still works as best-effort JSON. `reasoning_effort` is sent only when
+the client is configured for reasoning models. A `refusal` gives an empty answer
+with stop reason `refusal`, as on Claude; a `content_filter` finish is a
+`safety_block` error. Cached prompt tokens are priced as cache reads. The API
+has no token counting endpoint, so `count_tokens` is `unsupported`.
+
+The Gemini client posts to `generateContent`, with the schema as
+`responseJsonSchema` and, when configured, effort as a thinking level. Safety
+filtering is never an empty answer: a blocked prompt (`promptFeedback.blockReason`)
+or an answer stopped by a filter (`SAFETY`, `PROHIBITED_CONTENT`, `BLOCKLIST`,
+`SPII`, `RECITATION`, `IMAGE_SAFETY`) is a `safety_block` error naming the reason
+and the blocked categories, so a report tells a provider's filter from a model
+that refused. Thought parts are not part of the answer, thought tokens are
+billed as output, and cached content tokens are priced as cache reads.
+`count_tokens` uses `countTokens`; `embed` uses `batchEmbedContents`, whose
+response has no token counts, so embedding usage is recorded as zero tokens.
+
 ## Calling Claude
 
 All Claude calls go through one provider (`providers/anthropic.py`):

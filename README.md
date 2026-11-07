@@ -270,7 +270,8 @@ src/evalkit/datasets.py    JSONL parsing, content hashing, versioned storage
 src/evalkit/targets/       prompt, HTTP (SSRF-safe) and fake targets; templates
 src/evalkit/scorers/       built-in scorers, plugin registry, LLM judge, calibration
 src/evalkit/providers/     the Provider protocol and error kinds; the Claude client (caching,
-                           structured output, fallback, cost)
+                           structured output, fallback, cost); raw HTTP OpenAI-compatible
+                           and Gemini clients (JSON schema output, usage, safety blocks)
 src/evalkit/runner.py      worker pool, cache, resume, run completion, batch mode, cancel, drain
 src/evalkit/cache.py       response cache: keys, last use, sweep by age and size, blob offload
 src/evalkit/blobs.py       content-addressed blobs: filesystem and S3 backends, signing, GC
