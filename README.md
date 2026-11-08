@@ -77,9 +77,11 @@ tags and splits. Each import is versioned and identified by a SHA-256 of its
 content, so re-importing the same file is a no-op, and two runs can only be
 compared if they used exactly the same cases.
 
-The target is the thing under test: a prompt template on a Claude model, your
-application behind an HTTP endpoint named in server config (never a URL from
-the request), or a fake target with known accuracy for demos and tests.
+The target is the thing under test: a prompt template on a model (Claude by
+default, or `provider = "openai"`, `"gemini"` or a server named in
+`EVALKIT_PROVIDERS_FILE`), your application behind an HTTP endpoint named in
+server config (never a URL from the request), or a fake target with known
+accuracy for demos and tests.
 
 Scorers grade each answer by exact match, regex, JSON Schema, numeric
 tolerance, token F1, or an LLM judge with a rubric. The pairwise judge runs
@@ -91,6 +93,50 @@ OpenAI-compatible server (`provider = "openai"`, keys in `OPENAI_API_KEY` and
 need not grade its own family. Each run records which judge graded it, and the
 gate refuses to compare runs whose judges differ unless given
 `--allow-judge-change`. Your own scorers plug in through an entry point.
+
+## Model matrices
+
+A `[matrix]` table runs the same dataset and scorers over several models,
+efforts and output limits, one child run per combination:
+
+```toml
+label = "support"
+# [dataset], [target] (a prompt) and [[scorers]] as above, then:
+
+[matrix]
+model = [
+  "claude-opus-5-5",
+  { provider = "openai", model = "gpt-5.1" },
+  { provider = "gemini", model = "gemini-3-pro", name = "gemini" },
+]
+effort = ["low", "high"]        # optional; so is max_tokens = [1024, 4096]
+```
+
+`evalkit run` executes the runs and prints the matrix report. On the stand-in
+providers of `tests/test_matrix.py` (three models, 120 cases, latency fixed):
+
+```console
+$ evalkit report matrix label:models
+matrix cb7291fe08cc4362a4b484b9949e7494  models  dataset qa v1
+quality exact  latency p50  frontier over quality, cost, latency
+
+variant            status           exact            95% CI   cost/case   p50 ms  frontier
+claude-sonnet-5-5  completed        96.7%    [93.3%, 99.2%]   $0.000400      800  *
+local:gpt-test     completed        64.2%    [55.8%, 72.5%]   $0.000280      500  dominated by gemini
+gemini             completed        86.7%    [80.0%, 92.5%]   $0.000140      300  *
+
+along the frontier, cheapest first (paired; p adjusted by Holm over 1 step(s), alpha 0.05):
+  gemini -> claude-sonnet-5-5: +10.0% [+3.3, +16.7]  p 0.0120  n 120  better
+```
+
+The report marks the Pareto frontier over quality (the first gated metric, or
+`--metric`), the target's cost per case and latency (`--latency p50|p95`): a
+variant is dominated when another is at least as good on all three and better
+on one. Neighbours on the frontier are compared case by case with the same
+paired test as `evalkit gate`, so you can see whether the dearer model's gain is
+real. Each child is an ordinary run labelled `support[gemini,effort=low]`, with
+its own tokens and cost; `--queue` hands all of them to worker daemons and
+`evalkit run --resume MATRIX_ID` finishes an interrupted matrix.
 
 ## During a run
 
@@ -136,7 +182,7 @@ size; Holm correction applies when several metrics are gated together.
 | Command | Purpose |
 |---|---|
 | `evalkit run CONFIG [--label L]` | Run an evaluation; prints the summary. |
-| `evalkit run --resume RUN_ID` | Continue an interrupted or crashed run. |
+| `evalkit run --resume RUN_ID` | Continue an interrupted or crashed run, or the unfinished runs of a matrix. |
 | `evalkit run CONFIG --queue` | Queue the run for worker daemons and exit. |
 | `evalkit worker [--runs N]` | Execute queued runs until SIGTERM, then drain. |
 | `evalkit cancel RUN_ID` | Cancel a queued or running run. |
@@ -144,7 +190,8 @@ size; Holm correction applies when several metrics are gated together.
 | `evalkit run verify RUN_ID [--repair]` | Recompute a run's aggregates and score arrays from its results; exit 3 on any difference, or rewrite them with `--repair`. |
 | `evalkit compare BASE CAND` | Paired comparison per metric. |
 | `evalkit gate BASE CAND [--allow-judge-change]` | Same, and exit 1 if any gated metric is worse; exit 3 if a metric's judge changed, unless allowed. |
-| `evalkit estimate CONFIG` | Cost estimate from token counts. |
+| `evalkit report matrix MATRIX [--metric M] [--latency p50\|p95]` | A matrix's variants, their cost/quality/latency frontier and paired steps along it. |
+| `evalkit estimate CONFIG` | Cost estimate from token counts (per variant for a matrix). |
 | `evalkit calibrate --judge J LABELS` | Judge agreement with human labels. |
 | `evalkit dataset import/export/list` | Manage datasets. |
 | `evalkit cache sweep [--max-age 30d] [--max-size 20GiB] [--dry-run]` | Delete old and least recently used cache entries, then unreferenced blobs. |
@@ -152,7 +199,7 @@ size; Holm correction applies when several metrics are gated together.
 | `evalkit serve`, `evalkit db upgrade` | Run the API; migrate PostgreSQL. |
 
 `RUN` is a run id or `label:NAME` for the newest completed run with that
-label. Exit codes: 0 success, 1 regression, 2 bad input, 3 the run cannot be
+label; `MATRIX` is a matrix id or `label:NAME` for the newest matrix. Exit codes: 0 success, 1 regression, 2 bad input, 3 the run cannot be
 used (failed, incomplete, a batch-mode run held by another process, different
 datasets, a changed judge) or any
 other error, 130 interrupted. Commands that print a report take `--json`.
@@ -209,6 +256,8 @@ Every `/v1` route takes `Authorization: Bearer <token>`.
 | `GET /v1/runs/{id}/results?after=&limit=` | Per-case outputs and scores, paged. |
 | `POST /v1/runs/{id}/resume` | Put an interrupted or failed run back in the queue. |
 | `POST /v1/runs/{id}/cancel` | Cancel a run: `cancelled` at once if nobody is executing it, else `cancelling` until every worker has stopped. 409 for a completed run. |
+| `POST /v1/matrices` | Queue every run of a config with a `matrix`. 202 with the matrix id and run summaries. |
+| `GET /v1/matrices/{id}[?metric=&latency=p95]` | The matrix report: variants, frontier, paired steps. |
 | `POST /v1/compare` | Paired comparison of two runs. |
 | `GET /healthz`, `GET /metrics` | Health (no auth, checks the database) and Prometheus metrics. |
 
@@ -277,8 +326,10 @@ src/evalkit/scorers/       built-in scorers, plugin registry, LLM judge, calibra
 src/evalkit/providers/     the Provider protocol and error kinds; the Claude client (caching,
                            structured output, fallback, cost); raw HTTP OpenAI-compatible
                            and Gemini clients (JSON schema output, usage, safety blocks);
-                           the registry of named providers judges use
+                           the registry of named providers targets and judges use
 src/evalkit/runner.py      worker pool, cache, resume, run completion, batch mode, cancel, drain
+src/evalkit/matrix.py      [matrix] configs expanded into grouped child runs
+src/evalkit/frontier.py    cost/quality/latency Pareto frontier and paired steps along it
 src/evalkit/cache.py       response cache: keys, last use, sweep by age and size, blob offload
 src/evalkit/blobs.py       content-addressed blobs: filesystem and S3 backends, signing, GC
 src/evalkit/leases.py      case leases: SKIP LOCKED claims and fenced result writes

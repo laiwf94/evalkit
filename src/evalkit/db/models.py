@@ -81,11 +81,27 @@ class DatasetCase(Base):
     dataset: Mapped[Dataset] = relationship(back_populates="cases")
 
 
+class Matrix(Base):
+    """A group of child runs expanded from one ``[matrix]`` config (``evalkit.matrix``)."""
+
+    __tablename__ = "matrices"
+    __table_args__ = (Index("ix_matrices_label", "label", "created_at"),)
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True)
+    label: Mapped[str] = mapped_column(String(128), default="")
+    dataset_id: Mapped[int] = mapped_column(ForeignKey("datasets.id", ondelete="RESTRICT"))
+    # The [matrix] table as given, and the base config it expanded.
+    axes: Mapped[dict[str, Any]] = mapped_column()
+    config: Mapped[dict[str, Any]] = mapped_column()
+    created_at: Mapped[datetime] = mapped_column(default=utcnow)
+
+
 class Run(Base):
     __tablename__ = "runs"
     __table_args__ = (
         Index("ix_runs_created_at", "created_at"),
         Index("ix_runs_queue", "status", "priority", "queued_at"),
+        Index("ix_runs_matrix", "matrix_id"),
     )
 
     id: Mapped[str] = mapped_column(String(32), primary_key=True)
@@ -119,6 +135,10 @@ class Run(Base):
     created_at: Mapped[datetime] = mapped_column(default=utcnow)
     started_at: Mapped[datetime | None] = mapped_column(nullable=True)
     finished_at: Mapped[datetime | None] = mapped_column(nullable=True)
+    # Set on the child runs of a matrix: the group, and what this variant runs
+    # (index, name, provider, model, effort, max_tokens).
+    matrix_id: Mapped[str | None] = mapped_column(ForeignKey("matrices.id"), nullable=True)
+    variant: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
 
     dataset: Mapped[Dataset] = relationship()
 

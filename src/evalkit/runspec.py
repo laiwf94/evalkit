@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Literal
+from typing import Annotated, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -10,6 +10,11 @@ from evalkit.datasets import Label
 from evalkit.ratelimit import RateLimit, RetryPolicy
 from evalkit.scorers import ScorerSpec
 from evalkit.targets import TargetSpec
+from evalkit.targets.specs import PROVIDER_NAME, Effort
+
+# A matrix expands into at most this many child runs: each is a full run, so a
+# typo that multiplies three long axes should fail at once, not after paying.
+MAX_MATRIX_VARIANTS = 64
 
 
 class _Model(BaseModel):
@@ -46,6 +51,29 @@ class QueueOptions(_Model):
     max_workers: int | None = Field(default=None, ge=1, le=1024)
 
 
+class MatrixModel(_Model):
+    """One value of the model axis: a model, and the provider that serves it."""
+
+    model: str = Field(min_length=1, max_length=64)
+    # None keeps the base target's provider.
+    provider: str | None = Field(default=None, pattern=PROVIDER_NAME)
+    # Short name for the variant label; defaults to ``provider:model`` (or the model).
+    name: str | None = Field(default=None, pattern=r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,63}$")
+
+
+class MatrixAxes(_Model):
+    """Axes a ``[matrix]`` table expands a prompt target over, in this order.
+
+    Every combination becomes one child run of the same dataset, filter and
+    scorers. An empty axis keeps the base target's value."""
+
+    model: tuple[MatrixModel | str, ...] = Field(default=(), max_length=MAX_MATRIX_VARIANTS)
+    effort: tuple[Effort, ...] = Field(default=(), max_length=5)
+    max_tokens: tuple[Annotated[int, Field(ge=1, le=128_000)], ...] = Field(
+        default=(), max_length=MAX_MATRIX_VARIANTS
+    )
+
+
 class RunConfig(_Model):
     label: str = Field(default="", max_length=128)
     dataset: DatasetRef
@@ -54,3 +82,5 @@ class RunConfig(_Model):
     filter: CaseFilter = CaseFilter()
     options: RunOptions = RunOptions()
     queue: QueueOptions = QueueOptions()
+    # Expands the run into grouped child runs, one per combination (``evalkit.matrix``).
+    matrix: MatrixAxes | None = None

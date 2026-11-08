@@ -10,6 +10,10 @@ from evalkit.datasets import canonical_json, sha256_hex
 from evalkit.errors import InvalidInputError
 from evalkit.targets.template import placeholders
 
+# Provider names, shared with ``evalkit.providers.registry``.
+ANTHROPIC = "anthropic"
+PROVIDER_NAME = r"^[a-z0-9][a-z0-9_-]{0,63}$"
+
 Effort = Literal["low", "medium", "high", "xhigh", "max"]
 
 
@@ -18,9 +22,11 @@ class _Spec(BaseModel):
 
 
 class PromptTargetSpec(_Spec):
-    """A prompt template sent to a Claude model."""
+    """A prompt template sent to a model on a named provider (Claude by default)."""
 
     type: Literal["prompt"]
+    # ``anthropic``, or a provider from ``evalkit.providers.registry``.
+    provider: str = Field(default=ANTHROPIC, pattern=PROVIDER_NAME)
     model: str = Field(default="claude-opus-5-5", min_length=1, max_length=64)
     system: str = Field(default="", max_length=200_000)
     template: str = Field(min_length=1, max_length=200_000)
@@ -68,6 +74,12 @@ def target_hash(spec: PromptTargetSpec | HttpTargetSpec | FakeTargetSpec, extra:
     """Identity of a target: every field that can change its output, in canonical form.
 
     ``extra`` carries resolved configuration that is not in the spec, such as
-    the URL behind an HTTP endpoint name.
+    the URL behind an HTTP endpoint name, or the endpoint of a prompt target's
+    provider. A Claude prompt target leaves its provider out, so its identity
+    (and with it every cache key) is the one it had before targets named a
+    provider.
     """
-    return sha256_hex(canonical_json({"spec": spec.model_dump(mode="json"), "extra": extra}))
+    dumped = spec.model_dump(mode="json")
+    if isinstance(spec, PromptTargetSpec) and spec.provider == ANTHROPIC:
+        del dumped["provider"]
+    return sha256_hex(canonical_json({"spec": dumped, "extra": extra}))

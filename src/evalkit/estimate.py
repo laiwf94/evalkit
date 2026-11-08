@@ -7,25 +7,27 @@ full ``max_tokens``. Cases already in the response cache cost nothing. For a
 judge, the response it will read is not known yet either; its input count
 includes the prompt without the response, plus the target's ``max_tokens`` as
 an upper bound on the response length when the target is a Claude prompt.
-Judges count on their own provider; one whose provider has no counting
-endpoint gets a note instead of an input cost.
+The target and each judge count on their own provider; one whose provider has
+no counting endpoint gets a note instead of an input cost. A matrix config is
+estimated variant by variant (``estimate_matrix``).
 """
 
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Awaitable, Iterable
 from dataclasses import dataclass, field
 
 from sqlalchemy.orm import Session, sessionmaker
 
-from evalkit import cache
+from evalkit import cache, matrix
 from evalkit.config import Settings
 from evalkit.datasets import Case, get_dataset, load_cases
 from evalkit.errors import InvalidInputError
 from evalkit.pricing import TokenCounts
 from evalkit.providers.anthropic import ClaudeClient
 from evalkit.providers.base import ErrorKind, Provider, ProviderError
-from evalkit.providers.registry import ProviderRegistry
+from evalkit.providers.registry import ANTHROPIC, ProviderRegistry
 from evalkit.ratelimit import Limiters, RetryStats, call_with_retries
 from evalkit.runspec import RunConfig
 from evalkit.scorers import build_scorers
@@ -68,10 +70,10 @@ async def estimate(
     providers: ProviderRegistry | None = None,
     concurrency: int = 8,
 ) -> Estimate:
-    target_id = identity(config.target, settings.http_endpoints)
-    scorers = build_scorers(
-        config.scorers, allow_import_paths=True, claude=claude, providers=providers
-    )
+    if providers is None:
+        providers = ProviderRegistry({}, claude.prices, claude=claude)
+    target_id = identity(config.target, settings.http_endpoints, providers.configs)
+    scorers = build_scorers(config.scorers, allow_import_paths=True, providers=providers)
     judges = [s for s in scorers if isinstance(s, LLMJudge)]
     with sessions() as session:
         dataset = get_dataset(session, config.dataset.name, config.dataset.version)
@@ -85,7 +87,7 @@ async def estimate(
     batch = config.options.mode == "batch"
     result = Estimate(cases=len(cases), cached_cases=len(cases) - len(uncached), batch=batch)
 
-    limiters = Limiters({"anthropic": config.options.rate_limit})
+    limiters = Limiters({ANTHROPIC: config.options.rate_limit})
     gate = asyncio.Semaphore(concurrency)
 
     async def count(model: str, prompt: str, system: str, client: Provider = claude) -> int:
@@ -97,24 +99,31 @@ async def estimate(
                 stats=RetryStats(),
             )
 
-    prices = claude.prices
     spec = config.target
     response_bound = 0
     if isinstance(spec, PromptTargetSpec):
         response_bound = spec.max_tokens
-        prompts = [_render(spec, c) for c in uncached]
-        counts = await asyncio.gather(*(count(spec.model, p, spec.system) for p in prompts if p))
-        tokens = sum(counts)
-        result.target_input_tokens = tokens
-        result.target_input_cost_usd = prices.cost(
-            spec.model, TokenCounts(input_tokens=tokens), batch=batch
-        )
-        result.target_max_output_cost_usd = prices.cost(
-            spec.model, TokenCounts(output_tokens=spec.max_tokens * len(counts)), batch=batch
-        )
-        skipped = len(prompts) - len(counts)
+        target = providers.get(spec.provider)
+        prices = target.prices
+        prices.require(spec.model)
+        prompts = [p for p in (_render(spec, c) for c in uncached) if p]
+        skipped = len(uncached) - len(prompts)
         if skipped:
             result.notes.append(f"{skipped} case(s) do not fit the template and will fail")
+        result.target_max_output_cost_usd = prices.cost(
+            spec.model, TokenCounts(output_tokens=spec.max_tokens * len(prompts)), batch=batch
+        )
+        tokens = await _total(count(spec.model, p, spec.system, target) for p in prompts)
+        if tokens is None:
+            result.notes.append(
+                f"the target's provider {spec.provider} cannot count tokens, "
+                "so its input cost is not included"
+            )
+        else:
+            result.target_input_tokens = tokens
+            result.target_input_cost_usd = prices.cost(
+                spec.model, TokenCounts(input_tokens=tokens), batch=batch
+            )
     else:
         result.notes.append(f"the {spec.type} target's own cost is not estimated")
 
@@ -125,24 +134,29 @@ async def estimate(
         result.judge_max_output_cost_usd += judge.client.prices.cost(
             judge.model, TokenCounts(output_tokens=judge.max_tokens * len(prompts))
         )
-        try:
-            counts = await asyncio.gather(
-                *(count(judge.model, p, judge.system, judge.client) for p in prompts)
-            )
-        except ProviderError as exc:
-            if exc.kind is not ErrorKind.UNSUPPORTED:
-                raise
+        counted = await _total(count(judge.model, p, judge.system, judge.client) for p in prompts)
+        if counted is None:
             result.notes.append(
                 f"judge {judge.name}: {judge.provider} cannot count tokens, "
                 "so its input cost is not included"
             )
             continue
-        tokens = sum(counts) + response_bound * len(counts)
+        tokens = counted + response_bound * len(prompts)
         result.judge_input_tokens += tokens
         result.judge_input_cost_usd += judge.client.prices.cost(
             judge.model, TokenCounts(input_tokens=tokens)
         )
     return result
+
+
+async def _total(counts: Iterable[Awaitable[int]]) -> int | None:
+    """The sum of ``counts``, or None when the provider cannot count tokens."""
+    try:
+        return sum(await asyncio.gather(*counts))
+    except ProviderError as exc:
+        if exc.kind is not ErrorKind.UNSUPPORTED:
+            raise
+        return None
 
 
 def _render(spec: PromptTargetSpec, case: Case) -> str:
@@ -156,3 +170,35 @@ def _judge_prompts(judge: LLMJudge, case: Case) -> list[str]:
     if judge.mode == "pairwise" and case.expected is None:
         return []
     return judge.prompts(case, "")
+
+
+@dataclass
+class VariantEstimate:
+    name: str
+    estimate: Estimate
+
+
+@dataclass
+class MatrixEstimate:
+    """One estimate per variant of a matrix config, in variant order."""
+
+    variants: list[VariantEstimate]
+
+    @property
+    def max_total_cost_usd(self) -> float:
+        return sum(v.estimate.max_total_cost_usd for v in self.variants)
+
+
+async def estimate_matrix(
+    sessions: sessionmaker[Session],
+    settings: Settings,
+    config: RunConfig,
+    claude: ClaudeClient,
+    *,
+    providers: ProviderRegistry | None = None,
+) -> MatrixEstimate:
+    out = []
+    for variant in matrix.expand(config):
+        found = await estimate(sessions, settings, variant.config, claude, providers=providers)
+        out.append(VariantEstimate(variant.name, found))
+    return MatrixEstimate(out)

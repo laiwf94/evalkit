@@ -24,7 +24,10 @@ dataset_cases   (dataset_id, case_id) unique; input, expected, tags, split, meta
 runs            target spec + target hash, scorer specs, options, filter, seed,
                 status, lease (owner, expires_at; batch mode only), batch_id,
                 queued_at, priority, max_workers, cases_total,
-                latency p50 and p95 (set when the run is compacted)
+                latency p50 and p95 (set when the run is compacted),
+                matrix_id and variant (for the child runs of a matrix)
+matrices        a group of child runs from one [matrix] config: label, dataset,
+                the axes as given and the base config
 case_leases     (run_id, case_id) key; position, owner, expires_at, fence, done
 run_workers     (run_id, worker_id) key; joined_at, expires_at: a worker daemon's slot
 results         (run_id, case_id) unique; redacted output, scores (JSON), tokens,
@@ -54,10 +57,17 @@ re-reads, so the same content never gets two versions.
 ### How a target is identified
 
 The target hash covers every field that can change an
-output: model, system prompt, template, `max_tokens`, effort, fallback setting,
-and for HTTP targets the resolved URL and header names (not the secret values).
-It keys the response cache, so a cache hit is only possible when nothing that
-could change the answer changed.
+output: provider, model, system prompt, template, `max_tokens`, effort, fallback
+setting, and for HTTP targets the resolved URL and header names (not the secret
+values). A prompt target on a provider other than Claude also includes that
+provider's kind and base URL, so pointing `local` at another server is a new
+target. A Claude prompt target leaves the provider field out of the hash, which
+keeps the hash every Claude target had before targets named a provider, and
+with it every cache entry. It keys the response cache, so a cache hit is only
+possible when nothing that could change the answer changed. A process refuses
+to execute a run whose target, as built from its own provider and endpoint
+configuration, would hash differently from the recorded one, for the same
+reason it refuses a changed judge.
 
 ### Runs keep their own config
 
@@ -426,6 +436,66 @@ billed as output, and cached content tokens are priced as cache reads.
 `count_tokens` uses `countTokens`; `embed` uses `batchEmbedContents`, whose
 response has no token counts, so embedding usage is recorded as zero tokens.
 
+### Prompt targets on any provider
+
+A prompt target names its provider like a judge does (`provider = "openai"`,
+default `anthropic`) and reaches it through the same registry, so the CLI and
+the API only build a Claude client when a target or judge uses Claude. Its rate
+limits and cool-downs are keyed by the provider name. The model must have a
+price on that provider, checked when the run is created rather than as a
+missing cost at the end. Batch mode stays Claude only: it uses the Message
+Batches API. `evalkit estimate` counts input tokens on the target's provider;
+an OpenAI-compatible server has no counting endpoint, so its input cost is left
+out with a note rather than guessed.
+
+## Model matrices and the frontier
+
+A `[matrix]` table turns one run config into a group of child runs, one per
+combination of its axes: `model` (a model name, or `{provider, model, name}`),
+`effort` and `max_tokens`. Expansion (`matrix.py`) is pure: the same config
+gives the same children in the same order, model first, each axis in the order
+written, and an axis left out keeps the base target's value. Each child is an
+ordinary run with its own target hash, cache entries, leases and aggregates.
+That is the point of the design: queueing, worker daemons, resume, `run verify`,
+`show` and `gate` need nothing new, and a matrix of a hundred thousand cases
+per variant scales the way one run does. The group row (`matrices`) records the
+axes and the base config; each child records its variant (index, name and the
+values it resolved to) and is labelled `<label>[<variant>]`, so
+`evalkit gate label:support[gemini] label:support[claude-opus-5-5]` works.
+
+Every variant is validated before any is recorded (its provider, the model's
+price, batch mode, its judges), and the group and its children are inserted in
+one transaction, so a typo in the fifth variant does not leave four orphan
+runs. A matrix expands into at most 64 runs, and naming the same target twice
+is refused: each child is a full paid run. The CLI executes the children one
+after another (each already runs its cases concurrently, and different
+providers do not share a rate limit, but sequential runs keep the progress and
+the interrupt point simple); `--queue` hands them to worker daemons, which run
+them in parallel. `evalkit run --resume MATRIX_ID` resumes the children that
+are not completed.
+
+`frontier.py` reads the children's summaries. Each completed variant is a
+point: the mean of the quality metric (the first gated one unless
+`--metric` says otherwise), the target's cost per case it actually called, and
+the p50 (or `--latency p95`) latency. A variant is dominated when another is at
+least as good everywhere and strictly better somewhere, and the frontier is the
+undominated set; ties are all kept. Cost per *called* case leaves cached cases
+out, because a variant answered from the cache is not free in general, only in
+this run. Judge cost is shown but is not a dimension, since one judge grades
+every variant. A dimension that some variant cannot be measured on (latency
+when all its cases were cached or failed) is dropped for all of them, with a
+note, instead of comparing a number against a guess.
+
+Point estimates decide dominance, so the report adds what they cannot say: the
+frontier is sorted from cheapest to most expensive and each variant is compared
+with the one before it, case by case, with the paired bootstrap and permutation
+test of `evalkit compare` and Holm's correction across the steps. Adjacent
+steps are the questions a frontier poses ("does the next price buy a
+difference this dataset can detect?"); all pairs would add comparisons nobody
+asks for and dilute the correction. With 120 cases and a 10-point gap the test
+finds the difference (p 0.012 in `tests/test_matrix.py`); with 30 cases and a
+3-point gap it will say "no detectable change", which is the honest answer.
+
 ## Calling Claude
 
 All Claude calls go through one provider (`providers/anthropic.py`):
@@ -635,6 +705,8 @@ band.
 | Judge refuses, runs out of tokens or returns bad JSON | That score is `unscorable` with the reason. |
 | Database unavailable | `/healthz` returns 503; a running run fails and can be resumed. |
 | Runs compared over different dataset contents | `failed_precondition` (CLI exit 3), never a misleading verdict. |
+| A matrix variant is invalid (unknown provider, unpriced model) | Nothing is recorded: the matrix and its runs are created in one transaction after every variant is checked. |
+| A provider moved after a run was recorded | The run is refused (it fails with `failed_precondition`) rather than answered by another server under the old identity. |
 
 ## Limits
 

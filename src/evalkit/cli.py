@@ -46,10 +46,12 @@ from evalkit.datasets import (
     to_jsonl,
 )
 from evalkit.db import make_engine, make_session_factory, upgrade
-from evalkit.db.models import Run, utcnow
+from evalkit.db.models import Matrix, Run, utcnow
 from evalkit.errors import ConflictError, EvalkitError, NotFoundError, PreconditionError
-from evalkit.estimate import estimate
+from evalkit.estimate import MatrixEstimate, estimate, estimate_matrix
+from evalkit.frontier import MatrixReport, matrix_report
 from evalkit.logs import configure_logging, scrubber
+from evalkit.matrix import child_runs, resolve_matrix
 from evalkit.pricing import PriceTable
 from evalkit.providers.anthropic import ClaudeClient
 from evalkit.providers.registry import ProviderRegistry
@@ -58,7 +60,6 @@ from evalkit.runner import Runner
 from evalkit.runspec import RunConfig
 from evalkit.scorers.calibration import calibrate, parse_labels, save_calibration
 from evalkit.scorers.registry import JudgeSpec, judge_from_spec
-from evalkit.scorers.registry import needs_claude as judges_need_claude
 from evalkit.worker import Worker, listen_url
 
 VERIFY = "verify"
@@ -87,8 +88,8 @@ class App:
         self._providers: ProviderRegistry | None = None
 
     def providers(self) -> ProviderRegistry:
-        """Every configured provider. The Claude client is made only if a judge
-        uses it, so a run with no Claude model does not need ANTHROPIC_API_KEY."""
+        """Every configured provider. The Claude client is made only if a target or
+        a judge uses it, so a run with no Claude model does not need ANTHROPIC_API_KEY."""
         if self._providers is None:
             self._providers = ProviderRegistry(
                 self.settings.provider_configs(),
@@ -104,11 +105,10 @@ class App:
             )
         return self._claude
 
-    def runner(self, needs_claude: bool, *, allow_import_paths: bool = True) -> Runner:
+    def runner(self, *, allow_import_paths: bool = True) -> Runner:
         return Runner(
             self.sessions,
             self.settings,
-            claude=self.claude() if needs_claude else None,
             providers=self.providers(),
             allow_import_paths=allow_import_paths,
         )
@@ -137,10 +137,6 @@ def load_run_config(path: Path, app: App) -> RunConfig:
         raise CliError(f"{path}: {_describe(exc)}", EXIT_INPUT) from None
 
 
-def needs_claude(config: RunConfig) -> bool:
-    return config.target.type == "prompt" or judges_need_claude(config.scorers)
-
-
 def resolve_run(session: Session, ref: str) -> str:
     """A run id, or ``label:NAME`` for the newest completed run with that label."""
     if ref.startswith("label:"):
@@ -166,31 +162,38 @@ async def cmd_run(args: argparse.Namespace, app: App) -> int:
         raise CliError("--repair belongs to: evalkit run verify RUN_ID", EXIT_INPUT)
     if args.resume:
         with app.sessions() as session:
-            run = session.get(Run, args.resume)
-            if run is None:
+            group = session.get(Matrix, args.resume)
+            if group is not None:
+                ids = [r.id for r in child_runs(session, group.id) if r.status != "completed"]
+            elif session.get(Run, args.resume) is None:
                 raise NotFoundError(f"run {args.resume} not found")
-            claude = run.target_spec.get("type") == "prompt" or any(
-                s.get("type") == "judge" and s.get("provider", "anthropic") == "anthropic"
-                for s in run.scorers
-            )
+        if group is not None:
+            return await _run_matrix(args, app, app.runner(), group.id, ids)
         run_id = args.resume
-        runner = app.runner(claude)
+        runner = app.runner()
     else:
         if args.config is None:
             raise CliError("give a run config, or --resume RUN_ID", EXIT_INPUT)
         config = load_run_config(Path(args.config), app)
         if args.label is not None:
             config = config.model_copy(update={"label": args.label})
+        # Worker daemons import scorers only from installed entry points.
+        runner = app.runner(allow_import_paths=not args.queue)
+        if config.matrix is not None:
+            group, runs = runner.create_matrix(config, queued=args.queue)
+            _err(f"matrix {group.id}: {len(runs)} runs {'queued' if args.queue else 'started'}")
+            if args.queue:
+                with app.sessions() as session:
+                    report = matrix_report(session, group.id)
+                _emit(app.out, report, args.json, _format_matrix)
+                return EXIT_OK
+            return await _run_matrix(args, app, runner, group.id, [r.id for r in runs])
         if args.queue:
-            # Worker daemons import scorers only from installed entry points.
-            queued = app.runner(needs_claude(config), allow_import_paths=False).create_run(
-                config, queued=True
-            )
+            queued = runner.create_run(config, queued=True)
             _err(f"run {queued.id} queued")
             with app.sessions() as session:
                 _emit(app.out, summarize(session, queued.id), args.json, _format_summary)
             return EXIT_OK
-        runner = app.runner(needs_claude(config))
         run_id = runner.create_run(config).id
         _err(f"run {run_id} started")
     try:
@@ -202,6 +205,38 @@ async def cmd_run(args: argparse.Namespace, app: App) -> int:
         summary = summarize(session, run_id)
     _emit(app.out, summary, args.json, _format_summary)
     return EXIT_OK if summary.status == "completed" else EXIT_UNUSABLE
+
+
+async def _run_matrix(
+    args: argparse.Namespace, app: App, runner: Runner, matrix_id: str, run_ids: list[str]
+) -> int:
+    """Execute a matrix's runs one after another, then print its report. Each run
+    is an ordinary run, so an interrupted matrix resumes where it stopped."""
+    for run_id in run_ids:
+        try:
+            await runner.execute(run_id)
+        except asyncio.CancelledError:
+            _err(f"interrupted; resume with: evalkit run --resume {matrix_id}")
+            return EXIT_INTERRUPTED
+    with app.sessions() as session:
+        report = matrix_report(session, matrix_id)
+    _emit(app.out, report, args.json, _format_matrix)
+    return EXIT_OK if report.complete else EXIT_UNUSABLE
+
+
+async def cmd_report(args: argparse.Namespace, app: App) -> int:
+    """``evalkit report matrix MATRIX``: a matrix's variants and their frontier."""
+    with app.sessions() as session:
+        report = matrix_report(
+            session,
+            resolve_matrix(session, args.matrix),
+            metric=args.metric,
+            latency=args.latency,
+            alpha=args.alpha,
+            min_effect=args.min_effect,
+        )
+    _emit(app.out, report, args.json, _format_matrix)
+    return EXIT_OK
 
 
 async def cmd_verify(args: argparse.Namespace, app: App) -> int:
@@ -227,7 +262,7 @@ async def cmd_worker(args: argparse.Namespace, app: App) -> int:
     slots = app.settings.max_active_runs if args.runs is None else args.runs
     if slots < 1:
         raise CliError("a worker needs at least one run slot (--runs)", EXIT_INPUT)
-    runner = app.runner(needs_claude=True, allow_import_paths=False)
+    runner = app.runner(allow_import_paths=False)
     worker = Worker(
         app.sessions,
         runner,
@@ -384,6 +419,12 @@ def _compare(args: argparse.Namespace, app: App) -> CompareReport:
 
 async def cmd_estimate(args: argparse.Namespace, app: App) -> int:
     config = load_run_config(Path(args.config), app)
+    if config.matrix is not None:
+        each = await estimate_matrix(
+            app.sessions, app.settings, config, app.claude(), providers=app.providers()
+        )
+        _emit(app.out, each, args.json, _format_matrix_estimate)
+        return EXIT_OK
     result = await estimate(
         app.sessions, app.settings, config, app.claude(), providers=app.providers()
     )
@@ -465,7 +506,9 @@ def build_parser() -> argparse.ArgumentParser:
         "--repair", action="store_true", help="with 'verify': rewrite what differs from results"
     )
     run.add_argument("--label", help="label the run, e.g. a branch or commit")
-    run.add_argument("--resume", metavar="RUN_ID", help="continue an interrupted run")
+    run.add_argument(
+        "--resume", metavar="RUN_ID", help="continue an interrupted run, or a matrix's runs"
+    )
     run.add_argument(
         "--queue", action="store_true", help="queue the run for worker daemons and exit"
     )
@@ -504,6 +547,8 @@ def build_parser() -> argparse.ArgumentParser:
         )
         p.set_defaults(handler=handler)
 
+    _add_report_commands(sub)
+
     est = with_json(sub.add_parser("estimate", help="estimate the cost of a run config"))
     est.add_argument("config")
     est.set_defaults(handler=cmd_estimate)
@@ -517,6 +562,23 @@ def build_parser() -> argparse.ArgumentParser:
     _add_maintenance_commands(sub)
     sub.add_parser("serve", help="run the HTTP API (EVALKIT_HOST, EVALKIT_PORT)")
     return parser
+
+
+def _add_report_commands(sub: Any) -> None:
+    report = sub.add_parser("report", help="reports over groups of runs")
+    report_sub = report.add_subparsers(dest="report_command", required=True)
+    mat = report_sub.add_parser(
+        "matrix", help="a matrix's variants, their cost/quality/latency frontier"
+    )
+    mat.add_argument("matrix", help="matrix id or label:NAME")
+    mat.add_argument("--metric", help="quality metric (default: the first gated one)")
+    mat.add_argument("--latency", choices=["p50", "p95"], default="p50")
+    mat.add_argument("--alpha", type=float, default=0.05, help="significance level")
+    mat.add_argument(
+        "--min-effect", type=float, default=0.0, help="ignore differences smaller than this"
+    )
+    mat.set_defaults(handler=cmd_report)
+    mat.add_argument("--json", action="store_true", help="print JSON instead of a table")
 
 
 def _add_maintenance_commands(sub: Any) -> None:
@@ -645,6 +707,8 @@ def _jsonable(value: Any) -> Any:
 def _extra(value: Any) -> dict[str, Any]:
     if isinstance(value, CompareReport):
         return {"passed": value.passed}
+    if isinstance(value, MatrixReport):
+        return {"complete": value.complete, "frontier": value.frontier}
     if hasattr(value, "max_total_cost_usd"):
         return {"max_total_cost_usd": value.max_total_cost_usd}
     return {}
@@ -679,6 +743,8 @@ def _format_summary(s: RunSummary) -> str:
         f"cache read {s.cache_read_tokens:,}  cache write {s.cache_write_tokens:,}",
         f"cost ${s.cost_usd:.4f} target + ${s.judge_cost_usd:.4f} judge",
     ]
+    if s.matrix_id is not None:
+        lines.append(f"variant {s.variant} of matrix {s.matrix_id}")
     for name, j in s.judges.items():
         where = j["provider"] if j.get("endpoint") is None else f"{j['provider']} ({j['endpoint']})"
         lines.append(f"judge {name}: {j['model']} on {where}, {j['mode']}, effort {j['effort']}")
@@ -732,6 +798,58 @@ def _format_estimate(e: Any) -> str:
         f"at most ${e.max_total_cost_usd:.4f}",
     ]
     lines += [f"note: {n}" for n in e.notes]
+    return "\n".join(lines) + "\n"
+
+
+def _format_matrix_estimate(m: MatrixEstimate) -> str:
+    lines = []
+    for v in m.variants:
+        lines.append(f"variant {v.name}")
+        lines += [f"  {line}" for line in _format_estimate(v.estimate).splitlines()]
+    lines.append(f"matrix of {len(m.variants)} runs: at most ${m.max_total_cost_usd:.4f}")
+    return "\n".join(lines) + "\n"
+
+
+def _money(value: float | None) -> str:
+    if value is None:
+        return "-"
+    return f"${value:.6f}" if value < 0.01 else f"${value:.4f}"
+
+
+def _format_matrix(r: MatrixReport) -> str:
+    width = max([len("variant"), *(len(v.name) for v in r.variants)]) + 2
+    lines = [
+        f"matrix {r.matrix_id}  {r.label or '(no label)'}  "
+        f"dataset {r.dataset} v{r.dataset_version}",
+        f"quality {r.metric}  latency {r.latency}  frontier over {', '.join(r.dimensions)}",
+        "",
+        f"{'variant':<{width}}{'status':<12}{r.metric[:10]:>10}{'95% CI':>18}{'cost/case':>12}"
+        f"{r.latency + ' ms':>9}  frontier",
+    ]
+    for v in r.variants:
+        ci = "-" if v.ci_low is None else f"[{_pct(v.ci_low)}, {_pct(v.ci_high)}]"
+        lat = "-" if v.latency_ms is None else f"{v.latency_ms:.0f}"
+        mark = "*" if v.on_frontier else ""
+        if v.dominated_by:
+            mark = f"dominated by {', '.join(v.dominated_by)}"
+        lines.append(
+            f"{v.name:<{width}}{v.status:<12}{_pct(v.quality):>10}{ci:>18}"
+            f"{_money(v.cost_per_case_usd):>12}{lat:>9}  {mark}"
+        )
+    if r.steps:
+        lines += [
+            "",
+            f"along the frontier, cheapest first (paired; p adjusted by Holm over "
+            f"{len(r.steps)} step(s), alpha {r.alpha}):",
+        ]
+        for step in r.steps:
+            c = step.comparison
+            ci = f"[{c.ci_low * 100:+.1f}, {c.ci_high * 100:+.1f}]"
+            lines.append(
+                f"  {step.baseline} -> {step.candidate}: {c.difference * 100:+.1f}% {ci}  "
+                f"p {c.p_adjusted:.4f}  n {c.n_pairs}  {c.verdict}"
+            )
+    lines += [f"note: {n}" for n in r.notes]
     return "\n".join(lines) + "\n"
 
 

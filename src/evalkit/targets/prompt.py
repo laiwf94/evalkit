@@ -1,16 +1,17 @@
-"""A prompt template evaluated on a Claude model."""
+"""A prompt template evaluated on a model, on any provider."""
 
 from __future__ import annotations
 
 from evalkit.datasets import Case
-from evalkit.providers.anthropic import ClaudeClient
+from evalkit.providers.base import Provider
 from evalkit.targets.base import Generation, Target
 from evalkit.targets.specs import PromptTargetSpec
 from evalkit.targets.template import render
 
 
 class PromptTarget(Target):
-    def __init__(self, spec: PromptTargetSpec, client: ClaudeClient) -> None:
+    def __init__(self, spec: PromptTargetSpec, client: Provider) -> None:
+        # An unknown model would run with no cost accounting; refuse it up front.
         client.prices.require(spec.model)
         # Rate limits and cool-downs are shared per provider.
         self.provider = client.name

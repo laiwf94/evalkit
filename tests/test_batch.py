@@ -210,7 +210,7 @@ def test_batch_mode_requires_a_prompt_target(
     api = FakeBatchApi()
     runner = Runner(sessions, Settings(), claude=api.client(), target_factory=FakeTarget)
     run = runner.create_run(batch_config())
-    with pytest.raises(InvalidInputError, match="only available for prompt targets"):
+    with pytest.raises(InvalidInputError, match="only available for Claude prompt targets"):
         asyncio.run(runner.execute(run.id))
 
 

@@ -30,7 +30,7 @@ from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager
 from dataclasses import asdict, dataclass
 from datetime import datetime
-from typing import Annotated, Any, cast
+from typing import Annotated, Any, Literal, cast
 
 import uvicorn
 from fastapi import APIRouter, Depends, FastAPI, Query, Request, Response
@@ -56,7 +56,8 @@ from evalkit.datasets import (
 )
 from evalkit.db import make_engine, make_session_factory, upgrade
 from evalkit.db.models import Dataset, Result, Run, as_utc, utcnow
-from evalkit.errors import EvalkitError, NotFoundError
+from evalkit.errors import EvalkitError, InvalidInputError, NotFoundError
+from evalkit.frontier import matrix_report
 from evalkit.logs import configure_logging, log_context, scrubber
 from evalkit.pricing import PriceTable
 from evalkit.providers.anthropic import ClaudeClient
@@ -349,6 +350,46 @@ async def cancel_run(run_id: str, svc: Svc) -> dict[str, Any]:
     if svc.worker is not None:
         svc.worker.cancel(run_id)
     return summary
+
+
+@router.post("/matrices", status_code=202)
+async def create_matrix(config: RunConfig, svc: Svc) -> dict[str, Any]:
+    """Queue every run of a ``[matrix]`` config ("matrix" in the body)."""
+    if config.matrix is None:
+        raise InvalidInputError("the body has no matrix; queue a single run with POST /v1/runs")
+    group, runs = await asyncio.to_thread(svc.runner.create_matrix, config, queued=True)
+    svc.wake()
+
+    def load(session: Session) -> dict[str, Any]:
+        return {
+            "matrix_id": group.id,
+            "label": group.label,
+            "runs": [_summary_json(session, r.id) for r in runs],
+        }
+
+    return await _in_session(svc, load)
+
+
+@router.get("/matrices/{matrix_id}")
+async def get_matrix_report(
+    matrix_id: str,
+    svc: Svc,
+    *,
+    metric: Annotated[str | None, Query(max_length=128)] = None,
+    latency: Annotated[Literal["p50", "p95"], Query()] = "p50",
+    alpha: Annotated[float, Query(gt=0, lt=1)] = 0.05,
+    min_effect: Annotated[float, Query(ge=0, le=1)] = 0.0,
+) -> dict[str, Any]:
+    """Every variant with its quality, cost and latency, the Pareto frontier, and
+    paired comparisons along it."""
+
+    def load(session: Session) -> dict[str, Any]:
+        report = matrix_report(
+            session, matrix_id, metric=metric, latency=latency, alpha=alpha, min_effect=min_effect
+        )
+        return {**asdict(report), "complete": report.complete, "frontier": report.frontier}
+
+    return await _in_session(svc, load)
 
 
 @router.post("/compare")

@@ -80,6 +80,8 @@ class RunSummary:
     max_workers: int | None = None
     workers: int = 0  # worker daemons holding a slot on the run now
     judges: dict[str, dict[str, Any]] = field(default_factory=dict)  # by scorer name
+    matrix_id: str | None = None  # the matrix this run is a variant of
+    variant: str | None = None  # its variant name there
 
 
 @dataclass(frozen=True)
@@ -270,6 +272,8 @@ def summarize(session: Session, run_id: str, *, resamples: int = DEFAULT_RESAMPL
         max_workers=run.max_workers,
         workers=runqueue.live_workers(session, run.id, utcnow()),
         judges=run_judges(run),
+        matrix_id=run.matrix_id,
+        variant=str(run.variant["name"]) if run.variant else None,
     )
 
 

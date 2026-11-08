@@ -47,16 +47,22 @@ from sqlalchemy import ColumnElement, case, exists, false, func, or_, select, tr
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, sessionmaker
 
-from evalkit import aggregates, cache, leases, metrics, runqueue
+from evalkit import aggregates, cache, leases, matrix, metrics, runqueue
 from evalkit.blobs import BlobStore
 from evalkit.config import Settings
 from evalkit.datasets import Case, get_dataset, load_cases
-from evalkit.db.models import CaseLease, Dataset, Result, Run, as_utc, utcnow
-from evalkit.errors import ConflictError, EvalkitError, InvalidInputError, NotFoundError
+from evalkit.db.models import CaseLease, Dataset, Matrix, Result, Run, as_utc, utcnow
+from evalkit.errors import (
+    ConflictError,
+    EvalkitError,
+    InvalidInputError,
+    NotFoundError,
+    PreconditionError,
+)
 from evalkit.logs import log_context, scrubber
 from evalkit.pricing import PriceTable
 from evalkit.providers.anthropic import ClaudeClient
-from evalkit.providers.registry import ProviderRegistry
+from evalkit.providers.registry import ANTHROPIC, ProviderRegistry
 from evalkit.ratelimit import (
     Clock,
     Limiters,
@@ -74,6 +80,7 @@ from evalkit.scorers.judge import LLMJudge, identity_changes
 from evalkit.targets import Generation, Target, TargetError, TargetSpec, Usage
 from evalkit.targets.factory import build_target, identity
 from evalkit.targets.prompt import PromptTarget
+from evalkit.targets.specs import PromptTargetSpec
 
 log = logging.getLogger(__name__)
 
@@ -117,6 +124,15 @@ class StoredRun:
             options=RunOptions.model_validate(run.options),
             filter=CaseFilter.model_validate(run.case_filter),
         )
+
+
+@dataclass(frozen=True)
+class _Prepared:
+    """A validated run config, with what its run row records about it."""
+
+    config: RunConfig
+    target_id: str
+    judges: dict[str, Any]
 
 
 class LeaseLostError(EvalkitError):
@@ -277,46 +293,118 @@ class Runner:
     def create_run(self, config: RunConfig, *, queued: bool = False) -> Run:
         """Validate ``config`` against the stored dataset and record the run:
         ``pending`` for this process to execute, or ``queued`` for worker daemons."""
+        if config.matrix is not None:
+            raise InvalidInputError(
+                "a config with a [matrix] table expands into several runs; "
+                "create it as a matrix (API: POST /v1/matrices)"
+            )
+        prepared = self._validate(config)
+        with self.sessions() as session:
+            dataset = get_dataset(session, config.dataset.name, config.dataset.version)
+            cases = self._select(session, dataset, config)
+            run = self._new_run(session, prepared, dataset.id, len(cases), queued=queued)
+            if queued:
+                runqueue.notify(session, "queued", run.id)
+            session.commit()
+            return run
+
+    def create_matrix(self, config: RunConfig, *, queued: bool = False) -> tuple[Matrix, list[Run]]:
+        """Expand a ``[matrix]`` config into its child runs and record them, with
+        the group, in one transaction: every variant is validated (its provider,
+        model price and judges) before any is recorded."""
+        variants = matrix.expand(config)
+        prepared = [(v, self._validate(v.config)) for v in variants]
+        with self.sessions() as session:
+            dataset = get_dataset(session, config.dataset.name, config.dataset.version)
+            total = len(self._select(session, dataset, config))
+            group = Matrix(
+                id=uuid.uuid4().hex,
+                label=config.label,
+                dataset_id=dataset.id,
+                axes=config.matrix.model_dump(mode="json") if config.matrix else {},
+                config=config.model_dump(mode="json", by_alias=True, exclude={"matrix"}),
+                created_at=utcnow(),
+            )
+            session.add(group)
+            session.flush()
+            runs = [
+                self._new_run(
+                    session, p, dataset.id, total, queued=queued, group=group, variant=v.axes()
+                )
+                for v, p in prepared
+            ]
+            if queued:
+                runqueue.notify(session, "queued", runs[0].id)
+            session.commit()
+            return group, runs
+
+    def _validate(self, config: RunConfig) -> _Prepared:
         scorers = build_scorers(
             config.scorers, allow_import_paths=self.allow_import_paths, providers=self.providers
         )
         # What each judge is, frozen with the run: the gate refuses to pair runs whose
         # judges differ, and a later change to a provider's config cannot rewrite this.
         judges = {s.name: s.identity() for s in scorers if isinstance(s, LLMJudge)}
-        target_id = identity(config.target, self.settings.http_endpoints)
-        if config.options.mode == "batch" and config.target.type != "prompt":
-            raise InvalidInputError("batch mode is only available for prompt targets")
-        with self.sessions() as session:
-            dataset = get_dataset(session, config.dataset.name, config.dataset.version)
-            cases = load_cases(session, dataset, config.filter.split, config.filter.tags)
-            if not cases:
-                raise InvalidInputError("the filter selects no cases from the dataset")
-            now = utcnow()
-            run = Run(
-                id=uuid.uuid4().hex,
-                label=config.label,
-                dataset_id=dataset.id,
-                target_spec=config.target.model_dump(mode="json"),
-                target_hash=target_id,
-                scorers=[s.model_dump(mode="json", by_alias=True) for s in config.scorers],
-                judges=judges,
-                options=config.options.model_dump(mode="json"),
-                case_filter=config.filter.model_dump(mode="json"),
-                seed=config.options.seed,
-                status="queued" if queued else "pending",
-                queued_at=now if queued else None,
-                priority=config.queue.priority,
-                # A batch is one paid request for the whole run: one worker at a time.
-                max_workers=1 if config.options.mode == "batch" else config.queue.max_workers,
-                cases_total=len(cases),
-                created_at=now,
-            )
-            session.add(run)
-            session.flush()
-            if queued:
-                runqueue.notify(session, "queued", run.id)
-            session.commit()
-            return run
+        target = config.target
+        target_id = identity(target, self.settings.http_endpoints, self.providers.configs)
+        if isinstance(target, PromptTargetSpec):
+            # An unknown model would run with no cost accounting: refuse it before
+            # recording the run, with the prices the target's provider will use.
+            prices = self.providers.prices
+            if target.provider == ANTHROPIC:
+                claude = self.providers.claude or self.claude
+                prices = claude.prices if claude else PriceTable(self.settings.prices)
+            prices.require(target.model)
+        if config.options.mode == "batch" and not (
+            isinstance(target, PromptTargetSpec) and target.provider == ANTHROPIC
+        ):
+            raise InvalidInputError("batch mode is only available for Claude prompt targets")
+        return _Prepared(config, target_id, judges)
+
+    @staticmethod
+    def _select(session: Session, dataset: Dataset, config: RunConfig) -> list[Case]:
+        cases = load_cases(session, dataset, config.filter.split, config.filter.tags)
+        if not cases:
+            raise InvalidInputError("the filter selects no cases from the dataset")
+        return cases
+
+    @staticmethod
+    def _new_run(
+        session: Session,
+        prepared: _Prepared,
+        dataset_id: int,
+        cases_total: int,
+        *,
+        queued: bool,
+        group: Matrix | None = None,
+        variant: dict[str, Any] | None = None,
+    ) -> Run:
+        config = prepared.config
+        now = utcnow()
+        run = Run(
+            id=uuid.uuid4().hex,
+            label=config.label,
+            dataset_id=dataset_id,
+            target_spec=config.target.model_dump(mode="json"),
+            target_hash=prepared.target_id,
+            scorers=[s.model_dump(mode="json", by_alias=True) for s in config.scorers],
+            judges=prepared.judges,
+            options=config.options.model_dump(mode="json"),
+            case_filter=config.filter.model_dump(mode="json"),
+            seed=config.options.seed,
+            status="queued" if queued else "pending",
+            queued_at=now if queued else None,
+            priority=config.queue.priority,
+            # A batch is one paid request for the whole run: one worker at a time.
+            max_workers=1 if config.options.mode == "batch" else config.queue.max_workers,
+            cases_total=cases_total,
+            created_at=now,
+            matrix_id=group.id if group is not None else None,
+            variant=variant,
+        )
+        session.add(run)
+        session.flush()
+        return run
 
     @property
     def executing(self) -> set[str]:
@@ -552,6 +640,15 @@ class Runner:
         for scorer in scorers:
             if isinstance(scorer, LLMJudge):
                 scorer.limiter = self._limiter(f"{scorer.provider}:judge", RateLimit())
+        if self._target_factory is None:
+            # The same check as for judges: a provider or endpoint whose config moved
+            # since the run was recorded would answer under the old identity.
+            current = identity(config.target, self.settings.http_endpoints, self.providers.configs)
+            if current != run.target_hash:
+                raise PreconditionError(
+                    "the target's provider or endpoint configuration changed since the run "
+                    "was created; start a new run"
+                )
         target = self._build_target(config)
         fingerprint = self.settings.redaction.fingerprint()
         keys = {
@@ -615,8 +712,8 @@ class Runner:
         errored, expired or were cancelled are left to the online workers.
         """
         target = ctx.target
-        if not isinstance(target, PromptTarget):
-            raise InvalidInputError("batch mode is only available for prompt targets")
+        if not (isinstance(target, PromptTarget) and isinstance(target.client, ClaudeClient)):
+            raise InvalidInputError("batch mode is only available for Claude prompt targets")
         client, spec = target.client, target.spec
         handled: set[str] = set()
         failed = 0
@@ -681,7 +778,7 @@ class Runner:
         if self._target_factory is not None:
             return self._target_factory(config.target)
         return build_target(
-            config.target, endpoints=self.settings.http_endpoints, claude=self.claude
+            config.target, endpoints=self.settings.http_endpoints, providers=self.providers
         )
 
     async def _run_case(self, ctx: _Context, case: Case, key: str) -> CaseResult:

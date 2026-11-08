@@ -259,7 +259,7 @@ async def test_background_failures_and_shutdown(sessions: sessionmaker[Session])
         built = asyncio.Event()
 
         def recording_target(spec: Any) -> Any:
-            target = build_target(spec, endpoints={}, claude=None)
+            target = build_target(spec, endpoints={}, providers=svc.runner.providers)
             built.set()
             return target
 

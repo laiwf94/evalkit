@@ -94,10 +94,6 @@ ScorerSpec = Annotated[
 ]
 
 
-def needs_claude(specs: Sequence[ScorerSpec]) -> bool:
-    return any(isinstance(s, JudgeSpec) and s.provider == ANTHROPIC for s in specs)
-
-
 def build_scorers(
     specs: Sequence[ScorerSpec],
     *,

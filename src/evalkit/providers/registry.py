@@ -1,6 +1,6 @@
 """Named providers, configured once per process and built on first use.
 
-A judge (and later a target) names its provider: ``anthropic``, ``openai``,
+A judge or a prompt target names its provider: ``anthropic``, ``openai``,
 ``gemini``, or a server the operator described in ``EVALKIT_PROVIDERS_FILE``:
 
     [providers.local]
@@ -33,9 +33,9 @@ from evalkit.pricing import PriceTable
 from evalkit.providers import gemini, openai_compat
 from evalkit.providers.anthropic import ClaudeClient
 from evalkit.providers.base import Provider
+from evalkit.targets.specs import ANTHROPIC, PROVIDER_NAME
 
-ANTHROPIC = "anthropic"
-PROVIDER_NAME = r"^[a-z0-9][a-z0-9_-]{0,63}$"
+__all__ = ["ANTHROPIC", "PROVIDER_NAME", "ProviderConfig", "ProviderRegistry", "builtin_providers"]
 
 
 class ProviderConfig(BaseModel):
