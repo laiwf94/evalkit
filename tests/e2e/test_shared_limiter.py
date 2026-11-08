@@ -41,10 +41,12 @@ def _worker(job: Job, n: int, gate: Any, results: Any) -> None:
 
     Records each call as (when it started on this machine's clock, the slot the
     limiter reserved for it on the database server's clock). Both clocks are
-    the same kernel's wall clock here, so the two compare directly.
+    the same kernel's wall clock here, so the two compare directly. A cool-down
+    is recorded twice: when the 429 came back, and the server's clock when the
+    cool-down statement ran, which is when it starts to hold the others back.
     """
     calls: list[tuple[float, float]] = []
-    cooled: list[float] = []
+    cooled: list[tuple[float, float]] = []
     engine = make_engine(job.postgres_url)
     limiter = PgRateLimiter(make_session_factory(engine), job.key, job.limit)
     slots: dict[asyncio.Task[Any] | None, float] = {}
@@ -58,6 +60,15 @@ def _worker(job: Job, n: int, gate: Any, results: Any) -> None:
         return reservation
 
     limiter._reserve = recording_reserve  # type: ignore[method-assign]
+    announce = limiter._announce
+    announced: list[float] = []
+
+    async def recording_announce(seconds: float) -> tuple[float, float]:
+        cooldown_until, now = await announce(seconds)
+        announced.append(now)
+        return cooldown_until, now
+
+    limiter._announce = recording_announce  # type: ignore[method-assign]
 
     async def caller(c: int) -> None:
         for i in range(job.per_worker // CALLERS):
@@ -65,8 +76,9 @@ def _worker(job: Job, n: int, gate: Any, results: Any) -> None:
             calls.append((time.time(), slots[asyncio.current_task()]))
             if n == 0 and c == 0 and i == job.cool_down_after:
                 # As if this call had come back 429 with Retry-After: 0.5.
-                cooled.append(time.time())
+                seen = time.time()
                 await limiter.cool_down(0.5)
+                cooled.append((seen, announced[-1]))
 
     async def main() -> None:
         await limiter.acquire()  # creates the row and warms the connection
@@ -85,10 +97,10 @@ def _worker(job: Job, n: int, gate: Any, results: Any) -> None:
 
 def run_workers(
     postgres_url: str, key: str, limit: RateLimit, per_worker: int, cool_down_after: int | None
-) -> tuple[list[tuple[float, float]], list[float]]:
+) -> tuple[list[tuple[float, float]], list[tuple[float, float]]]:
     """Run WORKERS separate processes against one limiter row, as a fleet of
     worker containers would. Returns every call as (start, reserved slot),
-    sorted by start, and the times the cool-down was announced."""
+    sorted by start, and each cool-down as (429 seen, cool-down stored)."""
     ctx = multiprocessing.get_context("spawn")
     gate = ctx.Barrier(WORKERS)
     results = ctx.Queue()
@@ -152,10 +164,16 @@ def test_eight_workers_stay_within_five_percent_of_the_rate(postgres_url: str) -
 def test_a_cool_down_on_one_worker_pauses_all_of_them(postgres_url: str) -> None:
     limit = RateLimit(requests_per_second=100)
     calls, cooled = run_workers(postgres_url, "cool-test", limit, per_worker=20, cool_down_after=2)
-    (at,) = cooled
+    ((seen, at),) = cooled
     starts = [start for start, _ in calls]
-    # Slots reserved before the 429 may still go for up to peek_seconds (0.1 s);
-    # after that nothing starts until the cool-down ends.
+    # The cool-down statement waits its turn behind this worker's admission in
+    # flight, which waits for the row lock; on a loaded machine that can take as
+    # long as the lateness the rate test allows. Until it is stored, the others
+    # rightly keep calling.
+    print(f"\nthe cool-down was stored {(at - seen) * 1000:.1f} ms after the 429")
+    assert 0 <= at - seen < 0.25
+    # Once stored, slots reserved before it may still go for up to peek_seconds
+    # (0.1 s); after that nothing starts until the cool-down ends.
     quiet = [t for t in starts if at + PgRateLimiter.peek_seconds + 0.02 < t < at + 0.5]
     assert quiet == []
     assert any(t >= at + 0.5 for t in starts)
