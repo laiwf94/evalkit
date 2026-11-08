@@ -640,13 +640,15 @@ class Runner:
         for scorer in scorers:
             if isinstance(scorer, LLMJudge):
                 scorer.limiter = self._limiter(f"{scorer.provider}:judge", RateLimit())
-        if self._target_factory is None:
-            # The same check as for judges: a provider or endpoint whose config moved
-            # since the run was recorded would answer under the old identity.
-            current = identity(config.target, self.settings.http_endpoints, self.providers.configs)
+        target_spec = config.target
+        if isinstance(target_spec, PromptTargetSpec) and target_spec.provider != ANTHROPIC:
+            # The same check as for judges: a provider whose base URL moved since the
+            # run was recorded would answer under the old identity. HTTP targets are
+            # not checked: workers may tag their calls with their own headers.
+            current = identity(target_spec, self.settings.http_endpoints, self.providers.configs)
             if current != run.target_hash:
                 raise PreconditionError(
-                    "the target's provider or endpoint configuration changed since the run "
+                    f"provider {target_spec.provider}'s configuration changed since the run "
                     "was created; start a new run"
                 )
         target = self._build_target(config)

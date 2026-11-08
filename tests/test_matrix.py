@@ -530,7 +530,9 @@ def test_queued_matrix_runs_and_a_moved_provider(
             local=ProviderConfig(kind="openai_compat", base_url="http://llm2.test/v1"), gem=GEM
         ),
     )
-    with pytest.raises(PreconditionError, match="configuration changed since the run"):
+    with pytest.raises(
+        PreconditionError, match="provider local's configuration changed since the run"
+    ):
         asyncio.run(moved.execute(runs[1].id))
     assert fakes.bodies("llm.test") == fakes.bodies("llm2.test") == []
     assert asyncio.run(runner.execute(runs[2].id)).status == "completed"

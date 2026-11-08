@@ -65,9 +65,11 @@ target. A Claude prompt target leaves the provider field out of the hash, which
 keeps the hash every Claude target had before targets named a provider, and
 with it every cache entry. It keys the response cache, so a cache hit is only
 possible when nothing that could change the answer changed. A process refuses
-to execute a run whose target, as built from its own provider and endpoint
-configuration, would hash differently from the recorded one, for the same
-reason it refuses a changed judge.
+to execute a run whose prompt target, on a provider other than Claude, would
+hash differently with its own provider configuration than the recorded one, for
+the same reason it refuses a changed judge. HTTP targets are not checked this
+way, since workers may legitimately send their own non-secret headers (the
+container fleet test tags each worker's calls).
 
 ### Runs keep their own config
 
