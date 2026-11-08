@@ -11,6 +11,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import datetime
+from typing import Any
 
 import numpy as np
 from sqlalchemy import select
@@ -19,6 +20,7 @@ from sqlalchemy.orm import Session
 from evalkit import aggregates, runqueue
 from evalkit.db.models import Dataset, Result, Run, as_utc, utcnow
 from evalkit.errors import InvalidInputError, NotFoundError, PreconditionError
+from evalkit.scorers.judge import identity_changes, judge_identity
 from evalkit.stats import (
     DEFAULT_RESAMPLES,
     Comparison,
@@ -77,6 +79,15 @@ class RunSummary:
     priority: int = 0
     max_workers: int | None = None
     workers: int = 0  # worker daemons holding a slot on the run now
+    judges: dict[str, dict[str, Any]] = field(default_factory=dict)  # by scorer name
+
+
+@dataclass(frozen=True)
+class JudgeChange:
+    """A compared metric whose judge is not the same in both runs."""
+
+    metric: str
+    changes: list[str]
 
 
 @dataclass(frozen=True)
@@ -87,6 +98,8 @@ class CompareReport:
     min_effect: float
     comparisons: list[Comparison]
     regressions: list[str] = field(default_factory=list)
+    # Only ever non-empty when the comparison was asked to allow judge changes.
+    judge_changes: list[JudgeChange] = field(default_factory=list)
 
     @property
     def passed(self) -> bool:
@@ -98,6 +111,35 @@ def get_run(session: Session, run_id: str) -> Run:
     if run is None:
         raise NotFoundError(f"run {run_id} not found")
     return run
+
+
+def run_judges(run: Run) -> dict[str, dict[str, Any]]:
+    """Each judge metric's identity: as recorded, or for runs from before judge
+    identities were recorded (all Claude judges), derived from the scorer specs."""
+    if run.judges is not None:
+        return dict(run.judges)
+    out = {}
+    for name, spec in zip(aggregates.metric_names(run), run.scorers, strict=True):
+        if spec.get("type") == "judge":
+            out[name] = judge_identity(
+                provider=str(spec.get("provider", "anthropic")),
+                endpoint=None,
+                model=str(spec.get("model", "claude-opus-5-5")),
+                mode=str(spec.get("mode", "rubric")),
+                effort=str(spec.get("effort", "medium")),
+                rubric=str(spec.get("rubric", "")),
+            )
+    return out
+
+
+def judge_changes(base: Run, cand: Run, metrics: list[str]) -> list[JudgeChange]:
+    base_judges, cand_judges = run_judges(base), run_judges(cand)
+    out = []
+    for metric in metrics:
+        changes = identity_changes(base_judges.get(metric), cand_judges.get(metric))
+        if changes:
+            out.append(JudgeChange(metric, changes))
+    return out
 
 
 def scorer_names(run: Run) -> list[tuple[str, bool]]:
@@ -227,6 +269,7 @@ def summarize(session: Session, run_id: str, *, resamples: int = DEFAULT_RESAMPL
         priority=run.priority,
         max_workers=run.max_workers,
         workers=runqueue.live_workers(session, run.id, utcnow()),
+        judges=run_judges(run),
     )
 
 
@@ -239,8 +282,14 @@ def compare_runs(
     min_effect: float = 0.0,
     metrics: list[str] | None = None,
     resamples: int = DEFAULT_RESAMPLES,
+    allow_judge_change: bool = False,
 ) -> CompareReport:
-    """Paired comparison of two completed runs over the same dataset content."""
+    """Paired comparison of two completed runs over the same dataset content.
+
+    A metric whose judge differs between the runs (provider, endpoint, model,
+    mode, effort or rubric) measures the judge as much as the system under test,
+    so the comparison is refused unless ``allow_judge_change``; when allowed, the
+    report lists what changed."""
     base = get_run(session, baseline_id)
     cand = get_run(session, candidate_id)
     for run in (base, cand):
@@ -265,6 +314,14 @@ def compare_runs(
         selected = [n for n, gate in scorer_names(cand) if gate and n in base_names]
     if not selected:
         raise PreconditionError("the runs have no gated metric in common")
+    changed = judge_changes(base, cand, selected)
+    if changed and not allow_judge_change:
+        detail = "; ".join(f"{c.metric}: {', '.join(c.changes)}" for c in changed)
+        raise PreconditionError(
+            f"the judge changed between the runs ({detail}), so a score change may come "
+            "from the judge; rerun the baseline with the new judge, or pass "
+            "--allow-judge-change (API: allow_judge_change) to compare anyway"
+        )
     base_scores = aggregates.load_scores(session, base, selected)
     cand_scores = aggregates.load_scores(session, cand, selected)
     usable = {
@@ -285,4 +342,5 @@ def compare_runs(
         min_effect=min_effect,
         comparisons=comparisons,
         regressions=[c.metric for c in comparisons if c.verdict == "worse"],
+        judge_changes=changed,
     )

@@ -104,6 +104,12 @@ def kind_for_status(status: int) -> ErrorKind:
             return ErrorKind.UNKNOWN
 
 
+# Each provider's stop reason for an answer that ended on its own, and for one cut
+# off at the output limit: Claude, OpenAI-compatible servers, Gemini.
+FINISHED_STOP_REASONS = frozenset({"end_turn", "stop", "STOP"})
+TRUNCATED_STOP_REASONS = frozenset({"max_tokens", "length", "MAX_TOKENS"})
+
+
 @dataclass(frozen=True)
 class Completion:
     text: str
@@ -114,6 +120,16 @@ class Completion:
 
     def json(self) -> Any:
         return json.loads(self.text)
+
+    @property
+    def finished(self) -> bool:
+        """The model ended the answer itself (not cut off, refused or filtered)."""
+        return self.stop_reason in FINISHED_STOP_REASONS
+
+    @property
+    def truncated(self) -> bool:
+        """The answer was cut off at the output token limit."""
+        return self.stop_reason in TRUNCATED_STOP_REASONS
 
 
 @dataclass(frozen=True)

@@ -1,4 +1,4 @@
-"""LLM-as-judge: a Claude model grades outputs against a rubric.
+"""LLM-as-judge: a model on any configured provider grades outputs against a rubric.
 
 Two modes:
 
@@ -20,6 +20,13 @@ since outputs of the system under test may contain instructions of their own.
 Verdicts are cached like target outputs, keyed by the judge configuration and
 the exact prompt, so rerunning an unchanged target with an unchanged judge
 costs nothing.
+
+The judge can run on any provider (``evalkit.providers.registry``), so a model
+need not grade its own family's answers. What the judge is (provider, endpoint,
+model, mode, effort and rubric) is its identity: each run stores the identity
+of every judge it used, and the gate refuses to compare runs whose judges
+differ, since a score change could then come from the judge rather than the
+system under test.
 """
 
 from __future__ import annotations
@@ -32,8 +39,7 @@ from typing import Any, Literal, Protocol
 from pydantic import BaseModel, Field, ValidationError
 
 from evalkit.datasets import Case, canonical_json, sha256_hex
-from evalkit.providers.anthropic import ClaudeClient
-from evalkit.providers.base import Completion
+from evalkit.providers.base import Completion, Provider
 from evalkit.ratelimit import Limiters, RateLimiter, RetryPolicy, RetryStats, call_with_retries
 from evalkit.scorers.base import Scorer, ScoreResult
 from evalkit.targets.base import TargetError, Usage
@@ -130,12 +136,53 @@ def pair_label(value: float) -> PairLabel:
     return "tie"
 
 
+# The judge fields that change what it grades. max_tokens only decides whether a
+# verdict fits, and a verdict that does not fit is reported, not scored.
+IDENTITY_FIELDS = ("provider", "endpoint", "model", "mode", "effort", "rubric_sha256")
+
+
+def judge_identity(
+    *, provider: str, endpoint: str | None, model: str, mode: str, effort: str, rubric: str
+) -> dict[str, Any]:
+    """What a judge is, as stored with each run that uses it.
+
+    ``fingerprint`` keys cached verdicts and calibrations. For Claude judges it
+    is the hash it has always been, so their existing caches and calibrations
+    stay valid; other providers add their name and endpoint, so an OpenAI and a
+    Gemini model that share a name never share verdicts."""
+    keyed: dict[str, Any] = {"mode": mode, "model": model, "effort": effort, "rubric": rubric}
+    if provider != "anthropic":
+        keyed |= {"provider": provider, "endpoint": endpoint}
+    return {
+        "provider": provider,
+        "endpoint": endpoint,
+        "model": model,
+        "mode": mode,
+        "effort": effort,
+        "rubric_sha256": sha256_hex(rubric),
+        "fingerprint": sha256_hex(canonical_json(keyed)),
+    }
+
+
+def identity_changes(base: dict[str, Any] | None, cand: dict[str, Any] | None) -> list[str]:
+    """How the judge behind a metric differs between two runs, one phrase per field."""
+    if base is None and cand is None:
+        return []
+    if base is None or cand is None:
+        return ["a judge in one run only"]
+    return [
+        f"{f} {base.get(f)} -> {cand.get(f)}" if f != "rubric_sha256" else "rubric changed"
+        for f in IDENTITY_FIELDS
+        if base.get(f) != cand.get(f)
+    ]
+
+
 class LLMJudge(Scorer):
     def __init__(
         self,
         name: str,
         *,
-        client: ClaudeClient,
+        client: Provider,
         rubric: str,
         mode: Mode = "rubric",
         model: str = "claude-opus-5-5",
@@ -144,36 +191,41 @@ class LLMJudge(Scorer):
         retry: RetryPolicy | None = None,
         limiters: Limiters | None = None,
         cache: VerdictCache | None = None,
+        endpoint: str | None = None,
     ) -> None:
         super().__init__(name)
         client.prices.require(model)
         self.client = client
+        self.provider = client.name
+        self.endpoint = endpoint
         self.rubric = rubric
         self.mode = mode
         self.model = model
         self.effort = effort
         self.max_tokens = max_tokens
         self.retry = retry or RetryPolicy()
-        self.limiter: RateLimiter = (limiters or Limiters()).get("anthropic:judge")
+        self.limiter: RateLimiter = (limiters or Limiters()).get(f"{self.provider}:judge")
         self.cache = cache
         template = _RUBRIC_SYSTEM if mode == "rubric" else _PAIRWISE_SYSTEM
         self.system = template.format(rubric=rubric)
 
-    def fingerprint(self) -> str:
-        """Identity of the judge configuration, for calibration records."""
-        return sha256_hex(
-            canonical_json(
-                {
-                    "mode": self.mode,
-                    "model": self.model,
-                    "effort": self.effort,
-                    "rubric": self.rubric,
-                }
-            )
+    def identity(self) -> dict[str, Any]:
+        return judge_identity(
+            provider=self.provider,
+            endpoint=self.endpoint,
+            model=self.model,
+            mode=self.mode,
+            effort=self.effort,
+            rubric=self.rubric,
         )
+
+    def fingerprint(self) -> str:
+        """Identity of the judge configuration, for cached verdicts and calibrations."""
+        return str(self.identity()["fingerprint"])
 
     def spec(self) -> dict[str, Any]:
         return {
+            "provider": self.provider,
             "mode": self.mode,
             "model": self.model,
             "effort": self.effort,
@@ -209,7 +261,7 @@ class LLMJudge(Scorer):
             policy=self.retry,
             stats=RetryStats(),
         )
-        if self.cache is not None and completion.stop_reason == "end_turn":
+        if self.cache is not None and completion.finished:
             await self.cache.put(key, self.fingerprint(), completion.text, asdict(completion.usage))
         return completion
 
@@ -282,7 +334,7 @@ class LLMJudge(Scorer):
 def _parse(completion: Completion, model: type[BaseModel]) -> Any:
     if completion.stop_reason == "refusal":
         return "judge declined to grade this case"
-    if completion.stop_reason == "max_tokens":
+    if completion.truncated:
         return "judge ran out of output tokens; raise max_tokens"
     try:
         return model.model_validate_json(completion.text)

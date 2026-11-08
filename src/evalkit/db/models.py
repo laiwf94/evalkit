@@ -94,6 +94,9 @@ class Run(Base):
     target_spec: Mapped[dict[str, Any]] = mapped_column()
     target_hash: Mapped[str] = mapped_column(String(64))
     scorers: Mapped[list[Any]] = mapped_column()
+    # Identity of each judge scorer, by scorer name (``evalkit.scorers.judge``);
+    # None for runs created before identities were recorded.
+    judges: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
     options: Mapped[dict[str, Any]] = mapped_column()
     case_filter: Mapped[dict[str, Any]] = mapped_column(default=dict)
     seed: Mapped[int] = mapped_column(BigInteger)

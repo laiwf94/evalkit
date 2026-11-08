@@ -7,6 +7,8 @@ full ``max_tokens``. Cases already in the response cache cost nothing. For a
 judge, the response it will read is not known yet either; its input count
 includes the prompt without the response, plus the target's ``max_tokens`` as
 an upper bound on the response length when the target is a Claude prompt.
+Judges count on their own provider; one whose provider has no counting
+endpoint gets a note instead of an input cost.
 """
 
 from __future__ import annotations
@@ -22,6 +24,8 @@ from evalkit.datasets import Case, get_dataset, load_cases
 from evalkit.errors import InvalidInputError
 from evalkit.pricing import TokenCounts
 from evalkit.providers.anthropic import ClaudeClient
+from evalkit.providers.base import ErrorKind, Provider, ProviderError
+from evalkit.providers.registry import ProviderRegistry
 from evalkit.ratelimit import Limiters, RetryStats, call_with_retries
 from evalkit.runspec import RunConfig
 from evalkit.scorers import build_scorers
@@ -61,10 +65,13 @@ async def estimate(
     config: RunConfig,
     claude: ClaudeClient,
     *,
+    providers: ProviderRegistry | None = None,
     concurrency: int = 8,
 ) -> Estimate:
     target_id = identity(config.target, settings.http_endpoints)
-    scorers = build_scorers(config.scorers, allow_import_paths=True, claude=claude)
+    scorers = build_scorers(
+        config.scorers, allow_import_paths=True, claude=claude, providers=providers
+    )
     judges = [s for s in scorers if isinstance(s, LLMJudge)]
     with sessions() as session:
         dataset = get_dataset(session, config.dataset.name, config.dataset.version)
@@ -78,14 +85,14 @@ async def estimate(
     batch = config.options.mode == "batch"
     result = Estimate(cases=len(cases), cached_cases=len(cases) - len(uncached), batch=batch)
 
-    limiter = Limiters({"anthropic": config.options.rate_limit}).get("anthropic")
+    limiters = Limiters({"anthropic": config.options.rate_limit})
     gate = asyncio.Semaphore(concurrency)
 
-    async def count(model: str, prompt: str, system: str) -> int:
+    async def count(model: str, prompt: str, system: str, client: Provider = claude) -> int:
         async with gate:
             return await call_with_retries(
-                lambda: claude.count_tokens(model=model, prompt=prompt, system=system),
-                limiter=limiter,
+                lambda: client.count_tokens(model=model, prompt=prompt, system=system),
+                limiter=limiters.get(client.name),
                 policy=config.options.retry,
                 stats=RetryStats(),
             )
@@ -114,13 +121,26 @@ async def estimate(
     for judge in judges:
         # Every case is judged, cached or not, because a rerun scores again.
         prompts = [p for c in cases for p in _judge_prompts(judge, c)]
-        counts = await asyncio.gather(*(count(judge.model, p, judge.system) for p in prompts))
+        result.judge_calls += len(prompts)
+        result.judge_max_output_cost_usd += judge.client.prices.cost(
+            judge.model, TokenCounts(output_tokens=judge.max_tokens * len(prompts))
+        )
+        try:
+            counts = await asyncio.gather(
+                *(count(judge.model, p, judge.system, judge.client) for p in prompts)
+            )
+        except ProviderError as exc:
+            if exc.kind is not ErrorKind.UNSUPPORTED:
+                raise
+            result.notes.append(
+                f"judge {judge.name}: {judge.provider} cannot count tokens, "
+                "so its input cost is not included"
+            )
+            continue
         tokens = sum(counts) + response_bound * len(counts)
-        result.judge_calls += len(counts)
         result.judge_input_tokens += tokens
-        result.judge_input_cost_usd += prices.cost(judge.model, TokenCounts(input_tokens=tokens))
-        result.judge_max_output_cost_usd += prices.cost(
-            judge.model, TokenCounts(output_tokens=judge.max_tokens * len(counts))
+        result.judge_input_cost_usd += judge.client.prices.cost(
+            judge.model, TokenCounts(input_tokens=tokens)
         )
     return result
 

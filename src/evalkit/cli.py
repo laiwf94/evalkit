@@ -52,12 +52,13 @@ from evalkit.estimate import estimate
 from evalkit.logs import configure_logging, scrubber
 from evalkit.pricing import PriceTable
 from evalkit.providers.anthropic import ClaudeClient
+from evalkit.providers.registry import ProviderRegistry
 from evalkit.report import CompareReport, RunSummary, compare_runs, summarize
 from evalkit.runner import Runner
 from evalkit.runspec import RunConfig
 from evalkit.scorers.calibration import calibrate, parse_labels, save_calibration
-from evalkit.scorers.judge import LLMJudge
-from evalkit.scorers.registry import JudgeSpec
+from evalkit.scorers.registry import JudgeSpec, judge_from_spec
+from evalkit.scorers.registry import needs_claude as judges_need_claude
 from evalkit.worker import Worker, listen_url
 
 VERIFY = "verify"
@@ -73,7 +74,7 @@ class CliError(Exception):
 
 
 class App:
-    """Settings, database and an on-demand Claude client for one command."""
+    """Settings, database and on-demand provider clients for one command."""
 
     def __init__(self, settings: Settings, out: TextIO) -> None:
         self.settings = settings
@@ -83,6 +84,18 @@ class App:
             upgrade(self.engine)
         self.sessions: sessionmaker[Session] = make_session_factory(self.engine)
         self._claude: ClaudeClient | None = None
+        self._providers: ProviderRegistry | None = None
+
+    def providers(self) -> ProviderRegistry:
+        """Every configured provider. The Claude client is made only if a judge
+        uses it, so a run with no Claude model does not need ANTHROPIC_API_KEY."""
+        if self._providers is None:
+            self._providers = ProviderRegistry(
+                self.settings.provider_configs(),
+                PriceTable(self.settings.prices),
+                claude_factory=self.claude,
+            )
+        return self._providers
 
     def claude(self) -> ClaudeClient:
         if self._claude is None:
@@ -96,10 +109,13 @@ class App:
             self.sessions,
             self.settings,
             claude=self.claude() if needs_claude else None,
+            providers=self.providers(),
             allow_import_paths=allow_import_paths,
         )
 
     async def aclose(self) -> None:
+        if self._providers is not None:
+            await self._providers.aclose()
         if self._claude is not None:
             await self._claude.aclose()
         self.engine.dispose()
@@ -122,7 +138,7 @@ def load_run_config(path: Path, app: App) -> RunConfig:
 
 
 def needs_claude(config: RunConfig) -> bool:
-    return config.target.type == "prompt" or any(s.type == "judge" for s in config.scorers)
+    return config.target.type == "prompt" or judges_need_claude(config.scorers)
 
 
 def resolve_run(session: Session, ref: str) -> str:
@@ -154,7 +170,8 @@ async def cmd_run(args: argparse.Namespace, app: App) -> int:
             if run is None:
                 raise NotFoundError(f"run {args.resume} not found")
             claude = run.target_spec.get("type") == "prompt" or any(
-                s.get("type") == "judge" for s in run.scorers
+                s.get("type") == "judge" and s.get("provider", "anthropic") == "anthropic"
+                for s in run.scorers
             )
         run_id = args.resume
         runner = app.runner(claude)
@@ -361,12 +378,15 @@ def _compare(args: argparse.Namespace, app: App) -> CompareReport:
             alpha=args.alpha,
             min_effect=args.min_effect,
             metrics=args.metric or None,
+            allow_judge_change=args.allow_judge_change,
         )
 
 
 async def cmd_estimate(args: argparse.Namespace, app: App) -> int:
     config = load_run_config(Path(args.config), app)
-    result = await estimate(app.sessions, app.settings, config, app.claude())
+    result = await estimate(
+        app.sessions, app.settings, config, app.claude(), providers=app.providers()
+    )
     _emit(app.out, result, args.json, _format_estimate)
     return EXIT_OK
 
@@ -380,15 +400,7 @@ async def cmd_calibrate(args: argparse.Namespace, app: App) -> int:
         spec = JudgeSpec.model_validate({"type": "judge", **table})
     except ValidationError as exc:
         raise CliError(f"{args.judge}: {_describe(exc)}", EXIT_INPUT) from None
-    judge = LLMJudge(
-        spec.resolved_name(),
-        client=app.claude(),
-        rubric=spec.rubric,
-        mode=spec.mode,
-        model=spec.model,
-        effort=spec.effort,
-        max_tokens=spec.max_tokens,
-    )
+    judge = judge_from_spec(spec, app.providers())
     items = parse_labels(_read_bytes(Path(args.labels)), spec.mode)
     report = await calibrate(judge, items, concurrency=args.concurrency)
     with app.sessions() as session:
@@ -485,6 +497,11 @@ def build_parser() -> argparse.ArgumentParser:
             "--min-effect", type=float, default=0.0, help="ignore differences smaller than this"
         )
         p.add_argument("--metric", action="append", help="metric to compare (repeatable)")
+        p.add_argument(
+            "--allow-judge-change",
+            action="store_true",
+            help="compare even if a metric's judge (provider, model, effort, rubric) changed",
+        )
         p.set_defaults(handler=handler)
 
     est = with_json(sub.add_parser("estimate", help="estimate the cost of a run config"))
@@ -662,6 +679,9 @@ def _format_summary(s: RunSummary) -> str:
         f"cache read {s.cache_read_tokens:,}  cache write {s.cache_write_tokens:,}",
         f"cost ${s.cost_usd:.4f} target + ${s.judge_cost_usd:.4f} judge",
     ]
+    for name, j in s.judges.items():
+        where = j["provider"] if j.get("endpoint") is None else f"{j['provider']} ({j['endpoint']})"
+        lines.append(f"judge {name}: {j['model']} on {where}, {j['mode']}, effort {j['effort']}")
     if s.latency_p50_ms is not None:
         lines.append(f"latency p50 {s.latency_p50_ms:.0f} ms  p95 {s.latency_p95_ms:.0f} ms")
     if s.error:
@@ -696,6 +716,8 @@ def _format_compare(r: CompareReport) -> str:
             f"{c.metric:<16}{_pct(c.baseline_mean):>8}{_pct(c.candidate_mean):>8}"
             f"{c.difference * 100:>+8.1f}%{ci:>22}{c.p_adjusted:>10.4f}{dz:>7}  {c.verdict}"
         )
+    for change in r.judge_changes:
+        lines.append(f"warning: judge changed for {change.metric}: {', '.join(change.changes)}")
     lines += ["", "PASS: no regression" if r.passed else f"FAIL: {', '.join(r.regressions)}"]
     return "\n".join(lines) + "\n"
 

@@ -18,7 +18,9 @@ from jsonschema.exceptions import SchemaError
 from pydantic import BaseModel, ConfigDict, Field, JsonValue
 
 from evalkit.errors import InvalidInputError
+from evalkit.pricing import PriceTable
 from evalkit.providers.anthropic import ClaudeClient
+from evalkit.providers.registry import ANTHROPIC, PROVIDER_NAME, ProviderRegistry
 from evalkit.scorers.base import Scorer
 from evalkit.scorers.builtin import ExactMatch, JsonSchemaMatch, NumericMatch, RegexMatch, TokenF1
 from evalkit.scorers.judge import LLMJudge
@@ -71,6 +73,8 @@ class TokenF1Spec(_Spec):
 
 class JudgeSpec(_Spec):
     type: Literal["judge"]
+    # A name from the provider registry: anthropic, openai, gemini or a configured server.
+    provider: str = Field(default=ANTHROPIC, pattern=PROVIDER_NAME)
     mode: Literal["rubric", "pairwise"] = "rubric"
     rubric: str = Field(min_length=1, max_length=20_000)
     model: str = Field(default="claude-opus-5-5", min_length=1, max_length=64)
@@ -90,22 +94,33 @@ ScorerSpec = Annotated[
 ]
 
 
+def needs_claude(specs: Sequence[ScorerSpec]) -> bool:
+    return any(isinstance(s, JudgeSpec) and s.provider == ANTHROPIC for s in specs)
+
+
 def build_scorers(
     specs: Sequence[ScorerSpec],
     *,
     allow_import_paths: bool,
     claude: ClaudeClient | None = None,
+    providers: ProviderRegistry | None = None,
 ) -> list[Scorer]:
+    """Scorer objects for ``specs``. Judges get their client from ``providers``;
+    without one, only Claude judges can be built, on ``claude``."""
+    if providers is None:
+        providers = ProviderRegistry({}, PriceTable(), claude=claude)
     if not specs:
         raise InvalidInputError("at least one scorer is required")
     names = [s.resolved_name() for s in specs]
     duplicates = sorted({n for n in names if names.count(n) > 1})
     if duplicates:
         raise InvalidInputError(f"scorer names must be unique; repeated: {', '.join(duplicates)}")
-    return [_build(spec, allow_import_paths=allow_import_paths, claude=claude) for spec in specs]
+    return [
+        _build(spec, allow_import_paths=allow_import_paths, providers=providers) for spec in specs
+    ]
 
 
-def _build(spec: ScorerSpec, *, allow_import_paths: bool, claude: ClaudeClient | None) -> Scorer:
+def _build(spec: ScorerSpec, *, allow_import_paths: bool, providers: ProviderRegistry) -> Scorer:
     name = spec.resolved_name()
     try:
         match spec:
@@ -136,19 +151,7 @@ def _build(spec: ScorerSpec, *, allow_import_paths: bool, claude: ClaudeClient |
             case TokenF1Spec():
                 return TokenF1(name, expected_key=spec.expected_key)
             case JudgeSpec():
-                if claude is None:
-                    raise InvalidInputError(
-                        f"scorer {name}: the judge needs the Claude API; set ANTHROPIC_API_KEY"
-                    )
-                return LLMJudge(
-                    name,
-                    client=claude,
-                    rubric=spec.rubric,
-                    mode=spec.mode,
-                    model=spec.model,
-                    effort=spec.effort,
-                    max_tokens=spec.max_tokens,
-                )
+                return judge_from_spec(spec, providers, name)
             case PluginSpec():
                 return _load_plugin(spec, name, allow_import_paths=allow_import_paths)
     except SchemaError as exc:
@@ -156,6 +159,25 @@ def _build(spec: ScorerSpec, *, allow_import_paths: bool, claude: ClaudeClient |
     except regex.error as exc:
         raise InvalidInputError(f"scorer {name}: invalid pattern: {exc}") from None
     raise InvalidInputError(f"unknown scorer type for {name}")  # pragma: no cover
+
+
+def judge_from_spec(spec: JudgeSpec, providers: ProviderRegistry, name: str = "") -> LLMJudge:
+    name = name or spec.resolved_name()
+    try:
+        client = providers.get(spec.provider)
+        endpoint = providers.endpoint(spec.provider)
+    except InvalidInputError as exc:
+        raise InvalidInputError(f"scorer {name}: {exc.message}") from None
+    return LLMJudge(
+        name,
+        client=client,
+        endpoint=endpoint,
+        rubric=spec.rubric,
+        mode=spec.mode,
+        model=spec.model,
+        effort=spec.effort,
+        max_tokens=spec.max_tokens,
+    )
 
 
 def _load_plugin(spec: PluginSpec, name: str, *, allow_import_paths: bool) -> Scorer:

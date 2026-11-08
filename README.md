@@ -85,7 +85,12 @@ Scorers grade each answer by exact match, regex, JSON Schema, numeric
 tolerance, token F1, or an LLM judge with a rubric. The pairwise judge runs
 every comparison twice with the answers swapped, so a judge that prefers a
 position cannot decide the result, and judges are calibrated against human
-labels with Cohen's kappa. Your own scorers plug in through an entry point.
+labels with Cohen's kappa. A judge can run on Claude, OpenAI, Gemini or any
+OpenAI-compatible server (`provider = "openai"`, keys in `OPENAI_API_KEY` and
+`GEMINI_API_KEY`, other servers named in `EVALKIT_PROVIDERS_FILE`), so a model
+need not grade its own family. Each run records which judge graded it, and the
+gate refuses to compare runs whose judges differ unless given
+`--allow-judge-change`. Your own scorers plug in through an entry point.
 
 ## During a run
 
@@ -138,7 +143,7 @@ size; Holm correction applies when several metrics are gated together.
 | `evalkit show RUN` | Summary of a run. |
 | `evalkit run verify RUN_ID [--repair]` | Recompute a run's aggregates and score arrays from its results; exit 3 on any difference, or rewrite them with `--repair`. |
 | `evalkit compare BASE CAND` | Paired comparison per metric. |
-| `evalkit gate BASE CAND` | Same, and exit 1 if any gated metric is worse. |
+| `evalkit gate BASE CAND [--allow-judge-change]` | Same, and exit 1 if any gated metric is worse; exit 3 if a metric's judge changed, unless allowed. |
 | `evalkit estimate CONFIG` | Cost estimate from token counts. |
 | `evalkit calibrate --judge J LABELS` | Judge agreement with human labels. |
 | `evalkit dataset import/export/list` | Manage datasets. |
@@ -149,7 +154,7 @@ size; Holm correction applies when several metrics are gated together.
 `RUN` is a run id or `label:NAME` for the newest completed run with that
 label. Exit codes: 0 success, 1 regression, 2 bad input, 3 the run cannot be
 used (failed, incomplete, a batch-mode run held by another process, different
-datasets) or any
+datasets, a changed judge) or any
 other error, 130 interrupted. Commands that print a report take `--json`.
 
 ## Running it as a service
@@ -271,7 +276,8 @@ src/evalkit/targets/       prompt, HTTP (SSRF-safe) and fake targets; templates
 src/evalkit/scorers/       built-in scorers, plugin registry, LLM judge, calibration
 src/evalkit/providers/     the Provider protocol and error kinds; the Claude client (caching,
                            structured output, fallback, cost); raw HTTP OpenAI-compatible
-                           and Gemini clients (JSON schema output, usage, safety blocks)
+                           and Gemini clients (JSON schema output, usage, safety blocks);
+                           the registry of named providers judges use
 src/evalkit/runner.py      worker pool, cache, resume, run completion, batch mode, cancel, drain
 src/evalkit/cache.py       response cache: keys, last use, sweep by age and size, blob offload
 src/evalkit/blobs.py       content-addressed blobs: filesystem and S3 backends, signing, GC

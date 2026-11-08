@@ -519,7 +519,53 @@ can agree 80% of the time with people who give 5 to 80% of cases, with kappa 0.
 As a rough guide, below 0.4 a judge should not gate a merge; 0.6-0.8 is
 substantial agreement (Landis & Koch, *The Measurement of Observer Agreement for
 Categorical Data*). Results are stored per judge configuration hash (mode,
-model, effort, rubric), so a rubric edit is visibly uncalibrated.
+model, effort, rubric, and for judges not on Claude the provider and its
+endpoint), so a rubric edit is visibly uncalibrated.
+
+### Judges on any provider
+
+A judge names its provider: `anthropic` (the default), the built-in `openai`
+and `gemini`, or a server the operator lists in `EVALKIT_PROVIDERS_FILE` as
+`[providers.<name>]` with a `kind` (`openai_compat` or `gemini`), a `base_url`
+and optionally `api_key_env`, the variable that holds its key. Only configured
+names can be used, so a run config sent to the API cannot point a judge at an
+arbitrary URL. `providers/registry.py` builds one client per name on first use,
+so a CLI run judged on Gemini needs no Claude key. The judge reads stop reasons
+through `Completion.finished` and `Completion.truncated`, which know each
+provider's spelling (`end_turn`, `stop`, `STOP`; `max_tokens`, `length`,
+`MAX_TOKENS`), so a verdict is cached only when the model ended it itself and a
+cut-off verdict is reported, not scored. Rate limits are keyed `<provider>:judge`.
+
+The fingerprint that keys cached verdicts and calibrations is unchanged for
+Claude judges, so existing caches and calibrations stay valid. Other providers
+add their name and endpoint to it, so an OpenAI model and a model on a
+self-hosted server that share a name never share verdicts.
+
+### Judge identity and the gate
+
+A score is a property of the system under test and of the judge that graded it.
+If a candidate run is graded by a different judge than its baseline, a
+"regression" may be the new judge being stricter. So each run stores, in
+`runs.judges`, the identity of every judge scorer when it is created: provider,
+endpoint, model, mode, effort, a SHA-256 of the rubric, and the fingerprint.
+Runs from before this column existed only had Claude judges, and their
+identity is derived from their scorer specs, which gives exactly the identity a
+new run with the same judge records.
+
+`compare_runs` checks every compared metric: if its judge differs between the
+two runs (or only one run has a judge behind that name) the comparison is
+refused, naming each field that changed, unless `--allow-judge-change` (API:
+`allow_judge_change`) is given; then the report lists the changes and the CLI
+prints them as warnings. A refusal is exit 3, "cannot be compared", not exit 1,
+"regression", because nothing is known about the system under test. Metrics
+without a judge, such as an exact match, can still be compared with `--metric`.
+`max_tokens` is not part of the identity: it only decides whether a verdict
+fits, and one that does not fit is reported as unscorable.
+
+A process also refuses to execute a run whose judges, as built from its own
+provider configuration, differ from the recorded ones. Without this, a worker
+whose `local` provider points at another server would grade part of a run with
+a different judge than the rest.
 
 ## Deciding whether a change is real
 

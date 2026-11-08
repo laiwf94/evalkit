@@ -28,7 +28,11 @@ a silent precedence rule.
     EVALKIT_BLOB_REGION         S3 signing region (default us-east-1)
     EVALKIT_BLOB_MIN_BYTES      cached outputs this long go to the blob store (default 64 KiB)
     EVALKIT_BLOB_GRACE          garbage collection keeps unreferenced blobs this new (default 1h)
+    EVALKIT_PROVIDERS_FILE      TOML [providers.<name>] tables: OpenAI-compatible and Gemini
+                                servers judges may call (see ``evalkit.providers.registry``)
     ANTHROPIC_API_KEY           Claude API key (secret)
+    OPENAI_API_KEY              key for the built-in ``openai`` provider (secret)
+    GEMINI_API_KEY              key for the built-in ``gemini`` provider (secret)
 """
 
 from __future__ import annotations
@@ -46,6 +50,7 @@ from pydantic import BaseModel, ConfigDict, Field, SecretStr, ValidationError
 
 from evalkit.blobs import BlobStore, open_store
 from evalkit.pricing import ModelPrice
+from evalkit.providers.registry import PROVIDER_NAME, ProviderConfig, builtin_providers
 from evalkit.redaction import RedactionConfig
 from evalkit.targets.http import HttpEndpoint
 
@@ -74,6 +79,9 @@ class Settings(BaseModel):
     log_level: LogLevel = "INFO"
     lease_seconds: float = Field(default=30.0, ge=2, le=3600)
     anthropic_api_key: SecretStr | None = None
+    openai_api_key: SecretStr | None = None
+    gemini_api_key: SecretStr | None = None
+    providers: dict[str, ProviderConfig] = Field(default_factory=dict)
     redaction: RedactionConfig = RedactionConfig()
     prices: dict[str, ModelPrice] = Field(default_factory=dict)
     http_endpoints: dict[str, HttpEndpoint] = Field(default_factory=dict)
@@ -104,9 +112,15 @@ class Settings(BaseModel):
         except ValueError:
             return False
 
+    def provider_configs(self) -> dict[str, ProviderConfig]:
+        """The built-in providers, overridden or extended by ``EVALKIT_PROVIDERS_FILE``."""
+        return {**builtin_providers(self.openai_api_key, self.gemini_api_key), **self.providers}
+
     def secret_values(self) -> list[str]:
         """Raw secret strings the log scrubber must never let through."""
-        values = [self.anthropic_api_key.get_secret_value()] if self.anthropic_api_key else []
+        keys = (self.anthropic_api_key, self.openai_api_key, self.gemini_api_key)
+        values = [k.get_secret_value() for k in keys if k]
+        values.extend(p.api_key.get_secret_value() for p in self.providers.values() if p.api_key)
         for endpoint in self.http_endpoints.values():
             values.extend(v.get_secret_value() for v in endpoint.secret_headers.values())
         values.extend(
@@ -160,9 +174,14 @@ class Settings(BaseModel):
         tokens = read_secret(env, "EVALKIT_API_TOKENS")
         if tokens is not None:
             values["api_token_digests"] = _token_digests(tokens)
-        key = read_secret(env, "ANTHROPIC_API_KEY")
-        if key is not None:
-            values["anthropic_api_key"] = SecretStr(key)
+        for var, field in (
+            ("ANTHROPIC_API_KEY", "anthropic_api_key"),
+            ("OPENAI_API_KEY", "openai_api_key"),
+            ("GEMINI_API_KEY", "gemini_api_key"),
+        ):
+            key = read_secret(env, var)
+            if key is not None:
+                values[field] = SecretStr(key)
 
         redaction_file = env.get("EVALKIT_REDACTION_FILE", "").strip()
         if redaction_file:
@@ -173,6 +192,9 @@ class Settings(BaseModel):
         endpoints_file = env.get("EVALKIT_HTTP_TARGETS_FILE", "").strip()
         if endpoints_file:
             values["http_endpoints"] = _endpoints(env, load_toml_table(endpoints_file, "endpoints"))
+        providers_file = env.get("EVALKIT_PROVIDERS_FILE", "").strip()
+        if providers_file:
+            values["providers"] = _providers(env, load_toml_table(providers_file, "providers"))
 
         try:
             settings = cls.model_validate(values)
@@ -281,6 +303,32 @@ def _endpoints(env: Mapping[str, str], table: dict[str, object]) -> dict[str, ob
             resolved[header] = value
         endpoint["secret_headers"] = resolved
         out[name] = endpoint
+    return out
+
+
+def _providers(env: Mapping[str, str], table: dict[str, object]) -> dict[str, object]:
+    """Provider configs with ``api_key_env`` resolved to the key it names."""
+    out: dict[str, object] = {}
+    for name, raw in table.items():
+        if not re.fullmatch(PROVIDER_NAME, name) or name == "anthropic":
+            raise ConfigError(
+                f"provider name {name!r} must match {PROVIDER_NAME} and not be 'anthropic'"
+            )
+        if not isinstance(raw, dict):
+            raise ConfigError(f"providers.{name} must be a table")
+        provider = dict(raw)
+        if "api_key" in provider or "key_required" in provider:
+            raise ConfigError(
+                f"providers.{name}: give the key with api_key_env, the variable that holds it"
+            )
+        var = provider.get("api_key_env")
+        if var is not None:
+            key = read_secret(env, str(var))
+            if key is None:
+                raise ConfigError(f"providers.{name}: the key needs {var} or {var}_FILE")
+            provider["api_key"] = key
+            provider["key_required"] = True
+        out[name] = provider
     return out
 
 

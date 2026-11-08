@@ -60,6 +60,7 @@ from evalkit.errors import EvalkitError, NotFoundError
 from evalkit.logs import configure_logging, log_context, scrubber
 from evalkit.pricing import PriceTable
 from evalkit.providers.anthropic import ClaudeClient
+from evalkit.providers.registry import ProviderRegistry
 from evalkit.report import compare_runs, summarize
 from evalkit.runner import Runner
 from evalkit.runspec import RunConfig
@@ -151,6 +152,8 @@ class CompareRequest(BaseModel):
     alpha: float = Field(default=0.05, gt=0, lt=1)
     min_effect: float = Field(default=0.0, ge=0, le=1)
     metrics: list[str] | None = Field(default=None, max_length=32)
+    # Compare even when a metric's judge differs between the runs.
+    allow_judge_change: bool = False
 
 
 def _iso(value: datetime | None) -> str | None:
@@ -358,6 +361,7 @@ async def compare(body: CompareRequest, svc: Svc) -> dict[str, Any]:
             alpha=body.alpha,
             min_effect=body.min_effect,
             metrics=body.metrics,
+            allow_judge_change=body.allow_judge_change,
         )
         return {**asdict(report), "passed": report.passed}
 
@@ -467,7 +471,12 @@ def create_app(
     if sessions is None:
         sessions = make_session_factory(make_engine(settings.database_url))
     claude_client = claude or ClaudeClient(PriceTable(settings.prices), settings.anthropic_api_key)
-    runner = Runner(sessions, settings, claude=claude_client, allow_import_paths=False)
+    providers = ProviderRegistry(
+        settings.provider_configs(), PriceTable(settings.prices), claude=claude_client
+    )
+    runner = Runner(
+        sessions, settings, claude=claude_client, providers=providers, allow_import_paths=False
+    )
     worker = None
     if settings.max_active_runs:
         worker = Worker(
@@ -490,6 +499,7 @@ def create_app(
             stop.set()
             if serving is not None:
                 await serving
+            await providers.aclose()
             await claude_client.aclose()
 
     app = FastAPI(title="evalkit", version="1", lifespan=lifespan, docs_url=None, redoc_url=None)

@@ -54,7 +54,9 @@ from evalkit.datasets import Case, get_dataset, load_cases
 from evalkit.db.models import CaseLease, Dataset, Result, Run, as_utc, utcnow
 from evalkit.errors import ConflictError, EvalkitError, InvalidInputError, NotFoundError
 from evalkit.logs import log_context, scrubber
+from evalkit.pricing import PriceTable
 from evalkit.providers.anthropic import ClaudeClient
+from evalkit.providers.registry import ProviderRegistry
 from evalkit.ratelimit import (
     Clock,
     Limiters,
@@ -68,7 +70,7 @@ from evalkit.ratelimit_pg import PgRateLimiter
 from evalkit.redaction import Redactor
 from evalkit.runspec import CaseFilter, RunConfig, RunOptions
 from evalkit.scorers import Scorer, ScoreResult, ScorerSpec, build_scorers
-from evalkit.scorers.judge import LLMJudge
+from evalkit.scorers.judge import LLMJudge, identity_changes
 from evalkit.targets import Generation, Target, TargetError, TargetSpec, Usage
 from evalkit.targets.factory import build_target, identity
 from evalkit.targets.prompt import PromptTarget
@@ -224,6 +226,7 @@ class Runner:
         settings: Settings,
         *,
         claude: ClaudeClient | None = None,
+        providers: ProviderRegistry | None = None,
         clock: Clock | None = None,
         owner: str | None = None,
         allow_import_paths: bool = False,
@@ -238,6 +241,12 @@ class Runner:
         self.blobs = blob_store if blob_store is not None else settings.open_blob_store()
         self.settings = settings
         self.claude = claude
+        # Judges reach their provider through the registry. One the runner builds
+        # itself has HTTP clients that ``aclose`` shuts; one passed in belongs to the caller.
+        self._owns_providers = providers is None
+        self.providers = providers or ProviderRegistry(
+            settings.provider_configs(), PriceTable(settings.prices), claude=claude
+        )
         self.clock = clock or RealClock()
         self.owner = owner or new_owner_id()
         self.allow_import_paths = allow_import_paths
@@ -261,12 +270,19 @@ class Runner:
             threading.Lock() if _dialect(sessions) == "sqlite" else contextlib.nullcontext()
         )
 
+    async def aclose(self) -> None:
+        if self._owns_providers:
+            await self.providers.aclose()
+
     def create_run(self, config: RunConfig, *, queued: bool = False) -> Run:
         """Validate ``config`` against the stored dataset and record the run:
         ``pending`` for this process to execute, or ``queued`` for worker daemons."""
-        build_scorers(
-            config.scorers, allow_import_paths=self.allow_import_paths, claude=self.claude
+        scorers = build_scorers(
+            config.scorers, allow_import_paths=self.allow_import_paths, providers=self.providers
         )
+        # What each judge is, frozen with the run: the gate refuses to pair runs whose
+        # judges differ, and a later change to a provider's config cannot rewrite this.
+        judges = {s.name: s.identity() for s in scorers if isinstance(s, LLMJudge)}
         target_id = identity(config.target, self.settings.http_endpoints)
         if config.options.mode == "batch" and config.target.type != "prompt":
             raise InvalidInputError("batch mode is only available for prompt targets")
@@ -283,6 +299,7 @@ class Runner:
                 target_spec=config.target.model_dump(mode="json"),
                 target_hash=target_id,
                 scorers=[s.model_dump(mode="json", by_alias=True) for s in config.scorers],
+                judges=judges,
                 options=config.options.model_dump(mode="json"),
                 case_filter=config.filter.model_dump(mode="json"),
                 seed=config.options.seed,
@@ -525,15 +542,16 @@ class Runner:
         cases, done = await asyncio.to_thread(self._load_cases, run, config)
         pending = {c.id: c for c in cases if c.id not in done}
         scorers = build_scorers(
-            config.scorers, allow_import_paths=self.allow_import_paths, claude=self.claude
+            config.scorers, allow_import_paths=self.allow_import_paths, providers=self.providers
         )
+        _check_judges(run, scorers)
         if config.options.use_cache:
             for scorer in scorers:
                 if isinstance(scorer, LLMJudge):
                     scorer.cache = cache.VerdictStore(self.sessions)
         for scorer in scorers:
             if isinstance(scorer, LLMJudge):
-                scorer.limiter = self._limiter("anthropic:judge", RateLimit())
+                scorer.limiter = self._limiter(f"{scorer.provider}:judge", RateLimit())
         target = self._build_target(config)
         fingerprint = self.settings.redaction.fingerprint()
         keys = {
@@ -1090,6 +1108,23 @@ async def wait_for_any(
         for waiter in waiters:
             waiter.cancel()
         await asyncio.gather(*waiters, return_exceptions=True)
+
+
+def _check_judges(run: Run, scorers: Sequence[Scorer]) -> None:
+    """Refuse to execute a run with judges other than the ones it recorded: a
+    worker whose provider config differs (another endpoint behind the same name)
+    would otherwise grade part of the run with a different judge."""
+    if run.judges is None:
+        return  # created before judge identities were recorded
+    for scorer in scorers:
+        if not isinstance(scorer, LLMJudge):
+            continue
+        changes = identity_changes(run.judges.get(scorer.name), scorer.identity())
+        if changes:
+            raise InvalidInputError(
+                f"judge {scorer.name} here is not the judge the run recorded "
+                f"({'; '.join(changes)}); check this process's provider configuration"
+            )
 
 
 def _dialect(sessions: sessionmaker[Session]) -> str | None:
