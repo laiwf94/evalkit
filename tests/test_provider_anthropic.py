@@ -300,7 +300,7 @@ def test_prices_file(tmp_path: Path) -> None:
     f = tmp_path / "prices.toml"
     f.write_text("[prices.my-model]\ninput = 1.5\noutput = 3\n")
     s = Settings.from_env({"EVALKIT_PRICES_FILE": str(f)})
-    assert s.prices["my-model"].input == 1.5
+    assert s.price_book().table("anthropic").require("my-model").input == 1.5
     f.write_text("[prices.my-model]\ninput = -1\noutput = 3\n")
     with pytest.raises(ConfigError, match="invalid configuration"):
         Settings.from_env({"EVALKIT_PRICES_FILE": str(f)})

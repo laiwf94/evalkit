@@ -9,11 +9,17 @@ A judge or a prompt target names its provider: ``anthropic``, ``openai``,
     api_key_env = "LOCAL_LLM_KEY"      # optional; a variable or LOCAL_LLM_KEY_FILE
     output_limit_field = "max_tokens"  # older servers
     reasoning_effort = false
+    price_list = "openai"              # optional; a proxy in front of a priced API
 
 Only configured names can be used, so a run config sent to the API cannot
 point a judge at an arbitrary URL. ``openai`` and ``gemini`` are built in, with
 their public endpoints and keys from ``OPENAI_API_KEY`` and ``GEMINI_API_KEY``;
 the file can redefine them, for example to go through a proxy.
+
+Each provider prices its models from its own table in the ``PriceBook``:
+``anthropic``, ``openai`` and ``gemini`` start from their built-in lists, and a
+server from the file starts from the list it names in ``price_list``, or from
+none (``EVALKIT_PRICES_FILE`` then has to price the models it serves).
 
 Each name gets one client for the life of the registry. The Claude client is
 passed in (or made on first use by a factory) by whoever owns it, the CLI or
@@ -29,7 +35,7 @@ import httpx2
 from pydantic import BaseModel, ConfigDict, Field, SecretStr, field_validator
 
 from evalkit.errors import InvalidInputError
-from evalkit.pricing import PriceTable
+from evalkit.pricing import PRICE_LISTS, PriceBook, PriceTable
 from evalkit.providers import gemini, openai_compat
 from evalkit.providers.anthropic import ClaudeClient
 from evalkit.providers.base import Provider
@@ -54,6 +60,16 @@ class ProviderConfig(BaseModel):
     reasoning_effort: bool = False
     thinking_level: bool = False
     timeout_seconds: float = Field(default=600.0, gt=0, le=3600)
+    # The built-in price list this server's models start from (default: the
+    # provider's own, which only ``openai`` and ``gemini`` have).
+    price_list: str | None = Field(default=None, max_length=64)
+
+    @field_validator("price_list")
+    @classmethod
+    def _known_list(cls, value: str | None) -> str | None:
+        if value is not None and value not in PRICE_LISTS:
+            raise ValueError(f"unknown price list {value!r}; built in: {', '.join(PRICE_LISTS)}")
+        return value
 
     @field_validator("base_url")
     @classmethod
@@ -96,7 +112,7 @@ class ProviderRegistry:
     def __init__(
         self,
         configs: Mapping[str, ProviderConfig],
-        prices: PriceTable,
+        prices: PriceBook,
         *,
         claude: ClaudeClient | None = None,
         claude_factory: Callable[[], ClaudeClient] | None = None,
@@ -105,7 +121,7 @@ class ProviderRegistry:
         if ANTHROPIC in configs:
             raise InvalidInputError(f"the provider name {ANTHROPIC!r} is reserved for Claude")
         self.configs = dict(configs)
-        self.prices = prices  # for the HTTP providers; Claude keeps its own table
+        self.prices = prices
         self.claude = claude
         self._claude_factory = claude_factory
         self._transport = transport
@@ -119,6 +135,14 @@ class ProviderRegistry:
         if name == ANTHROPIC:
             return None
         return self._config(name).endpoint
+
+    def price_table(self, name: str) -> PriceTable:
+        """The prices provider ``name`` charges by, without building its client."""
+        if name == ANTHROPIC:
+            if self.claude is not None:
+                return self.claude.prices
+            return self.prices.table(ANTHROPIC)
+        return self.prices.table(name, self._config(name).price_list)
 
     def get(self, name: str) -> Provider:
         if name == ANTHROPIC:
@@ -147,7 +171,7 @@ class ProviderRegistry:
             raise InvalidInputError(f"provider {name} needs a key; set {config.api_key_env}")
         if config.kind == "gemini":
             return gemini.GeminiClient(
-                self.prices,
+                self.price_table(name),
                 config.api_key,
                 name=name,
                 base_url=config.base_url,
@@ -156,7 +180,7 @@ class ProviderRegistry:
                 transport=self._transport,
             )
         return openai_compat.OpenAICompatClient(
-            self.prices,
+            self.price_table(name),
             config.api_key,
             name=name,
             base_url=config.base_url,

@@ -3,7 +3,7 @@ import pytest
 
 from evalkit.datasets import canonical_json, sha256_hex
 from evalkit.errors import InvalidInputError
-from evalkit.pricing import ModelPrice, PriceTable
+from evalkit.pricing import ModelPrice, PriceBook
 from evalkit.providers.openai_compat import OpenAICompatClient
 from evalkit.providers.registry import ProviderConfig, ProviderRegistry
 from evalkit.targets import FakeTargetSpec, HttpTargetSpec, PromptTargetSpec, target_hash
@@ -21,7 +21,7 @@ MOVED = ProviderConfig(kind="openai_compat", base_url="http://llm2.test/v1")
 def registry(claude: bool = True) -> ProviderRegistry:
     return ProviderRegistry(
         {"local": LOCAL},
-        PriceTable({"gpt-test": ModelPrice(input=1.0, output=2.0)}),
+        PriceBook({"gpt-test": ModelPrice(input=1.0, output=2.0)}),
         claude=FakeAnthropic().client() if claude else None,
         transport=httpx2.MockTransport(lambda r: httpx2.Response(500)),
     )

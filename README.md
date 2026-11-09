@@ -160,7 +160,32 @@ only the digest in the database; every read checks the bytes against it.
 
 Tokens and dollars are counted per case and per run, including prompt cache
 reads and writes and judge calls, and `evalkit estimate` prices a run before
-you start it, using the token counting endpoint.
+you start it, using the provider's token counting endpoint. OpenAI-compatible
+servers have none, so their input tokens are estimated from the text's length
+and the estimate says so (`~1,234 tokens (estimated)`).
+
+Each provider prices from its own versioned list (`anthropic@2026-11-09`,
+`openai@2026-11-09`, `gemini@2026-11-09`). `EVALKIT_PRICES_FILE` overrides or
+extends them, with `[prices.<model>]` for every provider or
+`[prices.<provider>.<model>]` for one; a self-hosted server prices nothing until
+it gets a table there or names a list with `price_list = "openai"` in
+`EVALKIT_PROVIDERS_FILE`:
+
+```toml
+[prices.local."llama-3.3-70b"]   # a server named local in EVALKIT_PROVIDERS_FILE
+input = 0.0
+output = 0.0
+
+[prices.openai."gpt-5"]          # a negotiated price
+input = 1.0
+output = 8.0
+cache_read = 0.1
+```
+
+An override changes the table's version (`openai@2026-11-09+local.1a2b3c4d`).
+A run records the version and the price of every model it uses, `evalkit show`
+prints them, and a worker whose prices for those models differ refuses to
+execute the run, so one run's costs never mix two price lists.
 
 Outputs are redacted (emails, phone numbers, card numbers, keys and your own
 patterns) before they are stored or shown to the judge. Keys come from the
@@ -318,7 +343,12 @@ with stable codes: `invalid_argument` 400, `unauthenticated` 401, `not_found`
 
 No test calls the real API. The Claude client is exercised through the real SDK
 over a fake HTTP transport that checks the exact request body; one opt-in test
-(`pytest -m live`) makes a real call when `ANTHROPIC_API_KEY` is set.
+(`pytest -m live`) makes a real call when `ANTHROPIC_API_KEY` is set. The
+OpenAI-compatible and Gemini clients run against `tests/fake_openai.py` and
+`tests/fake_gemini.py`, which refuse any request a strict server would (an
+unknown field, a second output limit, a system message out of place, a JSON
+schema without the JSON MIME type, a wrong key) with the API's own error, and
+tests compare the bodies they received with the exact bodies expected.
 
 | What | How |
 |---|---|
@@ -387,6 +417,8 @@ src/evalkit/worker.py      the worker daemon: LISTEN/NOTIFY wake-up, heartbeats,
 src/evalkit/stats.py       bootstrap, permutation test, effect size, Holm
 src/evalkit/aggregates.py  per-run aggregates, latency histograms, score arrays, run verify
 src/evalkit/report.py      run summaries and comparisons
+src/evalkit/pricing.py     versioned per-provider price lists, overrides, run price records,
+                           token estimates for providers that cannot count
 src/evalkit/estimate.py    cost estimates from token counts
 src/evalkit/ratelimit.py   GCRA limiter, cool-downs, retries
 src/evalkit/ratelimit_pg.py  the same limiter shared through PostgreSQL

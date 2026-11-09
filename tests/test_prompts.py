@@ -23,7 +23,7 @@ from evalkit.db import models
 from evalkit.db.models import Prompt, PromptVersion, Run
 from evalkit.errors import ConflictError, InvalidInputError, NotFoundError
 from evalkit.estimate import estimate, estimate_matrix
-from evalkit.pricing import PriceTable
+from evalkit.pricing import PriceBook
 from evalkit.prompts import (
     content_hash,
     diff,
@@ -328,7 +328,7 @@ def test_a_target_names_a_prompt_or_a_template() -> None:
 
 def test_an_unresolved_prompt_never_runs() -> None:
     spec = PromptTargetSpec.model_validate({"type": "prompt", "prompt": "support"})
-    providers = ProviderRegistry({}, PriceTable(), claude=FakeAnthropic().client())
+    providers = ProviderRegistry({}, PriceBook(), claude=FakeAnthropic().client())
     with pytest.raises(InvalidInputError, match="must be resolved"):
         build_target(spec, endpoints={}, providers=providers)
     # Unresolved references never hash alike, whatever they would resolve to.
@@ -405,7 +405,7 @@ def runner(sessions: sessionmaker[Session], fake: FakeAnthropic) -> Runner:
         push(s, V1, note="first")
         push(s, V2, note="one word")
         move_label(s, "support", "production", 1, expected=None)
-    providers = ProviderRegistry({}, PriceTable(), claude=fake.client())
+    providers = ProviderRegistry({}, PriceBook(), claude=fake.client())
     return Runner(sessions, Settings(), providers=providers)
 
 

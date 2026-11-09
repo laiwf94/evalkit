@@ -5,8 +5,9 @@ import asyncio
 import functools
 import io
 import json
+from collections.abc import Iterator
 from pathlib import Path
-from typing import Any
+from typing import Any, ClassVar
 
 import httpx2
 import pytest
@@ -22,7 +23,7 @@ from evalkit.db import make_engine, upgrade
 from evalkit.db.models import Run
 from evalkit.errors import InvalidInputError, PreconditionError
 from evalkit.estimate import estimate
-from evalkit.pricing import ModelPrice, PriceTable
+from evalkit.pricing import ModelPrice, PriceBook, PriceTable, estimate_tokens
 from evalkit.providers.base import Completion
 from evalkit.providers.gemini import GeminiClient
 from evalkit.providers.openai_compat import OpenAICompatClient
@@ -31,9 +32,12 @@ from evalkit.ratelimit import RetryPolicy
 from evalkit.report import compare_runs, run_judges, summarize
 from evalkit.runner import Runner
 from evalkit.runspec import RunConfig
-from evalkit.scorers.judge import LLMJudge, identity_changes, judge_identity
+from evalkit.scorers import build_scorers
+from evalkit.scorers.judge import RUBRIC_SCHEMA, LLMJudge, identity_changes, judge_identity
 from evalkit.targets.base import Usage
 from tests.fake_anthropic import FakeAnthropic, json_reply, message
+from tests.fake_gemini import FakeGemini, generated
+from tests.fake_openai import FakeOpenAI, chat_response
 
 PRICES = {
     "gpt-test": ModelPrice(input=2.0, output=8.0),
@@ -46,52 +50,51 @@ GEM = ProviderConfig(kind="gemini", base_url="http://gemini.test/v1beta")
 
 
 class Server:
-    """One mock HTTP server for every provider: answers by host."""
+    """The OpenAI-compatible and Gemini fakes behind one transport, answering
+    every judge with the same verdict. Each fake checks the exact shape of the
+    requests it gets; ``no_rejected_requests`` fails a test that sent a bad one."""
+
+    instances: ClassVar[list["Server"]] = []
 
     def __init__(self) -> None:
         self.requests: list[httpx2.Request] = []
         self.score = 5
         self.finish = {"llm.test": "stop", "gemini.test": "STOP"}
+        self.openai = FakeOpenAI("http://llm.test/v1", api_key=None, answer=self._chat)
+        self.gemini = FakeGemini("http://gemini.test/v1beta", api_key=None, answer=self._generate)
+        Server.instances.append(self)
+
+    def _verdict(self) -> str:
+        return json.dumps({"reasoning": "fine", "score": self.score})
+
+    def _chat(self, body: dict[str, Any]) -> httpx2.Response:
+        return chat_response(self._verdict(), model="gpt-test", finish=self.finish["llm.test"])
+
+    def _generate(self, model: str, body: dict[str, Any]) -> httpx2.Response:
+        return generated(self._verdict(), model=model, finish=self.finish["gemini.test"])
 
     def handle(self, request: httpx2.Request) -> httpx2.Response:
         self.requests.append(request)
-        verdict = json.dumps({"reasoning": "fine", "score": self.score})
-        if request.url.host == "gemini.test":
-            return httpx2.Response(
-                200,
-                json={
-                    "candidates": [
-                        {
-                            "content": {"role": "model", "parts": [{"text": verdict}]},
-                            "finishReason": self.finish["gemini.test"],
-                        }
-                    ],
-                    "usageMetadata": {"promptTokenCount": 100, "candidatesTokenCount": 10},
-                    "modelVersion": "gemini-test",
-                },
-            )
-        return httpx2.Response(
-            200,
-            json={
-                "model": "gpt-test",
-                "choices": [
-                    {
-                        "message": {"role": "assistant", "content": verdict},
-                        "finish_reason": self.finish["llm.test"],
-                    }
-                ],
-                "usage": {"prompt_tokens": 100, "completion_tokens": 10},
-            },
-        )
+        fake = self.gemini if request.url.host == "gemini.test" else self.openai
+        return fake.handle(request)
 
     def bodies(self, host: str) -> list[Any]:
         return [json.loads(r.content) for r in self.requests if r.url.host == host]
 
 
+@pytest.fixture(autouse=True)
+def no_rejected_requests() -> Iterator[None]:
+    Server.instances.clear()
+    yield
+    for server in Server.instances:
+        assert server.openai.rejected == [], server.openai.rejected
+        assert server.gemini.rejected == [], server.gemini.rejected
+
+
 def registry(server: Server, **configs: ProviderConfig) -> ProviderRegistry:
     return ProviderRegistry(
         configs or {"local": LOCAL, "gem": GEM},
-        PriceTable(PRICES),
+        PriceBook(PRICES),
         claude=FakeAnthropic(json_reply(message('{"reasoning": "ok", "score": 3}'))).client(),
         transport=httpx2.MockTransport(server.handle),
     )
@@ -157,37 +160,36 @@ def http_judge(server: Server, provider: str, model: str, **kw: Any) -> LLMJudge
 def test_openai_compatible_judge_sends_the_rubric_and_a_strict_schema() -> None:
     server = Server()
     server.score = 4
-    result = asyncio.run(http_judge(server, "local", "gpt-test").score(CASE, "Paris."))
+    judge = http_judge(server, "local", "gpt-test")
+    result = asyncio.run(judge.score(CASE, "Paris."))
     assert result.value == 0.75
     assert result.detail == "4/5: fine"
     assert result.cost_usd == pytest.approx((100 * 2.0 + 10 * 8.0) / 1e6)
-    (body,) = server.bodies("llm.test")
-    assert body["model"] == "gpt-test"
-    system, user = body["messages"]
-    assert system["role"] == "system"
-    assert "<rubric>\nThe answer is correct.\n</rubric>" in system["content"]
-    assert user["content"].endswith("<response>\nParis.\n</response>")
-    fmt = body["response_format"]
-    assert fmt["type"] == "json_schema"
-    assert fmt["json_schema"]["strict"] is True
-    assert fmt["json_schema"]["schema"]["required"] == ["reasoning", "score"]
+    (prompt,) = judge.prompts(CASE, "Paris.")
+    assert "<rubric>\nThe answer is correct.\n</rubric>" in judge.system
+    assert prompt.endswith("<response>\nParis.\n</response>")
+    assert server.bodies("llm.test") == [
+        {
+            "model": "gpt-test",
+            "messages": [
+                {"role": "system", "content": judge.system},
+                {"role": "user", "content": prompt},
+            ],
+            "max_completion_tokens": judge.max_tokens,
+            "response_format": {
+                "type": "json_schema",
+                "json_schema": {"name": "output", "schema": RUBRIC_SCHEMA, "strict": True},
+            },
+        }
+    ]
 
 
 def test_gemini_judge_in_pairwise_mode() -> None:
     server = Server()
-
-    def pairwise(request: httpx2.Request) -> httpx2.Response:
-        server.requests.append(request)
-        text = json.dumps({"reasoning": "same", "winner": "tie"})
-        return httpx2.Response(
-            200,
-            json={
-                "candidates": [{"content": {"parts": [{"text": text}]}, "finishReason": "STOP"}],
-                "usageMetadata": {"promptTokenCount": 50, "candidatesTokenCount": 5},
-            },
-        )
-
-    server.handle = pairwise  # type: ignore[method-assign]
+    tie = json.dumps({"reasoning": "same", "winner": "tie"})
+    server.gemini.answer = lambda model, body: generated(
+        tie, model=model, prompt_tokens=50, output_tokens=5
+    )
     judge = http_judge(server, "gem", "gemini-test", mode="pairwise")
     result = asyncio.run(judge.score(CASE, "Paris"))
     assert result.value == 0.5
@@ -305,7 +307,7 @@ def test_registry_builds_each_provider_once_and_closes_what_it_built() -> None:
     claude = FakeAnthropic().client()
     reg = ProviderRegistry(
         {"local": LOCAL, "gem": GEM},
-        PriceTable(),
+        PriceBook(),
         claude=claude,
         transport=httpx2.MockTransport(server.handle),
     )
@@ -324,7 +326,7 @@ def test_registry_builds_each_provider_once_and_closes_what_it_built() -> None:
 
 
 def test_registry_errors() -> None:
-    reg = ProviderRegistry(Settings.from_env({}).provider_configs(), PriceTable())
+    reg = ProviderRegistry(Settings.from_env({}).provider_configs(), PriceBook())
     with pytest.raises(InvalidInputError, match="ANTHROPIC_API_KEY"):
         reg.get("anthropic")
     with pytest.raises(InvalidInputError, match="unknown provider 'nope'; configured: anthropic"):
@@ -336,7 +338,7 @@ def test_registry_errors() -> None:
     with pytest.raises(InvalidInputError, match="set GEMINI_API_KEY"):
         reg.get("gemini")
     with pytest.raises(InvalidInputError, match="reserved"):
-        ProviderRegistry({"anthropic": LOCAL}, PriceTable())
+        ProviderRegistry({"anthropic": LOCAL}, PriceBook())
 
 
 def test_registry_makes_the_claude_client_only_when_asked() -> None:
@@ -347,7 +349,7 @@ def test_registry_makes_the_claude_client_only_when_asked() -> None:
         made.append(1)
         return fake.client()
 
-    reg = ProviderRegistry({"local": LOCAL}, PriceTable(), claude_factory=factory)
+    reg = ProviderRegistry({"local": LOCAL}, PriceBook(), claude_factory=factory)
     reg.get("local")
     assert made == []
     claude = reg.get("anthropic")
@@ -580,7 +582,7 @@ def test_estimate_counts_each_judge_on_its_own_provider(
     server = Server()
     providers = ProviderRegistry(
         {"local": LOCAL},
-        PriceTable(PRICES),
+        PriceBook(PRICES),
         claude=claude,
         transport=httpx2.MockTransport(server.handle),
     )
@@ -590,10 +592,31 @@ def test_estimate_counts_each_judge_on_its_own_provider(
     )
     result = asyncio.run(estimate(sessions, settings(), config, claude, providers=providers))
     assert result.judge_calls == 24
-    assert result.judge_input_tokens == 12 * 40
+    # The Claude judge is counted; the local judge is estimated from text length.
+    local = next(
+        s
+        for s in build_scorers(config.scorers, allow_import_paths=True, providers=providers)
+        if s.name == "quality"
+    )
+    assert isinstance(local, LLMJudge)
+    estimated = sum(
+        estimate_tokens(p, local.system)
+        for i in range(12)
+        for p in local.prompts(Case(id=f"c{i:02d}", input={"q": f"q{i}"}, expected=f"a{i}"), "")
+    )
+    assert result.judge_input_tokens == 12 * 40 + estimated
+    assert result.judge_input_estimated
+    assert not result.target_input_estimated
+    assert result.price_versions == {
+        "anthropic": claude.prices.version,
+        "local": PriceBook(PRICES).table("local").version,
+    }
+    assert result.price_versions["anthropic"] == "anthropic@2026-11-09"
+    assert result.price_versions["local"].startswith("none@none+local.")
     assert result.notes == [
         "the fake target's own cost is not estimated",
-        "judge quality: local cannot count tokens, so its input cost is not included",
+        "judge quality: local cannot count tokens; its input tokens are estimated "
+        "from the text's length",
     ]
     assert result.judge_max_output_cost_usd == pytest.approx(
         12 * 4096 * 8.0 / 1e6 + 12 * 4096 * 20.0 / 1e6

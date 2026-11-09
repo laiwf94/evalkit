@@ -52,7 +52,6 @@ from evalkit.estimate import MatrixEstimate, estimate, estimate_matrix
 from evalkit.frontier import MatrixReport, matrix_report
 from evalkit.logs import configure_logging, scrubber
 from evalkit.matrix import child_runs, resolve_matrix
-from evalkit.pricing import PriceTable
 from evalkit.prompts import (
     LabelMove,
     diff,
@@ -65,7 +64,7 @@ from evalkit.prompts import (
     resolve,
 )
 from evalkit.providers.anthropic import ClaudeClient
-from evalkit.providers.registry import ProviderRegistry
+from evalkit.providers.registry import ANTHROPIC, ProviderRegistry
 from evalkit.report import CompareReport, RunSummary, compare_runs, summarize
 from evalkit.runner import Runner
 from evalkit.runspec import RunConfig
@@ -104,7 +103,7 @@ class App:
         if self._providers is None:
             self._providers = ProviderRegistry(
                 self.settings.provider_configs(),
-                PriceTable(self.settings.prices),
+                self.settings.price_book(),
                 claude_factory=self.claude,
             )
         return self._providers
@@ -112,7 +111,7 @@ class App:
     def claude(self) -> ClaudeClient:
         if self._claude is None:
             self._claude = ClaudeClient(
-                PriceTable(self.settings.prices), self.settings.anthropic_api_key
+                self.settings.price_book().table(ANTHROPIC), self.settings.anthropic_api_key
             )
         return self._claude
 
@@ -888,6 +887,11 @@ def _format_summary(s: RunSummary) -> str:
     for name, j in s.judges.items():
         where = j["provider"] if j.get("endpoint") is None else f"{j['provider']} ({j['endpoint']})"
         lines.append(f"judge {name}: {j['model']} on {where}, {j['mode']}, effort {j['effort']}")
+    for provider, entry in sorted((s.prices or {}).items()):
+        models = "; ".join(
+            f"{m} in {p['input']:g} out {p['output']:g}" for m, p in sorted(entry["models"].items())
+        )
+        lines.append(f"prices {provider} {entry['version']}: {models} (USD per 1M tokens)")
     if s.latency_p50_ms is not None:
         lines.append(f"latency p50 {s.latency_p50_ms:.0f} ms  p95 {s.latency_p95_ms:.0f} ms")
     if s.error:
@@ -931,14 +935,27 @@ def _format_compare(r: CompareReport) -> str:
 def _format_estimate(e: Any) -> str:
     lines = [
         f"cases {e.cases} ({e.cached_cases} cached){'  batch pricing' if e.batch else ''}",
-        f"target input  {e.target_input_tokens:,} tokens  ${e.target_input_cost_usd:.4f}",
+        f"target input  {_approx(e.target_input_estimated)}{e.target_input_tokens:,} tokens"
+        f"{_estimated(e.target_input_estimated)}  ${e.target_input_cost_usd:.4f}",
         f"target output up to ${e.target_max_output_cost_usd:.4f}",
-        f"judge calls {e.judge_calls}  input {e.judge_input_tokens:,} tokens  "
+        f"judge calls {e.judge_calls}  input {_approx(e.judge_input_estimated)}"
+        f"{e.judge_input_tokens:,} tokens{_estimated(e.judge_input_estimated)}  "
         f"${e.judge_input_cost_usd:.4f}  output up to ${e.judge_max_output_cost_usd:.4f}",
-        f"at most ${e.max_total_cost_usd:.4f}",
+        f"at most {_approx(e.target_input_estimated or e.judge_input_estimated)}"
+        f"${e.max_total_cost_usd:.4f}",
     ]
+    if e.price_versions:
+        lines.append("prices " + "  ".join(f"{p} {v}" for p, v in sorted(e.price_versions.items())))
     lines += [f"note: {n}" for n in e.notes]
     return "\n".join(lines) + "\n"
+
+
+def _approx(estimated: bool) -> str:
+    return "~" if estimated else ""
+
+
+def _estimated(estimated: bool) -> str:
+    return " (estimated)" if estimated else ""
 
 
 def _format_matrix_estimate(m: MatrixEstimate) -> str:

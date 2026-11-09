@@ -60,7 +60,6 @@ from evalkit.db.models import Dataset, Result, Run, as_utc, utcnow
 from evalkit.errors import EvalkitError, InvalidInputError, NotFoundError
 from evalkit.frontier import matrix_report
 from evalkit.logs import configure_logging, log_context, scrubber
-from evalkit.pricing import PriceTable
 from evalkit.prompts import (
     Resolved,
     diff,
@@ -74,7 +73,7 @@ from evalkit.prompts import (
     versions_of,
 )
 from evalkit.providers.anthropic import ClaudeClient
-from evalkit.providers.registry import ProviderRegistry
+from evalkit.providers.registry import ANTHROPIC, ProviderRegistry
 from evalkit.report import compare_runs, summarize
 from evalkit.runner import Runner
 from evalkit.runspec import RunConfig
@@ -656,10 +655,9 @@ def create_app(
 ) -> FastAPI:
     if sessions is None:
         sessions = make_session_factory(make_engine(settings.database_url))
-    claude_client = claude or ClaudeClient(PriceTable(settings.prices), settings.anthropic_api_key)
-    providers = ProviderRegistry(
-        settings.provider_configs(), PriceTable(settings.prices), claude=claude_client
-    )
+    book = settings.price_book()
+    claude_client = claude or ClaudeClient(book.table(ANTHROPIC), settings.anthropic_api_key)
+    providers = ProviderRegistry(settings.provider_configs(), book, claude=claude_client)
     runner = Runner(
         sessions, settings, claude=claude_client, providers=providers, allow_import_paths=False
     )

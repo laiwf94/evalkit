@@ -60,7 +60,7 @@ from evalkit.errors import (
     PreconditionError,
 )
 from evalkit.logs import log_context, scrubber
-from evalkit.pricing import PriceTable
+from evalkit.pricing import PriceTable, price_changes, price_record
 from evalkit.providers.anthropic import ClaudeClient
 from evalkit.providers.registry import ANTHROPIC, ProviderRegistry
 from evalkit.ratelimit import (
@@ -133,6 +133,7 @@ class _Prepared:
     config: RunConfig
     target_id: str
     judges: dict[str, Any]
+    prices: dict[str, Any]
 
 
 class LeaseLostError(EvalkitError):
@@ -261,7 +262,7 @@ class Runner:
         # itself has HTTP clients that ``aclose`` shuts; one passed in belongs to the caller.
         self._owns_providers = providers is None
         self.providers = providers or ProviderRegistry(
-            settings.provider_configs(), PriceTable(settings.prices), claude=claude
+            settings.provider_configs(), settings.price_book(), claude=claude
         )
         self.clock = clock or RealClock()
         self.owner = owner or new_owner_id()
@@ -365,19 +366,24 @@ class Runner:
         judges = {s.name: s.identity() for s in scorers if isinstance(s, LLMJudge)}
         target = config.target
         target_id = identity(target, self.settings.http_endpoints, self.providers.configs)
+        uses = [(s.provider, s.client.prices, s.model) for s in scorers if isinstance(s, LLMJudge)]
         if isinstance(target, PromptTargetSpec):
             # An unknown model would run with no cost accounting: refuse it before
             # recording the run, with the prices the target's provider will use.
-            prices = self.providers.prices
-            if target.provider == ANTHROPIC:
-                claude = self.providers.claude or self.claude
-                prices = claude.prices if claude else PriceTable(self.settings.prices)
+            prices = self._price_table(target.provider)
             prices.require(target.model)
+            uses.insert(0, (target.provider, prices, target.model))
         if config.options.mode == "batch" and not (
             isinstance(target, PromptTargetSpec) and target.provider == ANTHROPIC
         ):
             raise InvalidInputError("batch mode is only available for Claude prompt targets")
-        return _Prepared(config, target_id, judges)
+        # The prices the run is costed at, frozen with it like its judges.
+        return _Prepared(config, target_id, judges, price_record(uses))
+
+    def _price_table(self, provider: str) -> PriceTable:
+        if provider == ANTHROPIC and self.providers.claude is None and self.claude is not None:
+            return self.claude.prices
+        return self.providers.price_table(provider)
 
     @staticmethod
     def _select(session: Session, dataset: Dataset, config: RunConfig) -> list[Case]:
@@ -408,6 +414,7 @@ class Runner:
             target_hash=prepared.target_id,
             scorers=[s.model_dump(mode="json", by_alias=True) for s in config.scorers],
             judges=prepared.judges,
+            prices=prepared.prices,
             options=config.options.model_dump(mode="json"),
             case_filter=config.filter.model_dump(mode="json"),
             seed=config.options.seed,
@@ -672,6 +679,7 @@ class Runner:
                     "was created; start a new run"
                 )
         target = self._build_target(config)
+        _check_prices(run, target, scorers)
         fingerprint = self.settings.redaction.fingerprint()
         keys = {
             c.id: cache.cache_key(run.target_hash, c.input, fingerprint) for c in pending.values()
@@ -1244,6 +1252,22 @@ def _check_judges(run: Run, scorers: Sequence[Scorer]) -> None:
                 f"judge {scorer.name} here is not the judge the run recorded "
                 f"({'; '.join(changes)}); check this process's provider configuration"
             )
+
+
+def _check_prices(run: Run, target: Target, scorers: Sequence[Scorer]) -> None:
+    """Refuse to execute a run at prices other than the ones it recorded: a
+    worker with another price list would cost part of the run differently."""
+    if run.prices is None:
+        return  # created before prices were recorded
+    uses = [(s.provider, s.client.prices, s.model) for s in scorers if isinstance(s, LLMJudge)]
+    if isinstance(target, PromptTarget):
+        uses.append((target.provider, target.client.prices, target.spec.model))
+    changes = price_changes(run.prices, price_record(uses))
+    if changes:
+        raise PreconditionError(
+            f"this process prices the run's models differently from when it was created "
+            f"({'; '.join(changes)}); run it with the same EVALKIT_PRICES_FILE and release"
+        )
 
 
 def _dialect(sessions: sessionmaker[Session]) -> str | None:

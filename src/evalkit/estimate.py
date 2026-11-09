@@ -7,15 +7,19 @@ full ``max_tokens``. Cases already in the response cache cost nothing. For a
 judge, the response it will read is not known yet either; its input count
 includes the prompt without the response, plus the target's ``max_tokens`` as
 an upper bound on the response length when the target is a Claude prompt.
-The target and each judge count on their own provider; one whose provider has
-no counting endpoint gets a note instead of an input cost. A matrix config is
-estimated variant by variant (``estimate_matrix``).
+The target and each judge count on their own provider. One whose provider has
+no counting endpoint (OpenAI-compatible servers) is estimated from the text's
+length instead (``pricing.estimate_tokens``), and the estimate says so:
+``target_input_estimated`` and ``judge_input_estimated`` are set and a note
+names the provider. Each provider's price table version is listed in
+``price_versions``. A matrix config is estimated variant by variant
+(``estimate_matrix``).
 """
 
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Awaitable, Iterable
+from collections.abc import Awaitable, Callable, Iterable
 from dataclasses import dataclass, field
 
 from sqlalchemy.orm import Session, sessionmaker
@@ -24,7 +28,7 @@ from evalkit import cache, matrix
 from evalkit.config import Settings
 from evalkit.datasets import Case, get_dataset, load_cases
 from evalkit.errors import InvalidInputError
-from evalkit.pricing import TokenCounts
+from evalkit.pricing import PriceBook, TokenCounts, estimate_tokens
 from evalkit.prompts import resolve_config
 from evalkit.providers.anthropic import ClaudeClient
 from evalkit.providers.base import ErrorKind, Provider, ProviderError
@@ -50,6 +54,11 @@ class Estimate:
     judge_input_tokens: int = 0
     judge_input_cost_usd: float = 0.0
     judge_max_output_cost_usd: float = 0.0
+    # Input tokens estimated from text length, for providers that cannot count.
+    target_input_estimated: bool = False
+    judge_input_estimated: bool = False
+    # The price table each provider is costed at (``PriceTable.version``).
+    price_versions: dict[str, str] = field(default_factory=dict)
     notes: list[str] = field(default_factory=list)
 
     @property
@@ -90,7 +99,7 @@ async def _estimate(
     concurrency: int,
 ) -> Estimate:
     if providers is None:
-        providers = ProviderRegistry({}, claude.prices, claude=claude)
+        providers = ProviderRegistry({}, PriceBook(), claude=claude)
     scorers = build_scorers(config.scorers, allow_import_paths=True, providers=providers)
     judges = [s for s in scorers if isinstance(s, LLMJudge)]
     with sessions() as session:
@@ -132,20 +141,36 @@ async def _estimate(
         result.target_max_output_cost_usd = prices.cost(
             spec.model, TokenCounts(output_tokens=spec.max_tokens * len(prompts)), batch=batch
         )
+        result.price_versions[spec.provider] = prices.version
         tokens = await _total(count(spec.model, p, spec.system, target) for p in prompts)
         if tokens is None:
+            tokens = sum(estimate_tokens(p, spec.system) for p in prompts)
+            result.target_input_estimated = True
             result.notes.append(
-                f"the target's provider {spec.provider} cannot count tokens, "
-                "so its input cost is not included"
+                f"the target's provider {spec.provider} cannot count tokens; "
+                "its input tokens are estimated from the text's length"
             )
-        else:
-            result.target_input_tokens = tokens
-            result.target_input_cost_usd = prices.cost(
-                spec.model, TokenCounts(input_tokens=tokens), batch=batch
-            )
+        result.target_input_tokens = tokens
+        result.target_input_cost_usd = prices.cost(
+            spec.model, TokenCounts(input_tokens=tokens), batch=batch
+        )
     else:
         result.notes.append(f"the {spec.type} target's own cost is not estimated")
 
+    await _estimate_judges(result, judges, cases, count, response_bound)
+    return result
+
+
+Counter = Callable[[str, str, str, Provider], Awaitable[int]]
+
+
+async def _estimate_judges(
+    result: Estimate,
+    judges: list[LLMJudge],
+    cases: list[Case],
+    count: Counter,
+    response_bound: int,
+) -> None:
     for judge in judges:
         # Every case is judged, cached or not, because a rerun scores again.
         prompts = [p for c in cases for p in _judge_prompts(judge, c)]
@@ -153,19 +178,20 @@ async def _estimate(
         result.judge_max_output_cost_usd += judge.client.prices.cost(
             judge.model, TokenCounts(output_tokens=judge.max_tokens * len(prompts))
         )
+        result.price_versions[judge.provider] = judge.client.prices.version
         counted = await _total(count(judge.model, p, judge.system, judge.client) for p in prompts)
         if counted is None:
+            counted = sum(estimate_tokens(p, judge.system) for p in prompts)
+            result.judge_input_estimated = True
             result.notes.append(
-                f"judge {judge.name}: {judge.provider} cannot count tokens, "
-                "so its input cost is not included"
+                f"judge {judge.name}: {judge.provider} cannot count tokens; "
+                "its input tokens are estimated from the text's length"
             )
-            continue
         tokens = counted + response_bound * len(prompts)
         result.judge_input_tokens += tokens
         result.judge_input_cost_usd += judge.client.prices.cost(
             judge.model, TokenCounts(input_tokens=tokens)
         )
-    return result
 
 
 async def _total(counts: Iterable[Awaitable[int]]) -> int | None:

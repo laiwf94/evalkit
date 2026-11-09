@@ -10,7 +10,6 @@ import pytest
 
 from evalkit.config import Settings
 from evalkit.datasets import Case
-from evalkit.pricing import PriceTable
 from evalkit.providers.anthropic import ClaudeClient
 from evalkit.targets import PromptTargetSpec
 from evalkit.targets.prompt import PromptTarget
@@ -23,7 +22,7 @@ pytestmark = [
 
 def test_prompt_target_against_the_real_api() -> None:
     settings = Settings.from_env()
-    client = ClaudeClient(PriceTable(settings.prices), settings.anthropic_api_key)
+    client = ClaudeClient(settings.price_book().table("anthropic"), settings.anthropic_api_key)
     spec = PromptTargetSpec(
         type="prompt",
         template="What is {{a}} plus {{b}}? Reply with the number only.",

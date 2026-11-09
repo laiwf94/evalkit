@@ -26,7 +26,9 @@ runs            target spec + target hash, scorer specs, options, filter, seed,
                 queued_at, priority, max_workers, cases_total,
                 latency p50 and p95 (set when the run is compacted),
                 matrix_id and variant (for the child runs of a matrix),
-                prompt (the registry reference and the version it resolved to)
+                prompt (the registry reference and the version it resolved to),
+                prices (per provider: the price table version and the price of
+                each model the run uses)
 matrices        a group of child runs from one [matrix] config: label, dataset,
                 the axes as given and the base config
 case_leases     (run_id, case_id) key; position, owner, expires_at, fence, done
@@ -452,8 +454,50 @@ limits and cool-downs are keyed by the provider name. The model must have a
 price on that provider, checked when the run is created rather than as a
 missing cost at the end. Batch mode stays Claude only: it uses the Message
 Batches API. `evalkit estimate` counts input tokens on the target's provider;
-an OpenAI-compatible server has no counting endpoint, so its input cost is left
-out with a note rather than guessed.
+an OpenAI-compatible server has no counting endpoint, so its input tokens are
+estimated from the text's length and labelled as an estimate (see Prices).
+
+### Prices
+
+`pricing.py` holds one `PriceList` per provider, `anthropic`, `openai` and
+`gemini`, each with the date it was last checked against the provider's
+published page as its version and that page as its source. The `PriceBook`
+gives each provider name its table: `anthropic`, `openai` and `gemini` start
+from their own list; a server from `EVALKIT_PROVIDERS_FILE` starts from the
+list it names with `price_list`, or from none, because a self-hosted model has
+no published price and guessing one would put a wrong number on every run.
+`EVALKIT_PRICES_FILE` adds `[prices.<model>]` tables, which apply to every
+provider (as before per-provider tables existed), and `[prices.<provider>.<model>]`
+tables, which apply to one provider and win over the first kind.
+
+A table's version is its list's (`openai@2026-11-09`) when the overrides change
+nothing, and the list's plus the first eight hex digits of a SHA-256 over the
+overrides that do change something (`openai@2026-11-09+local.1a2b3c4d`), so
+restating a published price does not make a new version and two processes with
+the same file agree on it. Long-context rates (Gemini over 200,000 prompt
+tokens, Claude Haiku 5.5 over 100,000) cover input, output and cache reads.
+OpenAI and Gemini cache reads have explicit rates, since their discounts are not
+Claude's tenth of the input price.
+
+Costs are computed from usage in the process that executes each case, so a run
+records the prices it is costed at when it is created: for the target and each
+judge, the provider's table version and the price of the model it uses
+(`runs.prices`). A process whose tables price those models differently refuses
+to execute the run with `failed_precondition`, naming each model with its old
+and new price and version, in the same way a changed judge or a moved provider
+is refused. A table version that only changes other models is not a change.
+Runs created before prices were recorded execute at whatever prices the process
+has.
+
+Providers without a counting endpoint get `estimate_tokens`: one token per three
+UTF-8 bytes, rounded up, plus eight for each message's chat framing. English
+prose runs about four bytes a token on current tokenizers and most non-Latin
+scripts about one character, two or three bytes, a token, so the estimate leans
+high; a Hypothesis test checks it never falls below a four-bytes-a-token count.
+`evalkit estimate` sets `target_input_estimated` or `judge_input_estimated`, adds
+a note naming the provider, prints `~` and `(estimated)` on those lines and on
+the total, and lists the price table version for each provider. An estimate is
+never a bill: each case is costed from the usage the provider reports.
 
 ## Model matrices and the frontier
 
@@ -580,7 +624,9 @@ is a version bump.
 
 `evalkit estimate` counts input tokens with the token counting endpoint for
 every uncached target prompt and every judge call, and prices output at the
-worst case of `max_tokens` per call. Never a tokenizer from another vendor.
+worst case of `max_tokens` per call. Never a tokenizer from another vendor:
+where a provider cannot count, the estimate is from text length and labelled as
+one (see Prices).
 
 ## Scoring
 
@@ -754,6 +800,7 @@ band.
 | Database unavailable | `/healthz` returns 503; a running run fails and can be resumed. |
 | Runs compared over different dataset contents | `failed_precondition` (CLI exit 3), never a misleading verdict. |
 | A matrix variant is invalid (unknown provider, unpriced model) | Nothing is recorded: the matrix and its runs are created in one transaction after every variant is checked. |
+| A process prices a run's models differently from when it was created | The run is refused with `failed_precondition`, naming each model's old and new price and table version, so one run is never costed at two prices. |
 | A provider moved after a run was recorded | The run is refused (it fails with `failed_precondition`) rather than answered by another server under the old identity. |
 
 ## Limits

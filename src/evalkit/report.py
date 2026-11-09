@@ -84,6 +84,8 @@ class RunSummary:
     variant: str | None = None  # its variant name there
     # The registry prompt the target named: ref, name, version, label, content_hash.
     prompt: dict[str, Any] | None = None
+    # The prices it is costed at: {provider: {"version", "models"}} (None: older runs).
+    prices: dict[str, Any] | None = None
 
 
 @dataclass(frozen=True)
@@ -277,6 +279,7 @@ def summarize(session: Session, run_id: str, *, resamples: int = DEFAULT_RESAMPL
         matrix_id=run.matrix_id,
         variant=str(run.variant["name"]) if run.variant else None,
         prompt=dict(run.prompt) if run.prompt else None,
+        prices=dict(run.prices) if run.prices is not None else None,
     )
 
 

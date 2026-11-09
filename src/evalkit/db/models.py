@@ -142,6 +142,9 @@ class Run(Base):
     # Set when the target named a registry prompt (``evalkit.prompts``): the
     # reference as written and the version it resolved to when the run was created.
     prompt: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
+    # The prices the run is costed at, by provider: the table version and each
+    # model's price (``evalkit.pricing.price_record``); None for older runs.
+    prices: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
 
     dataset: Mapped[Dataset] = relationship()
 

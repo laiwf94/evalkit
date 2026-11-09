@@ -16,7 +16,8 @@ a silent precedence rule.
     EVALKIT_LOG_LEVEL           DEBUG, INFO, WARNING or ERROR (default INFO)
     EVALKIT_LEASE_SECONDS       seconds before a dead runner's run can be resumed (default 30)
     EVALKIT_REDACTION_FILE      TOML file with a [redaction] table (default: all built-ins on)
-    EVALKIT_PRICES_FILE         TOML [prices.<model>] tables overriding the built-in prices
+    EVALKIT_PRICES_FILE         TOML [prices.<model>] tables (every provider) and
+                                [prices.<provider>.<model>] tables over the built-in price lists
     EVALKIT_HTTP_TARGETS_FILE   TOML [endpoints.<name>] tables: the only URLs HTTP targets may call
     EVALKIT_CACHE_MAX_AGE       sweep cache entries unused for this long, e.g. 30d (default: never)
     EVALKIT_CACHE_MAX_BYTES     sweep least recently used entries above this size, e.g. 20GiB
@@ -49,7 +50,7 @@ from typing import Literal
 from pydantic import BaseModel, ConfigDict, Field, SecretStr, ValidationError
 
 from evalkit.blobs import BlobStore, open_store
-from evalkit.pricing import ModelPrice
+from evalkit.pricing import ModelPrice, PriceBook
 from evalkit.providers.registry import PROVIDER_NAME, ProviderConfig, builtin_providers
 from evalkit.redaction import RedactionConfig
 from evalkit.targets.http import HttpEndpoint
@@ -83,7 +84,8 @@ class Settings(BaseModel):
     gemini_api_key: SecretStr | None = None
     providers: dict[str, ProviderConfig] = Field(default_factory=dict)
     redaction: RedactionConfig = RedactionConfig()
-    prices: dict[str, ModelPrice] = Field(default_factory=dict)
+    # A model's price for every provider, or a provider's own {model: price} table.
+    prices: dict[str, ModelPrice | dict[str, ModelPrice]] = Field(default_factory=dict)
     http_endpoints: dict[str, HttpEndpoint] = Field(default_factory=dict)
     cache_max_age_seconds: float | None = Field(default=None, gt=0)
     cache_max_bytes: int | None = Field(default=None, ge=0)
@@ -115,6 +117,10 @@ class Settings(BaseModel):
     def provider_configs(self) -> dict[str, ProviderConfig]:
         """The built-in providers, overridden or extended by ``EVALKIT_PROVIDERS_FILE``."""
         return {**builtin_providers(self.openai_api_key, self.gemini_api_key), **self.providers}
+
+    def price_book(self) -> PriceBook:
+        """Every provider's price table: the built-in lists with ``EVALKIT_PRICES_FILE`` on top."""
+        return PriceBook(self.prices)
 
     def secret_values(self) -> list[str]:
         """Raw secret strings the log scrubber must never let through."""

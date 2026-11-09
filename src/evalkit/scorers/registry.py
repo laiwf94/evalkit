@@ -18,7 +18,7 @@ from jsonschema.exceptions import SchemaError
 from pydantic import BaseModel, ConfigDict, Field, JsonValue
 
 from evalkit.errors import InvalidInputError
-from evalkit.pricing import PriceTable
+from evalkit.pricing import PriceBook
 from evalkit.providers.anthropic import ClaudeClient
 from evalkit.providers.registry import ANTHROPIC, PROVIDER_NAME, ProviderRegistry
 from evalkit.scorers.base import Scorer
@@ -104,7 +104,7 @@ def build_scorers(
     """Scorer objects for ``specs``. Judges get their client from ``providers``;
     without one, only Claude judges can be built, on ``claude``."""
     if providers is None:
-        providers = ProviderRegistry({}, PriceTable(), claude=claude)
+        providers = ProviderRegistry({}, PriceBook(), claude=claude)
     if not specs:
         raise InvalidInputError("at least one scorer is required")
     names = [s.resolved_name() for s in specs]

@@ -5,6 +5,7 @@ import asyncio
 import io
 import json
 import re
+from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
 
@@ -25,13 +26,15 @@ from evalkit.errors import InvalidInputError, NotFoundError, PreconditionError
 from evalkit.estimate import estimate_matrix
 from evalkit.frontier import COST, LATENCY, QUALITY, Point, dominates, matrix_report, pareto
 from evalkit.matrix import child_runs, expand, resolve_matrix
-from evalkit.pricing import ModelPrice, PriceTable
+from evalkit.pricing import ModelPrice, PriceBook, PriceTable, estimate_tokens
 from evalkit.providers.registry import ProviderConfig, ProviderRegistry
 from evalkit.report import summarize
 from evalkit.runner import Runner
 from evalkit.runspec import MAX_MATRIX_VARIANTS, RunConfig
 from evalkit.targets.fake import unit
 from tests.fake_anthropic import FakeAnthropic, json_reply, message
+from tests.fake_gemini import FakeGemini
+from tests.fake_openai import FakeOpenAI
 
 N = 120
 PRICES = {
@@ -54,12 +57,25 @@ def answer(model: str, request_body: bytes) -> str:
 
 class Providers:
     """Every provider a matrix calls: the fake Claude API, an OpenAI-compatible
-    server and a Gemini server, answering each question by model."""
+    server and a Gemini server, answering each question by model. The HTTP fakes
+    check the exact shape of every request; the fixture fails a test that sent a
+    bad one."""
 
     def __init__(self) -> None:
         self.requests: list[httpx2.Request] = []
         self.claude = FakeAnthropic()
         self.claude.default = self._claude
+        self.openai = FakeOpenAI(
+            "http://llm.test/v1",
+            api_key=None,
+            answer=lambda body: answer("gpt-test", json.dumps(body).encode()),
+        )
+        self.gemini = FakeGemini(
+            "http://gemini.test/v1beta",
+            api_key=None,
+            answer=lambda model, body: answer("gemini-test", json.dumps(body).encode()),
+            count=lambda request: 50,
+        )
 
     def _claude(self, body: dict[str, Any]) -> httpx2.Response:
         if self.claude.paths[-1].endswith("/count_tokens"):
@@ -69,34 +85,8 @@ class Providers:
 
     def handle(self, request: httpx2.Request) -> httpx2.Response:
         self.requests.append(request)
-        if request.url.host == "gemini.test":
-            if request.url.path.endswith(":countTokens"):
-                return httpx2.Response(200, json={"totalTokens": 50})
-            text = answer("gemini-test", request.content)
-            return httpx2.Response(
-                200,
-                json={
-                    "candidates": [
-                        {
-                            "content": {"role": "model", "parts": [{"text": text}]},
-                            "finishReason": "STOP",
-                        }
-                    ],
-                    "usageMetadata": {"promptTokenCount": 100, "candidatesTokenCount": 10},
-                    "modelVersion": "gemini-test",
-                },
-            )
-        text = answer("gpt-test", request.content)
-        return httpx2.Response(
-            200,
-            json={
-                "model": "gpt-test",
-                "choices": [
-                    {"message": {"role": "assistant", "content": text}, "finish_reason": "stop"}
-                ],
-                "usage": {"prompt_tokens": 100, "completion_tokens": 10},
-            },
-        )
+        fake = self.gemini if request.url.host == "gemini.test" else self.openai
+        return fake.handle(request)
 
     def bodies(self, host: str) -> list[Any]:
         return [json.loads(r.content) for r in self.requests if r.url.host == host]
@@ -104,15 +94,18 @@ class Providers:
     def registry(self, **configs: ProviderConfig) -> ProviderRegistry:
         return ProviderRegistry(
             configs or {"local": LOCAL, "gem": GEM},
-            PriceTable(PRICES),
+            PriceBook(PRICES),
             claude=self.claude.client(PriceTable(PRICES)),
             transport=httpx2.MockTransport(self.handle),
         )
 
 
 @pytest.fixture
-def fakes() -> Providers:
-    return Providers()
+def fakes() -> Iterator[Providers]:
+    found = Providers()
+    yield found
+    assert found.openai.rejected == [], found.openai.rejected
+    assert found.gemini.rejected == [], found.gemini.rejected
 
 
 @pytest.fixture
@@ -551,12 +544,19 @@ def test_estimate_each_variant(
     assert on_claude.target_input_tokens == 50 * N
     assert on_claude.target_input_cost_usd == pytest.approx(50 * N * 2.0 / 1e6)
     assert on_claude.target_max_output_cost_usd == pytest.approx(64 * N * 10.0 / 1e6)
-    # The OpenAI-compatible API has no counting endpoint: a note, not a guess.
-    assert on_local.target_input_tokens == 0
+    assert not on_claude.target_input_estimated
+    # The OpenAI-compatible API has no counting endpoint: an estimate, labelled as one.
+    estimated = sum(estimate_tokens(f"Answer: question {i}") for i in range(N))
+    assert on_local.target_input_estimated
+    assert on_local.target_input_tokens == estimated
+    assert on_local.target_input_cost_usd == pytest.approx(estimated * 2.0 / 1e6)
     assert on_local.target_max_output_cost_usd == pytest.approx(64 * N * 8.0 / 1e6)
     assert on_local.notes == [
-        "the target's provider local cannot count tokens, so its input cost is not included"
+        "the target's provider local cannot count tokens; "
+        "its input tokens are estimated from the text's length"
     ]
+    assert on_local.price_versions["local"].startswith("none@none+local.")
+    assert not on_gemini.target_input_estimated
     assert on_gemini.target_input_tokens == 50 * N
     assert on_gemini.target_input_cost_usd == pytest.approx(50 * N * 1.0 / 1e6)
     assert found.max_total_cost_usd == pytest.approx(
