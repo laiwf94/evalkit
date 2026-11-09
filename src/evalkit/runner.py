@@ -47,7 +47,7 @@ from sqlalchemy import ColumnElement, case, exists, false, func, or_, select, tr
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, sessionmaker
 
-from evalkit import aggregates, cache, leases, matrix, metrics, runqueue
+from evalkit import aggregates, cache, leases, matrix, metrics, prompts, runqueue
 from evalkit.blobs import BlobStore
 from evalkit.config import Settings
 from evalkit.datasets import Case, get_dataset, load_cases
@@ -298,11 +298,14 @@ class Runner:
                 "a config with a [matrix] table expands into several runs; "
                 "create it as a matrix (API: POST /v1/matrices)"
             )
+        config, pinned = self._resolve_prompt(config)
         prepared = self._validate(config)
         with self.sessions() as session:
             dataset = get_dataset(session, config.dataset.name, config.dataset.version)
             cases = self._select(session, dataset, config)
-            run = self._new_run(session, prepared, dataset.id, len(cases), queued=queued)
+            run = self._new_run(
+                session, prepared, dataset.id, len(cases), queued=queued, prompt=pinned
+            )
             if queued:
                 runqueue.notify(session, "queued", run.id)
             session.commit()
@@ -312,6 +315,8 @@ class Runner:
         """Expand a ``[matrix]`` config into its child runs and record them, with
         the group, in one transaction: every variant is validated (its provider,
         model price and judges) before any is recorded."""
+        # Resolved once, so every variant runs the same version even if the label moves.
+        config, pinned = self._resolve_prompt(config)
         variants = matrix.expand(config)
         prepared = [(v, self._validate(v.config)) for v in variants]
         with self.sessions() as session:
@@ -329,7 +334,14 @@ class Runner:
             session.flush()
             runs = [
                 self._new_run(
-                    session, p, dataset.id, total, queued=queued, group=group, variant=v.axes()
+                    session,
+                    p,
+                    dataset.id,
+                    total,
+                    queued=queued,
+                    group=group,
+                    variant=v.axes(),
+                    prompt=pinned,
                 )
                 for v, p in prepared
             ]
@@ -337,6 +349,12 @@ class Runner:
                 runqueue.notify(session, "queued", runs[0].id)
             session.commit()
             return group, runs
+
+    def _resolve_prompt(self, config: RunConfig) -> tuple[RunConfig, dict[str, Any] | None]:
+        """Freeze a registry prompt into the config: the run keeps the content the
+        reference names now, whatever the label points at later."""
+        with self.sessions() as session:
+            return prompts.resolve_config(session, config)
 
     def _validate(self, config: RunConfig) -> _Prepared:
         scorers = build_scorers(
@@ -378,6 +396,7 @@ class Runner:
         queued: bool,
         group: Matrix | None = None,
         variant: dict[str, Any] | None = None,
+        prompt: dict[str, Any] | None = None,
     ) -> Run:
         config = prepared.config
         now = utcnow()
@@ -401,6 +420,7 @@ class Runner:
             created_at=now,
             matrix_id=group.id if group is not None else None,
             variant=variant,
+            prompt=prompt,
         )
         session.add(run)
         session.flush()

@@ -25,7 +25,8 @@ runs            target spec + target hash, scorer specs, options, filter, seed,
                 status, lease (owner, expires_at; batch mode only), batch_id,
                 queued_at, priority, max_workers, cases_total,
                 latency p50 and p95 (set when the run is compacted),
-                matrix_id and variant (for the child runs of a matrix)
+                matrix_id and variant (for the child runs of a matrix),
+                prompt (the registry reference and the version it resolved to)
 matrices        a group of child runs from one [matrix] config: label, dataset,
                 the axes as given and the base config
 case_leases     (run_id, case_id) key; position, owner, expires_at, fence, done
@@ -42,6 +43,10 @@ run_scores      (run_id, metric) key; a completed run's scores as one float64 ar
 response_cache  key = sha256(target hash, input, redaction fingerprint); output (or
                 its blob digest), created_at, last_used_at, size_bytes
 judge_calibrations  judge hash, kappa, weighted kappa, agreement, confusion matrix
+prompts         name unique; description
+prompt_versions (prompt_id, version) unique, (prompt_id, content_hash) unique;
+                system, template, note; inserted, never updated
+prompt_labels   (prompt_id, label) key; the version it points at, updated_at
 ```
 
 ### How a dataset is identified
@@ -498,6 +503,47 @@ asks for and dilute the correction. With 120 cases and a 10-point gap the test
 finds the difference (p 0.012 in `tests/test_matrix.py`); with 30 cases and a
 3-point gap it will say "no detectable change", which is the honest answer.
 
+## The prompt registry
+
+A prompt version is its system prompt and template, identified by SHA-256 over
+both in canonical JSON (so `"ab" + "c"` and `"a" + "bc"` differ). Version rows
+are only inserted: an edit is a new version, and pushing content the prompt
+already has returns the version that holds it, the way a dataset import does.
+Two pushes race on the unique constraints. The loser of a race for the prompt
+row uses the winner's, the loser of a race for a version number reads again
+and takes the next number, and the loser of a race for the same content
+returns the winner's version, so concurrent pushes never mint duplicates or
+skip a number. A push that loses five attempts in a row gets a conflict and
+retries, rather than looping under contention.
+
+Labels are where mutation lives, and they change only by compare-and-set. A
+move is `UPDATE prompt_labels SET version = :new WHERE prompt_id = :p AND
+label = :l AND version = :expected`; if no row matched, the label is somewhere
+else and the caller gets a 409 (exit 3) naming the version it is at now.
+Creating a label is an INSERT that the primary key refuses if another writer
+created it first. There is no "move regardless" mode: the API requires
+`expected_version` (possibly `null`), and the CLI fills it from the value it
+read, so a promotion based on a stale view of the label fails instead of
+silently undoing someone else's. The check is on the version, not a revision
+counter, so a label moved away and back still accepts a move that expected the
+version it points at, which is the outcome that writer asked for. `latest` is
+reserved for the newest version, and labels start with a letter so they can
+never be mistaken for version numbers in `NAME@REF`.
+
+A run config can name `prompt = "support@production"` in place of `system` and
+`template`. The runner resolves the reference once, before validating the
+config, and from then on the run is an ordinary prompt run: the resolved
+content goes into the stored target spec and the target hash, and
+`runs.prompt` records the reference, the version, the label and the content
+hash. Moving the label later does not touch existing runs, and resume, workers
+and `run verify` never consult the registry. A matrix resolves its reference
+once for all its variants, so a promotion halfway through creating the group
+cannot split it across versions. Because the hash covers the content and not
+the reference, `support@4` and the same text written inline are one target and
+share cache entries. A target spec that still holds an unresolved reference
+cannot be built into a target, so nothing executes a prompt that was not
+frozen first.
+
 ## Calling Claude
 
 All Claude calls go through one provider (`providers/anthropic.py`):
@@ -724,7 +770,8 @@ band.
 | Worker poll interval | 5 s default | Fallback when no notification arrives. |
 | Drain on SIGTERM | 25 s default | Inside Kubernetes' default 30 s grace period. |
 | Scorers per run | 32 | |
-| Template, system prompt | 200,000 characters | |
+| Template, system prompt | 200,000 characters | The same for registry prompt versions, so a pushed version can always run. |
+| Prompt version note, description | 2,000 characters | |
 | Regex patterns | 1,000 characters, 250 ms per match | Patterns can come from case data. |
 | Redaction patterns | 64, 1,000 characters each, 250 ms each | |
 | HTTP target response | 1 MiB default, 64 MiB max | Checked before buffering. |

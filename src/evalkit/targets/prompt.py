@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from evalkit.datasets import Case
+from evalkit.errors import InvalidInputError
 from evalkit.providers.base import Provider
 from evalkit.targets.base import Generation, Target
 from evalkit.targets.specs import PromptTargetSpec
@@ -11,6 +12,10 @@ from evalkit.targets.template import render
 
 class PromptTarget(Target):
     def __init__(self, spec: PromptTargetSpec, client: Provider) -> None:
+        if spec.prompt is not None:
+            raise InvalidInputError(
+                f"prompt {spec.prompt!r} must be resolved from the registry before it runs"
+            )
         # An unknown model would run with no cost accounting; refuse it up front.
         client.prices.require(spec.model)
         # Rate limits and cool-downs are shared per provider.

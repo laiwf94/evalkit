@@ -177,6 +177,44 @@ compared pairwise, with a paired bootstrap interval and a sign-flip permutation
 test, giving a better / worse / no detectable change verdict and an effect
 size; Holm correction applies when several metrics are gated together.
 
+## Prompt registry
+
+Prompts can live in evalkit instead of in each config. Every push of a prompt
+file is a version, identified by the SHA-256 of its system prompt and template,
+so pushing unchanged content (from CI on every commit, say) is a no-op:
+
+```console
+$ cat support.toml
+system = "You answer questions about the acme web app..."
+template = "{{question}}"
+$ evalkit prompt push support support.toml --note "shorter system prompt"
+support pushed version 4 (9c1f04e2b7aa)
+$ evalkit prompt diff support@production support@4    # a unified diff
+$ evalkit prompt label support@4 production
+support@production: v3 -> v4
+```
+
+A run config names a version instead of giving `system` and `template`:
+
+```toml
+[target]
+type = "prompt"
+model = "claude-opus-5-5"
+prompt = "support@production"     # or support@4, or support for the newest
+```
+
+The reference is resolved when the run is created and frozen into it: the run
+stores the content, and `evalkit show` prints `prompt support@production:
+support version 4 (9c1f04e2b7aa)`. Promoting another version afterwards does
+not change that run, and a resume uses what it recorded. Content from the
+registry hashes like the same text written inline, so the two share cache
+entries.
+
+Labels move only by compare-and-set. `evalkit prompt label` moves a label from
+wherever it was when read and refuses (exit 3) if someone else moved it in the
+meantime; `--expect 3` insists on a version, `--expect none` that the label is
+new. Versions are never changed or deleted.
+
 ## Command line
 
 | Command | Purpose |
@@ -194,12 +232,17 @@ size; Holm correction applies when several metrics are gated together.
 | `evalkit estimate CONFIG` | Cost estimate from token counts (per variant for a matrix). |
 | `evalkit calibrate --judge J LABELS` | Judge agreement with human labels. |
 | `evalkit dataset import/export/list` | Manage datasets. |
+| `evalkit prompt push NAME FILE [--system FILE] [--note N]` | Store a prompt file (TOML with `system` and `template`, or a template file) as a new version; unchanged content is a no-op. |
+| `evalkit prompt show REF`, `evalkit prompt list` | A version's content and labels; every prompt with its newest version and labels. |
+| `evalkit prompt diff REF [REF]` | Unified diff of two versions (the second defaults to the newest). |
+| `evalkit prompt label REF LABEL [--expect V\|none]` | Point a label at a version by compare-and-set; exit 3 if it moved. |
 | `evalkit cache sweep [--max-age 30d] [--max-size 20GiB] [--dry-run]` | Delete old and least recently used cache entries, then unreferenced blobs. |
 | `evalkit cache scrub` | Read every blob and check it against its digest; exit 3 if any is corrupt. |
 | `evalkit serve`, `evalkit db upgrade` | Run the API; migrate PostgreSQL. |
 
 `RUN` is a run id or `label:NAME` for the newest completed run with that
-label; `MATRIX` is a matrix id or `label:NAME` for the newest matrix. Exit codes: 0 success, 1 regression, 2 bad input, 3 the run cannot be
+label; `MATRIX` is a matrix id or `label:NAME` for the newest matrix; `REF` is
+`NAME`, `NAME@VERSION` or `NAME@LABEL`. Exit codes: 0 success, 1 regression, 2 bad input, 3 the run cannot be
 used (failed, incomplete, a batch-mode run held by another process, different
 datasets, a changed judge) or any
 other error, 130 interrupted. Commands that print a report take `--json`.
@@ -250,6 +293,11 @@ Every `/v1` route takes `Authorization: Bearer <token>`.
 | `POST /v1/datasets/{name}` | Import JSONL (body). 201 for a new version, 200 if the content already exists. |
 | `GET /v1/datasets` | All datasets and versions. |
 | `GET /v1/datasets/{name}/versions/{v}[/export]` | Metadata, or the cases as JSONL. |
+| `POST /v1/prompts/{name}/versions` | Push `{"template", "system", "note", "description"}`. 201 for a new version, 200 if the content already exists. |
+| `GET /v1/prompts`, `GET /v1/prompts/{name}` | All prompts with their labels; one prompt's labels and versions. |
+| `GET /v1/prompts/{name}/versions/{version\|label\|latest}` | A version and its content. |
+| `GET /v1/prompts/{name}/diff?from=&to=` | Unified diff of two versions (`to` defaults to `latest`). |
+| `PUT /v1/prompts/{name}/labels/{label}` | Move a label: `{"version": 4, "expected_version": 3}` (`null`: the label must be new). 409 with where it is now if it moved. |
 | `POST /v1/runs` | Queue a run from a JSON run config. 202 with the run summary. |
 | `GET /v1/runs[?label=]` | Recent runs. |
 | `GET /v1/runs/{id}` | Summary: progress, metrics with intervals, tokens, cost, latency. |
@@ -330,6 +378,7 @@ src/evalkit/providers/     the Provider protocol and error kinds; the Claude cli
 src/evalkit/runner.py      worker pool, cache, resume, run completion, batch mode, cancel, drain
 src/evalkit/matrix.py      [matrix] configs expanded into grouped child runs
 src/evalkit/frontier.py    cost/quality/latency Pareto frontier and paired steps along it
+src/evalkit/prompts.py     prompt registry: content-hashed versions, compare-and-set labels
 src/evalkit/cache.py       response cache: keys, last use, sweep by age and size, blob offload
 src/evalkit/blobs.py       content-addressed blobs: filesystem and S3 backends, signing, GC
 src/evalkit/leases.py      case leases: SKIP LOCKED claims and fenced result writes

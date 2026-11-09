@@ -25,6 +25,7 @@ from evalkit.config import Settings
 from evalkit.datasets import Case, get_dataset, load_cases
 from evalkit.errors import InvalidInputError
 from evalkit.pricing import TokenCounts
+from evalkit.prompts import resolve_config
 from evalkit.providers.anthropic import ClaudeClient
 from evalkit.providers.base import ErrorKind, Provider, ProviderError
 from evalkit.providers.registry import ANTHROPIC, ProviderRegistry
@@ -70,12 +71,30 @@ async def estimate(
     providers: ProviderRegistry | None = None,
     concurrency: int = 8,
 ) -> Estimate:
+    """What running ``config`` would cost at most; a registry prompt is estimated
+    at the version it names now."""
+    with sessions() as session:
+        config, _ = resolve_config(session, config)
+    return await _estimate(
+        sessions, settings, config, claude, providers=providers, concurrency=concurrency
+    )
+
+
+async def _estimate(
+    sessions: sessionmaker[Session],
+    settings: Settings,
+    config: RunConfig,
+    claude: ClaudeClient,
+    *,
+    providers: ProviderRegistry | None,
+    concurrency: int,
+) -> Estimate:
     if providers is None:
         providers = ProviderRegistry({}, claude.prices, claude=claude)
-    target_id = identity(config.target, settings.http_endpoints, providers.configs)
     scorers = build_scorers(config.scorers, allow_import_paths=True, providers=providers)
     judges = [s for s in scorers if isinstance(s, LLMJudge)]
     with sessions() as session:
+        target_id = identity(config.target, settings.http_endpoints, providers.configs)
         dataset = get_dataset(session, config.dataset.name, config.dataset.version)
         cases = load_cases(session, dataset, config.filter.split, config.filter.tags)
         if not cases:
@@ -198,7 +217,11 @@ async def estimate_matrix(
     providers: ProviderRegistry | None = None,
 ) -> MatrixEstimate:
     out = []
+    with sessions() as session:
+        config, _ = resolve_config(session, config)
     for variant in matrix.expand(config):
-        found = await estimate(sessions, settings, variant.config, claude, providers=providers)
+        found = await _estimate(
+            sessions, settings, variant.config, claude, providers=providers, concurrency=8
+        )
         out.append(VariantEstimate(variant.name, found))
     return MatrixEstimate(out)

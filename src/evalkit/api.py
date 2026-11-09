@@ -1,4 +1,5 @@
-"""HTTP API: datasets, runs and comparisons for a team sharing one evaluation store.
+"""HTTP API: datasets, prompts, runs and comparisons for a team sharing one
+evaluation store.
 
 Every ``/v1`` route takes ``Authorization: Bearer <token>`` when tokens are
 configured. Without tokens the server refuses to listen on anything but a
@@ -60,6 +61,18 @@ from evalkit.errors import EvalkitError, InvalidInputError, NotFoundError
 from evalkit.frontier import matrix_report
 from evalkit.logs import configure_logging, log_context, scrubber
 from evalkit.pricing import PriceTable
+from evalkit.prompts import (
+    Resolved,
+    diff,
+    get_prompt,
+    labels_of,
+    list_prompts,
+    move_label,
+    push_version,
+    resolve,
+    validate_prompt_name,
+    versions_of,
+)
 from evalkit.providers.anthropic import ClaudeClient
 from evalkit.providers.registry import ProviderRegistry
 from evalkit.report import compare_runs, summarize
@@ -263,6 +276,138 @@ async def export_dataset(name: str, version: int, svc: Svc) -> PlainTextResponse
         svc, lambda s: to_jsonl(load_cases(s, get_dataset(s, name, version)))
     )
     return PlainTextResponse(text_body, media_type="application/x-ndjson")
+
+
+class PromptPush(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    template: str = Field(min_length=1, max_length=200_000)
+    system: str = Field(default="", max_length=200_000)
+    note: str = Field(default="", max_length=2000)
+    # Kept from the first push; later pushes do not change it.
+    description: str = Field(default="", max_length=2000)
+
+
+class LabelMoveRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    version: int = Field(ge=1)
+    # Required, and may be null: the version the label must be at now, or null
+    # when the label must not exist yet. A label never moves without a check.
+    expected_version: int | None = Field(ge=1)
+
+
+def _version_json(found: Resolved, *, content: bool = True) -> dict[str, Any]:
+    v = found.version
+    body: dict[str, Any] = {
+        "name": found.name,
+        "version": v.version,
+        "label": found.label,
+        "content_hash": v.content_hash,
+        "note": v.note,
+        "created_at": _iso(v.created_at),
+    }
+    if content:
+        body |= {"system": v.system, "template": v.template}
+    return body
+
+
+@router.get("/prompts")
+async def get_prompts(svc: Svc) -> dict[str, Any]:
+    def load(session: Session) -> list[dict[str, Any]]:
+        return [
+            {
+                "name": p.name,
+                "description": p.description,
+                "latest_version": p.latest_version,
+                "labels": p.labels,
+                "created_at": _iso(p.created_at),
+            }
+            for p in list_prompts(session)
+        ]
+
+    return {"prompts": await _in_session(svc, load)}
+
+
+@router.get("/prompts/{name}")
+async def get_prompt_history(name: str, svc: Svc) -> dict[str, Any]:
+    """A prompt, its labels and every version, oldest first, without their content."""
+
+    def load(session: Session) -> dict[str, Any]:
+        prompt = get_prompt(session, name)
+        return {
+            "name": prompt.name,
+            "description": prompt.description,
+            "created_at": _iso(prompt.created_at),
+            "labels": labels_of(session, prompt),
+            "versions": [
+                _version_json(Resolved(name, v), content=False)
+                for v in versions_of(session, prompt)
+            ],
+        }
+
+    return await _in_session(svc, load)
+
+
+@router.post("/prompts/{name}/versions", status_code=201)
+async def push_prompt(name: str, body: PromptPush, response: Response, svc: Svc) -> dict[str, Any]:
+    validate_prompt_name(name)
+
+    def store(session: Session) -> tuple[dict[str, Any], bool]:
+        version, created = push_version(
+            session,
+            name,
+            template=body.template,
+            system=body.system,
+            note=body.note,
+            description=body.description,
+        )
+        return _version_json(Resolved(name, version)), created
+
+    out, created = await _in_session(svc, store)
+    if not created:
+        response.status_code = 200
+    return out
+
+
+@router.get("/prompts/{name}/versions/{selector}")
+async def get_prompt_version(name: str, selector: str, svc: Svc) -> dict[str, Any]:
+    """A version by number, by label, or ``latest``."""
+    ref = f"{validate_prompt_name(name)}@{selector}"
+    return await _in_session(svc, lambda s: _version_json(resolve(s, ref)))
+
+
+@router.get("/prompts/{name}/diff")
+async def diff_prompt(
+    name: str,
+    svc: Svc,
+    from_: Annotated[str, Query(alias="from", min_length=1, max_length=64)],
+    to: Annotated[str, Query(min_length=1, max_length=64)] = "latest",
+) -> PlainTextResponse:
+    validate_prompt_name(name)
+    text_body = await _in_session(
+        svc, lambda s: diff(resolve(s, f"{name}@{from_}"), resolve(s, f"{name}@{to}"))
+    )
+    return PlainTextResponse(text_body, media_type="text/x-diff")
+
+
+@router.put("/prompts/{name}/labels/{label}")
+async def put_prompt_label(
+    name: str, label: str, body: LabelMoveRequest, svc: Svc
+) -> dict[str, Any]:
+    """Move a label by compare-and-set; 409 with where the label is now if it is
+    not at ``expected_version``."""
+
+    def store(session: Session) -> dict[str, Any]:
+        moved = move_label(session, name, label, body.version, expected=body.expected_version)
+        return {
+            "name": moved.name,
+            "label": moved.label,
+            "previous_version": moved.previous,
+            "version": moved.version,
+        }
+
+    return await _in_session(svc, store)
 
 
 @router.post("/runs", status_code=202)

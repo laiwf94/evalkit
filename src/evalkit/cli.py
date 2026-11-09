@@ -53,6 +53,17 @@ from evalkit.frontier import MatrixReport, matrix_report
 from evalkit.logs import configure_logging, scrubber
 from evalkit.matrix import child_runs, resolve_matrix
 from evalkit.pricing import PriceTable
+from evalkit.prompts import (
+    LabelMove,
+    diff,
+    get_prompt,
+    labels_of,
+    list_prompts,
+    move_label,
+    parse_ref,
+    push_version,
+    resolve,
+)
 from evalkit.providers.anthropic import ClaudeClient
 from evalkit.providers.registry import ProviderRegistry
 from evalkit.report import CompareReport, RunSummary, compare_runs, summarize
@@ -472,6 +483,94 @@ async def cmd_dataset(args: argparse.Namespace, app: App) -> int:
     return EXIT_OK
 
 
+async def cmd_prompt(args: argparse.Namespace, app: App) -> int:
+    """``evalkit prompt push|show|list|diff|label``: the prompt registry."""
+    with app.sessions() as session:
+        if args.prompt_command == "push":
+            system, template = _read_prompt(Path(args.file), args.system)
+            version, created = push_version(
+                session,
+                args.name,
+                system=system,
+                template=template,
+                note=args.note,
+                description=args.description,
+            )
+            verb = "pushed" if created else "unchanged, already"
+            app.out.write(
+                f"{args.name} {verb} version {version.version} ({version.content_hash[:12]})\n"
+            )
+        elif args.prompt_command == "show":
+            found = resolve(session, args.ref)
+            prompt = get_prompt(session, found.name)
+            info = {
+                "name": found.name,
+                "version": found.version.version,
+                "label": found.label,
+                "content_hash": found.version.content_hash,
+                "note": found.version.note,
+                "created_at": found.version.created_at,
+                "labels": labels_of(session, prompt),
+                "system": found.version.system,
+                "template": found.version.template,
+            }
+            _emit(app.out, info, args.json, _format_prompt)
+        elif args.prompt_command == "list":
+            _emit(app.out, list_prompts(session), args.json, _format_prompt_list)
+        elif args.prompt_command == "diff":
+            new_ref = args.new or f"{parse_ref(args.old)[0]}@latest"
+            app.out.write(diff(resolve(session, args.old), resolve(session, new_ref)))
+        else:
+            name, _ = parse_ref(args.ref)
+            if "@" not in args.ref:
+                raise CliError(
+                    f"name the version to label: {args.ref}@VERSION or {args.ref}@LABEL",
+                    EXIT_INPUT,
+                )
+            target = resolve(session, args.ref).version.version
+            if args.expect is None:
+                # Compare-and-set against what the label is at now: a move made
+                # by someone else between this read and the write is refused.
+                expected = labels_of(session, get_prompt(session, name)).get(args.label)
+            elif args.expect == "none":
+                expected = None
+            elif args.expect.isdigit():
+                expected = int(args.expect)
+            else:
+                raise CliError("--expect takes a version number or 'none'", EXIT_INPUT)
+            moved = move_label(session, name, args.label, target, expected=expected)
+            _emit(app.out, moved, args.json, _format_label_move)
+    return EXIT_OK
+
+
+def _read_prompt(path: Path, system_path: str | None) -> tuple[str, str]:
+    """A prompt file: TOML with ``template`` and an optional ``system``, or any
+    other file as the template itself, with ``--system FILE`` beside it."""
+    if path.suffix == ".toml":
+        if system_path is not None:
+            raise CliError("a .toml prompt file holds its own system prompt", EXIT_INPUT)
+        raw = _read_toml(path)
+        unknown = sorted(set(raw) - {"system", "template"})
+        if unknown:
+            raise CliError(f"{path}: unknown key(s) {', '.join(unknown)}", EXIT_INPUT)
+        system, template = raw.get("system", ""), raw.get("template", "")
+        if not isinstance(system, str) or not isinstance(template, str):
+            raise CliError(f"{path}: system and template must be strings", EXIT_INPUT)
+        return system, template
+    system = "" if system_path is None else _read_text(Path(system_path))
+    return system, _read_text(path)
+
+
+def _read_text(path: Path) -> str:
+    data = _read_bytes(path)
+    if len(data) > MAX_CONFIG_BYTES:
+        raise CliError(f"{path} is larger than {MAX_CONFIG_BYTES} bytes", EXIT_INPUT)
+    try:
+        return data.decode("utf-8")
+    except UnicodeDecodeError:
+        raise CliError(f"{path} is not UTF-8", EXIT_INPUT) from None
+
+
 async def cmd_db(args: argparse.Namespace, app: App) -> int:
     upgrade(app.engine)
     app.out.write("database is at the latest schema\n")
@@ -559,6 +658,7 @@ def build_parser() -> argparse.ArgumentParser:
     cal.add_argument("--concurrency", type=int, default=8)
     cal.set_defaults(handler=cmd_calibrate)
 
+    _add_prompt_commands(sub)
     _add_maintenance_commands(sub)
     sub.add_parser("serve", help="run the HTTP API (EVALKIT_HOST, EVALKIT_PORT)")
     return parser
@@ -579,6 +679,41 @@ def _add_report_commands(sub: Any) -> None:
     )
     mat.set_defaults(handler=cmd_report)
     mat.add_argument("--json", action="store_true", help="print JSON instead of a table")
+
+
+def _add_prompt_commands(sub: Any) -> None:
+    def with_json(p: argparse.ArgumentParser) -> argparse.ArgumentParser:
+        p.add_argument("--json", action="store_true", help="print JSON instead of a table")
+        return p
+
+    prompt = sub.add_parser("prompt", help="push, label, diff and show registry prompts")
+    prompt_sub = prompt.add_subparsers(dest="prompt_command", required=True)
+    push = prompt_sub.add_parser(
+        "push", help="store a prompt file as a new version (unchanged content is a no-op)"
+    )
+    push.add_argument("name")
+    push.add_argument("file", help="TOML with template and system, or a template file")
+    push.add_argument("--system", metavar="FILE", help="the system prompt, beside a template file")
+    push.add_argument("--note", default="", help="what changed in this version")
+    push.add_argument("--description", default="", help="the prompt's description, on first push")
+    show_p = with_json(prompt_sub.add_parser("show", help="print a version: NAME[@VERSION|LABEL]"))
+    show_p.add_argument("ref")
+    with_json(prompt_sub.add_parser("list", help="every prompt, its newest version and labels"))
+    dif = prompt_sub.add_parser("diff", help="unified diff of two versions")
+    dif.add_argument("old", help="NAME@VERSION or NAME@LABEL")
+    dif.add_argument("new", nargs="?", help="another reference (default: NAME@latest)")
+    lab = with_json(
+        prompt_sub.add_parser("label", help="point a label at a version, by compare-and-set")
+    )
+    lab.add_argument("ref", help="the version to label: NAME@VERSION or NAME@LABEL")
+    lab.add_argument("label", help="the label to move, e.g. production")
+    lab.add_argument(
+        "--expect",
+        metavar="VERSION",
+        help="refuse unless the label is at this version now ('none': must not exist yet); "
+        "default: wherever it is when read",
+    )
+    prompt.set_defaults(handler=cmd_prompt)
 
 
 def _add_maintenance_commands(sub: Any) -> None:
@@ -745,6 +880,11 @@ def _format_summary(s: RunSummary) -> str:
     ]
     if s.matrix_id is not None:
         lines.append(f"variant {s.variant} of matrix {s.matrix_id}")
+    if s.prompt is not None:
+        p = s.prompt
+        lines.append(
+            f"prompt {p['ref']}: {p['name']} version {p['version']} ({p['content_hash'][:12]})"
+        )
     for name, j in s.judges.items():
         where = j["provider"] if j.get("endpoint") is None else f"{j['provider']} ({j['endpoint']})"
         lines.append(f"judge {name}: {j['model']} on {where}, {j['mode']}, effort {j['effort']}")
@@ -851,6 +991,34 @@ def _format_matrix(r: MatrixReport) -> str:
             )
     lines += [f"note: {n}" for n in r.notes]
     return "\n".join(lines) + "\n"
+
+
+def _format_prompt(p: dict[str, Any]) -> str:
+    via = f"  via {p['label']}" if p["label"] else ""
+    labels = ", ".join(f"{k}={v}" for k, v in p["labels"].items()) or "none"
+    lines = [
+        f"prompt {p['name']} version {p['version']}{via}  {p['content_hash'][:12]}",
+        f"labels {labels}",
+    ]
+    if p["note"]:
+        lines.append(f"note {p['note']}")
+    if p["system"]:
+        lines += ["", "--- system", p["system"].rstrip("\n")]
+    lines += ["", "--- template", p["template"].rstrip("\n")]
+    return "\n".join(lines) + "\n"
+
+
+def _format_prompt_list(rows: list[Any]) -> str:
+    return "".join(
+        f"{r.name}\tv{r.latest_version}\t"
+        f"{', '.join(f'{k}={v}' for k, v in r.labels.items()) or '-'}\n"
+        for r in rows
+    )
+
+
+def _format_label_move(m: LabelMove) -> str:
+    before = "new" if m.previous is None else f"v{m.previous}"
+    return f"{m.name}@{m.label}: {before} -> v{m.version}\n"
 
 
 def _format_calibration(r: Any) -> str:

@@ -39,9 +39,17 @@ def test_identity_includes_endpoint_for_http() -> None:
 
 def test_a_claude_prompt_target_keeps_the_identity_it_had_before_providers() -> None:
     spec = PromptTargetSpec(type="prompt", template="{{q}}")
-    # Exactly the hash older versions computed: the spec without a provider field.
-    before = spec.model_dump(mode="json")
-    del before["provider"]
+    # Exactly the hash older versions computed: the spec as it was before targets
+    # named a provider or a registry prompt, field for field.
+    before = {
+        "type": "prompt",
+        "model": "claude-opus-5-5",
+        "system": "",
+        "template": "{{q}}",
+        "max_tokens": 4096,
+        "effort": "medium",
+        "fallbacks": True,
+    }
     old = sha256_hex(canonical_json({"spec": before, "extra": None}))
     assert identity(spec, {}) == old == identity(spec, {}, {"local": LOCAL})
 

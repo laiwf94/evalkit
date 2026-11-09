@@ -139,6 +139,9 @@ class Run(Base):
     # (index, name, provider, model, effort, max_tokens).
     matrix_id: Mapped[str | None] = mapped_column(ForeignKey("matrices.id"), nullable=True)
     variant: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
+    # Set when the target named a registry prompt (``evalkit.prompts``): the
+    # reference as written and the version it resolved to when the run was created.
+    prompt: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
 
     dataset: Mapped[Dataset] = relationship()
 
@@ -315,3 +318,48 @@ class Calibration(Base):
     agreement: Mapped[float] = mapped_column(Float)
     confusion: Mapped[dict[str, Any]] = mapped_column()
     created_at: Mapped[datetime] = mapped_column(default=utcnow)
+
+
+class Prompt(Base):
+    """A named prompt in the registry (``evalkit.prompts``)."""
+
+    __tablename__ = "prompts"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    name: Mapped[str] = mapped_column(String(128), unique=True)
+    description: Mapped[str] = mapped_column(Text, default="")
+    created_at: Mapped[datetime] = mapped_column(default=utcnow)
+
+
+class PromptVersion(Base):
+    """One immutable version of a prompt: its system prompt and template, and the
+    SHA-256 of both. Rows are only ever inserted."""
+
+    __tablename__ = "prompt_versions"
+    __table_args__ = (
+        UniqueConstraint("prompt_id", "version", name="uq_prompt_versions_version"),
+        UniqueConstraint("prompt_id", "content_hash", name="uq_prompt_versions_hash"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    prompt_id: Mapped[int] = mapped_column(ForeignKey("prompts.id", ondelete="CASCADE"))
+    version: Mapped[int] = mapped_column(Integer)
+    content_hash: Mapped[str] = mapped_column(String(64))
+    system: Mapped[str] = mapped_column(Text, default="")
+    template: Mapped[str] = mapped_column(Text)
+    note: Mapped[str] = mapped_column(Text, default="")
+    created_at: Mapped[datetime] = mapped_column(default=utcnow)
+
+
+class PromptLabel(Base):
+    """A movable name for one version of a prompt, such as ``production``. Moved
+    only by compare-and-set on the version it points at (``evalkit.prompts``)."""
+
+    __tablename__ = "prompt_labels"
+
+    prompt_id: Mapped[int] = mapped_column(
+        ForeignKey("prompts.id", ondelete="CASCADE"), primary_key=True
+    )
+    label: Mapped[str] = mapped_column(String(64), primary_key=True)
+    version: Mapped[int] = mapped_column(Integer)
+    updated_at: Mapped[datetime] = mapped_column(default=utcnow)
