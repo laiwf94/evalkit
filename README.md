@@ -191,6 +191,40 @@ Outputs are redacted (emails, phone numbers, card numbers, keys and your own
 patterns) before they are stored or shown to the judge. Keys come from the
 environment or secret files and are scrubbed from logs.
 
+## Conversations
+
+A `conversation` target holds a dialogue with a simulated user, one case per
+dialogue. The case input names the goal, and optionally a persona, the opening
+messages, a turn limit and, for the scripted user, what the user says and the
+phrases that mean the goal is met:
+
+```json
+{"id": "b001", "input": {"goal": "Book a table for two at 7pm", "persona": "In a hurry",
+  "user_turns": ["Hi", "A table for two", "7pm, book it"], "success": ["confirmation"],
+  "max_turns": 6}}
+```
+
+```toml
+[target]
+type = "conversation"
+model = "claude-opus-5-5"            # the assistant, on any provider
+system = "You take restaurant bookings..."
+
+[target.simulator]
+type = "llm"                         # or "scripted": no calls, deterministic
+provider = "openai"
+model = "gpt-5.1"
+```
+
+A dialogue ends when the simulated user says the goal is reached, gives up, or
+the assistant has replied `max_turns` times. The result's output is the
+assistant's last reply and its stop reason is how the dialogue ended
+(`goal_reached`, `gave_up`, `max_turns`, or `no_reply` for an empty answer),
+so existing scorers apply. Every generated turn is stored as its own row with
+its tokens, cost and latency. Each turn is cached by a hash of the dialogue so
+far as soon as it is paid for, so a run killed mid-dialogue resumes from the
+turns it has, and a rerun of an unchanged target costs nothing.
+
 ## Reading the verdict
 
 Each run reports means with bootstrap confidence intervals (normal intervals
@@ -458,7 +492,8 @@ and what would change at larger scale is in [docs/DESIGN.md](docs/DESIGN.md).
 
 ```text
 src/evalkit/datasets.py    JSONL parsing, content hashing, versioned storage
-src/evalkit/targets/       prompt, HTTP (SSRF-safe) and fake targets; templates
+src/evalkit/targets/       prompt, HTTP (SSRF-safe), conversation and fake targets; templates
+src/evalkit/simuser.py     simulated users: scripted, or played by a model in JSON
 src/evalkit/scorers/       built-in scorers, plugin registry, LLM judge, calibration
 src/evalkit/providers/     the Provider protocol and error kinds; the Claude client (caching,
                            structured output, fallback, cost); raw HTTP OpenAI-compatible

@@ -42,7 +42,15 @@ from evalkit.providers._http import (
     HttpJsonProvider,
     non_negative_int,
 )
-from evalkit.providers.base import Completion, Embeddings, ErrorKind, ProviderError, kind_for_status
+from evalkit.providers.base import (
+    Completion,
+    Embeddings,
+    ErrorKind,
+    Prompt,
+    ProviderError,
+    as_messages,
+    kind_for_status,
+)
 from evalkit.targets.base import Usage
 
 PROVIDER = "gemini"
@@ -103,7 +111,7 @@ class GeminiClient(HttpJsonProvider):
         self,
         *,
         model: str,
-        prompt: str,
+        prompt: Prompt,
         system: str,
         max_tokens: int,
         effort: str,
@@ -124,7 +132,7 @@ class GeminiClient(HttpJsonProvider):
         self,
         *,
         model: str,
-        prompt: str,
+        prompt: Prompt,
         system: str = "",
         max_tokens: int = 4096,
         effort: str = "medium",
@@ -258,8 +266,12 @@ def _vectors(payload: dict[str, Any], count: int) -> list[list[float]]:
     return [[float(x) for x in item["values"]] for item in embeddings]
 
 
-def _contents(prompt: str) -> list[dict[str, Any]]:
-    return [{"role": "user", "parts": [{"text": prompt}]}]
+def _contents(prompt: Prompt) -> list[dict[str, Any]]:
+    # Gemini calls the assistant's side of a conversation "model".
+    return [
+        {"role": "model" if m["role"] == "assistant" else "user", "parts": [{"text": m["content"]}]}
+        for m in as_messages(prompt)
+    ]
 
 
 def _model_path(model: str) -> str:

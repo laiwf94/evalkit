@@ -19,7 +19,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from collections.abc import Iterable, Sequence
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from datetime import datetime, timedelta
 from typing import Any
 
@@ -31,6 +31,7 @@ from sqlalchemy.orm import Session, sessionmaker
 from evalkit import blobs, metrics
 from evalkit.datasets import canonical_json, sha256_hex
 from evalkit.db.models import CachedResponse, utcnow
+from evalkit.targets.base import Usage
 
 log = logging.getLogger(__name__)
 
@@ -378,6 +379,42 @@ class VerdictStore:
             "output": text,
             "stop_reason": "end_turn",
             "usage": usage,
+        }
+
+        def save() -> None:
+            with self.sessions() as session:
+                store(session, [entry])
+                session.commit()
+
+        await asyncio.to_thread(save)
+
+
+class TurnStore:
+    """Conversation turns in the response cache table, keyed by a hash of the
+    dialogue so far (``evalkit.targets.conversation.turn_key``). Each turn is
+    written in its own short transaction the moment it is paid for."""
+
+    def __init__(self, sessions: sessionmaker[Session]) -> None:
+        self.sessions = sessions
+
+    async def get(self, key: str) -> Hit | None:
+        def load() -> Hit | None:
+            with self.sessions() as session:
+                hit = lookup(session, [key]).get(key)
+                session.commit()
+                return hit
+
+        return await asyncio.to_thread(load)
+
+    async def put(
+        self, key: str, owner_hash: str, text: str, stop_reason: str | None, usage: Usage
+    ) -> None:
+        entry = {
+            "key": key,
+            "target_hash": owner_hash,
+            "output": text,
+            "stop_reason": stop_reason,
+            "usage": asdict(usage),
         }
 
         def save() -> None:

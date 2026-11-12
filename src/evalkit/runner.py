@@ -50,8 +50,17 @@ from sqlalchemy.orm import Session, sessionmaker
 from evalkit import aggregates, cache, leases, matrix, metrics, prompts, runqueue
 from evalkit.blobs import BlobStore
 from evalkit.config import Settings
-from evalkit.datasets import Case, get_dataset, load_cases
-from evalkit.db.models import CaseLease, Dataset, Matrix, Result, Run, as_utc, utcnow
+from evalkit.datasets import Case, conversation_of, get_dataset, load_cases
+from evalkit.db.models import (
+    CaseLease,
+    Dataset,
+    Matrix,
+    Result,
+    ResultTurn,
+    Run,
+    as_utc,
+    utcnow,
+)
 from evalkit.errors import (
     ConflictError,
     EvalkitError,
@@ -77,10 +86,12 @@ from evalkit.redaction import Redactor
 from evalkit.runspec import CaseFilter, RunConfig, RunOptions
 from evalkit.scorers import Scorer, ScoreResult, ScorerSpec, build_scorers
 from evalkit.scorers.judge import LLMJudge, identity_changes
-from evalkit.targets import Generation, Target, TargetError, TargetSpec, Usage
+from evalkit.simuser import LLMSimulator
+from evalkit.targets import Generation, Target, TargetError, TargetSpec, Turn, Usage
+from evalkit.targets.conversation import ConversationTarget
 from evalkit.targets.factory import build_target, identity
 from evalkit.targets.prompt import PromptTarget
-from evalkit.targets.specs import PromptTargetSpec
+from evalkit.targets.specs import ConversationTargetSpec, LLMSimulatorSpec, PromptTargetSpec
 
 log = logging.getLogger(__name__)
 
@@ -161,12 +172,34 @@ class CaseResult:
     error: str = ""
     cache_entry: dict[str, Any] | None = None
     fence: int = 0
+    # A conversation's generated turns, written as ``result_turns`` rows.
+    turns: tuple[Turn, ...] = ()
 
     def row(self, run_id: str) -> dict[str, Any]:
-        values = asdict(self)
-        values.pop("cache_entry")
-        values.pop("fence")
+        values = {f: getattr(self, f) for f in _RESULT_FIELDS}
+        values["scores"] = dict(self.scores)
         return {"run_id": run_id, **values}
+
+    def turn_rows(self, run_id: str) -> list[dict[str, Any]]:
+        return [
+            {
+                "run_id": run_id,
+                "case_id": self.case_id,
+                "turn": t.index,
+                "role": t.role,
+                "content": t.content,
+                "stop_reason": t.stop_reason,
+                "cached": t.cached,
+                "latency_ms": t.latency_ms,
+                **_usage_fields(t.usage),
+            }
+            for t in self.turns
+        ]
+
+
+_RESULT_FIELDS = tuple(
+    f for f in CaseResult.__dataclass_fields__ if f not in ("cache_entry", "fence", "turns")
+)
 
 
 @dataclass(frozen=True)
@@ -373,12 +406,29 @@ class Runner:
             prices = self._price_table(target.provider)
             prices.require(target.model)
             uses.insert(0, (target.provider, prices, target.model))
+        if isinstance(target, ConversationTargetSpec):
+            uses[:0] = self._conversation_prices(target)
         if config.options.mode == "batch" and not (
             isinstance(target, PromptTargetSpec) and target.provider == ANTHROPIC
         ):
             raise InvalidInputError("batch mode is only available for Claude prompt targets")
         # The prices the run is costed at, frozen with it like its judges.
         return _Prepared(config, target_id, judges, price_record(uses))
+
+    def _conversation_prices(
+        self, target: ConversationTargetSpec
+    ) -> list[tuple[str, PriceTable, str]]:
+        """What a conversation's assistant and simulated user are priced at, after
+        checking both models have a price."""
+        models = [(target.provider, target.model)]
+        if isinstance(target.simulator, LLMSimulatorSpec):
+            models.append((target.simulator.provider, target.simulator.model))
+        uses = []
+        for provider, model in models:
+            prices = self._price_table(provider)
+            prices.require(model)
+            uses.append((provider, prices, model))
+        return uses
 
     def _price_table(self, provider: str) -> PriceTable:
         if provider == ANTHROPIC and self.providers.claude is None and self.claude is not None:
@@ -390,6 +440,10 @@ class Runner:
         cases = load_cases(session, dataset, config.filter.split, config.filter.tags)
         if not cases:
             raise InvalidInputError("the filter selects no cases from the dataset")
+        if isinstance(config.target, ConversationTargetSpec):
+            # Say which case is malformed now, not as an error on every bad case.
+            for case in cases:
+                conversation_of(case)
         return cases
 
     @staticmethod
@@ -668,7 +722,9 @@ class Runner:
             if isinstance(scorer, LLMJudge):
                 scorer.limiter = self._limiter(f"{scorer.provider}:judge", RateLimit())
         target_spec = config.target
-        if isinstance(target_spec, PromptTargetSpec) and target_spec.provider != ANTHROPIC:
+        if (
+            isinstance(target_spec, PromptTargetSpec) and target_spec.provider != ANTHROPIC
+        ) or isinstance(target_spec, ConversationTargetSpec):
             # The same check as for judges: a provider whose base URL moved since the
             # run was recorded would answer under the old identity. HTTP targets are
             # not checked: workers may tag their calls with their own headers.
@@ -680,12 +736,29 @@ class Runner:
                 )
         target = self._build_target(config)
         _check_prices(run, target, scorers)
+        options = config.options
+        limit = options.rate_limit
+        if isinstance(target, ConversationTarget):
+            # Each turn waits on its own provider's limiter; dialogues are not paced.
+            limit = RateLimit()
+            simulator = target.simulator.provider
+            target.attach(
+                store=cache.TurnStore(self.sessions) if options.use_cache else None,
+                redactor=self.redactor,
+                assistant_limiter=self._limiter(target.assistant.name, options.rate_limit),
+                simulator_limiter=(
+                    None
+                    if simulator is None
+                    else self._limiter(f"{simulator}:simuser", RateLimit())
+                ),
+                max_retry_after=options.retry.max_retry_after,
+            )
         fingerprint = self.settings.redaction.fingerprint()
         keys = {
             c.id: cache.cache_key(run.target_hash, c.input, fingerprint) for c in pending.values()
         }
         hits: dict[str, Any] = {}
-        if config.options.use_cache and pending:
+        if config.options.use_cache and target.caches_cases and pending:
             hits = await asyncio.to_thread(self._cache_lookup, list(keys.values()))
         log.info(
             "run started",
@@ -697,7 +770,7 @@ class Runner:
             config=config,
             target=target,
             scorers=scorers,
-            limiter=self._limiter(target.provider, config.options.rate_limit),
+            limiter=self._limiter(target.provider, limit),
             rng=random.Random(run.seed),  # noqa: S311 - retry jitter
             pending=pending,
             keys=keys,
@@ -854,12 +927,16 @@ class Runner:
             stop_reason=generation.stop_reason,
             latency_ms=latency_ms,
             attempts=attempts,
+            turns=generation.turns,
             **_usage_fields(generation.usage),
         )
+        if generation.turns:
+            # Served from the cache when no turn was paid for in this run.
+            result.cached = all(t.cached for t in generation.turns)
         if redacted.failed:
             # Keep the placeholder out of the cache so a rerun gets a fresh output.
             log.warning("redaction timed out; output replaced", extra={"case_id": case.id})
-        else:
+        elif ctx.target.caches_cases:  # a conversation cached each turn as it went
             result.cache_entry = {
                 "key": key,
                 "target_hash": ctx.target_hash,
@@ -1173,6 +1250,7 @@ class Runner:
                 )
                 saved = [r for r in batch if r.case_id in accepted]
                 session.add_all(Result(**r.row(run_id)) for r in saved)
+                session.add_all(ResultTurn(**t) for r in saved for t in r.turn_rows(run_id))
                 aggregates.add(session, run_id, self.owner, aggregates.fold(saved, names))
                 cache.store(session, entries)
                 session.commit()
@@ -1208,6 +1286,7 @@ class Runner:
             return False
         try:
             session.add(Result(**result.row(run_id)))
+            session.add_all(ResultTurn(**t) for t in result.turn_rows(run_id))
             session.flush()
             aggregates.add(session, run_id, self.owner, aggregates.fold([result], names))
             session.commit()
@@ -1262,6 +1341,12 @@ def _check_prices(run: Run, target: Target, scorers: Sequence[Scorer]) -> None:
     uses = [(s.provider, s.client.prices, s.model) for s in scorers if isinstance(s, LLMJudge)]
     if isinstance(target, PromptTarget):
         uses.append((target.provider, target.client.prices, target.spec.model))
+    if isinstance(target, ConversationTarget):
+        spec = target.spec
+        uses.append((target.assistant.name, target.assistant.prices, spec.model))
+        simulator = target.simulator
+        if isinstance(simulator, LLMSimulator):
+            uses.append((simulator.client.name, simulator.client.prices, simulator.spec.model))
     changes = price_changes(run.prices, price_record(uses))
     if changes:
         raise PreconditionError(

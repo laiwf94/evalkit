@@ -4,7 +4,9 @@ Prompt targets, judges and cost estimates talk to a provider through the
 ``Provider`` protocol, so a new provider is one module that implements five
 operations:
 
-* ``complete``: one prompt in, one ``Completion`` out, with usage and cost.
+* ``complete``: one prompt, or a conversation of alternating user and
+  assistant messages ending with the user, in; one ``Completion`` out, with
+  usage and cost.
 * ``count_tokens``: input tokens for a prompt, for ``evalkit estimate``.
 * ``embed``: vectors for a list of texts, with usage and cost.
 * ``price``: USD for a set of token counts on one of the provider's models.
@@ -26,8 +28,29 @@ from dataclasses import dataclass
 from enum import StrEnum
 from typing import Any, Protocol, runtime_checkable
 
+from evalkit.datasets import Message, check_alternation
+from evalkit.errors import InvalidInputError
 from evalkit.pricing import PriceTable, TokenCounts
 from evalkit.targets.base import TargetError, Usage
+
+#: What ``complete`` answers: a single user prompt, or a whole conversation.
+Prompt = str | Sequence[Message]
+
+
+def as_messages(prompt: Prompt) -> list[dict[str, str]]:
+    """``prompt`` as role and content pairs: a string is one user message, and a
+    conversation must alternate from the user and end with the user. Raises
+    InvalidInputError before anything is sent otherwise."""
+    if isinstance(prompt, str):
+        return [{"role": "user", "content": prompt}]
+    messages = list(prompt)
+    try:
+        check_alternation(messages)
+    except ValueError as exc:
+        raise InvalidInputError(str(exc)) from None
+    if not messages or messages[-1].role != "user":
+        raise InvalidInputError("a conversation sent to a model must end with a user message")
+    return [{"role": m.role, "content": m.content} for m in messages]
 
 
 class ErrorKind(StrEnum):
@@ -151,15 +174,16 @@ class Provider(Protocol):
         self,
         *,
         model: str,
-        prompt: str,
+        prompt: Prompt,
         system: str = "",
         max_tokens: int = 4096,
         effort: str = "medium",
         output_schema: dict[str, Any] | None = None,
         fallbacks: bool = True,
     ) -> Completion:
-        """Answer one prompt. ``effort`` and ``fallbacks`` are hints a provider
-        maps to its own controls, or ignores when it has none. Raises
+        """Answer one prompt, or the last user message of a conversation.
+        ``effort`` and ``fallbacks`` are hints a provider maps to its own
+        controls, or ignores when it has none. Raises
         ``ProviderError``; an unknown model raises ``InvalidInputError`` before
         any request is sent."""
         ...

@@ -27,10 +27,30 @@ class Usage:
 
 
 @dataclass(frozen=True)
+class Turn:
+    """One generated turn of a conversation, stored as a ``result_turns`` row.
+
+    ``index`` is the turn's position in the whole dialogue, counting the
+    messages the case opened with. ``usage`` is what this run paid for it:
+    nothing when it came from the turn cache. A user turn's ``stop_reason`` is
+    the simulated user's verdict (``continue``, ``goal_reached`` or ``gave_up``)."""
+
+    index: int
+    role: str
+    content: str
+    stop_reason: str | None = None
+    cached: bool = False
+    latency_ms: float = 0.0
+    usage: Usage = field(default_factory=Usage)
+
+
+@dataclass(frozen=True)
 class Generation:
     text: str
     stop_reason: str | None = None
     usage: Usage = field(default_factory=Usage)
+    # The generated turns, for a conversation target; empty for a single answer.
+    turns: tuple[Turn, ...] = ()
 
 
 class TargetError(Exception):
@@ -46,6 +66,9 @@ class TargetError(Exception):
 class Target(ABC):
     #: Rate limits and cool-downs are shared by every target with the same provider key.
     provider: str
+    #: Whether a case's whole output goes in the response cache. A target that
+    #: caches its own steps (a conversation caches each turn) sets this False.
+    caches_cases: bool = True
 
     @abstractmethod
     async def generate(self, case: Case) -> Generation:

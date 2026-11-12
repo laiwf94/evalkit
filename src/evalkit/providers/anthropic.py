@@ -35,7 +35,9 @@ from evalkit.providers.base import (
     Completion,
     Embeddings,
     ErrorKind,
+    Prompt,
     ProviderError,
+    as_messages,
     kind_for_status,
 )
 from evalkit.ratelimit import parse_retry_after
@@ -83,7 +85,7 @@ class ClaudeClient:
         self,
         *,
         model: str,
-        prompt: str,
+        prompt: Prompt,
         system: str,
         max_tokens: int,
         effort: str,
@@ -96,7 +98,7 @@ class ClaudeClient:
         params: dict[str, Any] = {
             "model": model,
             "max_tokens": max_tokens,
-            "messages": [{"role": "user", "content": prompt}],
+            "messages": as_messages(prompt),
             "output_config": output_config,
         }
         if system:
@@ -109,7 +111,7 @@ class ClaudeClient:
         self,
         *,
         model: str,
-        prompt: str,
+        prompt: Prompt,
         system: str = "",
         max_tokens: int = 4096,
         effort: str = "medium",

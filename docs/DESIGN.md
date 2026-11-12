@@ -35,6 +35,9 @@ case_leases     (run_id, case_id) key; position, owner, expires_at, fence, done
 run_workers     (run_id, worker_id) key; joined_at, expires_at: a worker daemon's slot
 results         (run_id, case_id) unique; redacted output, scores (JSON), tokens,
                 cost, judge tokens and cost, attempts, latency, error
+result_turns    (run_id, case_id, turn) key; one generated turn of a conversation
+                case: role, redacted content, stop reason or the simulated user's
+                verdict, cached, latency, tokens and cost
 run_aggregates  (run_id, shard) key; counts, token and cost sums of the results
                 written by one process (the shard)
 run_metric_aggregates  (run_id, shard, metric) key; n, sum, sum of squares, unscorable
@@ -587,6 +590,54 @@ the reference, `support@4` and the same text written inline are one target and
 share cache entries. A target spec that still holds an unresolved reference
 cannot be built into a target, so nothing executes a prompt that was not
 frozen first.
+
+## Conversations
+
+A conversation case is one dialogue. Its input is a `Conversation`
+(`datasets.py`): the opening messages, which alternate from the user and may
+be empty, a persona, a goal, `max_turns`, and for the scripted simulator the
+user's lines and the phrases that mean success. A conversation run checks every
+selected case against that shape when it is created, so a malformed case is
+named before anything is paid for.
+
+`targets/conversation.py` loops: whenever the dialogue is empty or ends with an
+assistant reply, the simulated user (`simuser.py`) gives a verdict and, to go
+on, a message; then the assistant answers the whole transcript. It stops on
+`goal_reached` or `gave_up`, after `max_turns` assistant replies (the user's
+verdict on the last reply is still asked for and kept), or on an empty reply.
+The providers take a conversation where they took a prompt: Claude's
+`messages`, chat completions after the system message, and Gemini `contents`
+with the assistant as `model`. The LLM simulator answers in JSON under an
+output schema; an answer that does not parse fails the case without a retry,
+since asking again costs as much and usually fails the same way.
+
+### Turn caching and resume
+
+A case is executed as a whole, so a crash or a retryable error halfway through
+a dialogue would otherwise pay for its first turns again. Each turn is therefore
+cached the moment it is paid for, in its own short transaction, in the response
+cache table (bounded and swept like any entry). The key is a hash of who speaks,
+their identity and everything they have seen: for the assistant, its own spec
+and endpoint (not the simulator's) and the transcript; for the simulated user,
+its spec, the case's persona, goal and script, and the transcript; both with the
+redaction fingerprint. A retried or resumed dialogue replays the turns it has for
+nothing and pays only for the rest, a rerun of an unchanged target pays for
+nothing, and a run with another simulator keeps every assistant reply to a
+dialogue it already saw. A case is not cached as a whole, since the turns are.
+
+Turns are redacted before they are cached and before the dialogue continues, so
+the assistant sees `[EMAIL]` where the user typed an address. That costs a little
+realism, but a resumed dialogue then continues from exactly the transcript an
+uninterrupted one would have had, and no personal data reaches the store. With
+`use_cache = false` nothing is cached, and an interrupted dialogue starts over.
+
+Each turn takes its own provider's limiter: the assistant's under the run's
+rate limit, the simulated user's under `<provider>:simuser`. A turn that gets a
+Retry-After cools that provider down for every caller and fails the attempt; the
+run's retry policy retries the dialogue, which replays its cached turns. The
+result's tokens and cost are the sum of the turns paid for in this run, it is
+`cached` when none was, and its `result_turns` rows are written in the same
+transaction as the result, under the same lease check.
 
 ## Calling Claude
 

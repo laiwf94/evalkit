@@ -175,6 +175,29 @@ class Result(Base):
     created_at: Mapped[datetime] = mapped_column(default=utcnow)
 
 
+class ResultTurn(Base):
+    """One generated turn of a conversation case, written with its result.
+    ``turn`` is the position in the whole dialogue, counting the case's own
+    opening messages (which are not stored here). Costs are what this run paid:
+    zero for a turn replayed from the turn cache."""
+
+    __tablename__ = "result_turns"
+
+    run_id: Mapped[str] = mapped_column(ForeignKey("runs.id", ondelete="CASCADE"), primary_key=True)
+    case_id: Mapped[str] = mapped_column(String(256), primary_key=True)
+    turn: Mapped[int] = mapped_column(Integer, primary_key=True)
+    role: Mapped[str] = mapped_column(String(16))
+    content: Mapped[str] = mapped_column(Text)
+    stop_reason: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    cached: Mapped[bool] = mapped_column(Boolean, default=False)
+    latency_ms: Mapped[float] = mapped_column(Float, default=0.0)
+    input_tokens: Mapped[int] = mapped_column(Integer, default=0)
+    output_tokens: Mapped[int] = mapped_column(Integer, default=0)
+    cache_read_tokens: Mapped[int] = mapped_column(Integer, default=0)
+    cache_write_tokens: Mapped[int] = mapped_column(Integer, default=0)
+    cost_usd: Mapped[float] = mapped_column(Float, default=0.0)
+
+
 class RunAggregate(Base):
     """Running totals of one run's results, kept in the transaction that writes them.
     Each writing process has its own ``shard`` row, so processes never wait on each

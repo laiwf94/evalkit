@@ -97,3 +97,13 @@ week 2 (#23).
   fourth provider, with every provider's tokens and cost checked against its
   price list, then a prompt version promoted to production, run and gated
   against the matrix run it replaces.
+### Agents and conversations (#24)
+
+- **Conversation cases and simulated users.** A `conversation` target holds a
+  dialogue with a simulated user, scripted or played by a model on any provider,
+  until the goal is reached, the user gives up or `max_turns` is hit. Every
+  provider takes a whole conversation. Each generated turn is a `result_turns`
+  row (migration 0012) and is cached by a hash of the dialogue so far as soon as
+  it is paid for, so a dialogue killed or retried halfway replays its turns for
+  nothing.
+

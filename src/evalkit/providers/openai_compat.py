@@ -40,7 +40,15 @@ from evalkit.providers._http import (
     HttpJsonProvider,
     non_negative_int,
 )
-from evalkit.providers.base import Completion, Embeddings, ErrorKind, ProviderError, kind_for_status
+from evalkit.providers.base import (
+    Completion,
+    Embeddings,
+    ErrorKind,
+    Prompt,
+    ProviderError,
+    as_messages,
+    kind_for_status,
+)
 from evalkit.targets.base import Usage
 
 DEFAULT_BASE_URL = "https://api.openai.com/v1"
@@ -101,7 +109,7 @@ class OpenAICompatClient(HttpJsonProvider):
         self,
         *,
         model: str,
-        prompt: str,
+        prompt: Prompt,
         system: str,
         max_tokens: int,
         effort: str,
@@ -110,7 +118,7 @@ class OpenAICompatClient(HttpJsonProvider):
         messages: list[dict[str, str]] = []
         if system:
             messages.append({"role": "system", "content": system})
-        messages.append({"role": "user", "content": prompt})
+        messages.extend(as_messages(prompt))
         body: dict[str, Any] = {
             "model": model,
             "messages": messages,
@@ -133,7 +141,7 @@ class OpenAICompatClient(HttpJsonProvider):
         self,
         *,
         model: str,
-        prompt: str,
+        prompt: Prompt,
         system: str = "",
         max_tokens: int = 4096,
         effort: str = "medium",

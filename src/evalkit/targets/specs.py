@@ -81,12 +81,58 @@ class FakeTargetSpec(_Spec):
     wrong_answer: str = Field(default="I don't know.", max_length=10_000)
 
 
-TargetSpec = Annotated[
-    PromptTargetSpec | HttpTargetSpec | FakeTargetSpec, Field(discriminator="type")
-]
+class LLMSimulatorSpec(_Spec):
+    """A simulated user played by a model (``evalkit.simuser.LLMSimulator``)."""
+
+    type: Literal["llm"]
+    provider: str = Field(default=ANTHROPIC, pattern=PROVIDER_NAME)
+    model: str = Field(default="claude-sonnet-5-5", min_length=1, max_length=64)
+    # Added to the built-in role-play instructions, for every case of the run.
+    instructions: str = Field(default="", max_length=20_000)
+    max_tokens: int = Field(default=1024, ge=16, le=16_000)
+    effort: Effort = "low"
 
 
-def target_hash(spec: PromptTargetSpec | HttpTargetSpec | FakeTargetSpec, extra: Any = None) -> str:
+class ScriptedSimulatorSpec(_Spec):
+    """A simulated user that says each case's ``user_turns`` in order and calls
+    the goal reached when a reply contains one of its ``success`` phrases. It
+    makes no calls, so its conversations cost only the assistant's turns."""
+
+    type: Literal["scripted"]
+    # Compare success phrases ignoring case.
+    ignore_case: bool = True
+
+
+SimulatorSpec = Annotated[LLMSimulatorSpec | ScriptedSimulatorSpec, Field(discriminator="type")]
+
+
+class ConversationTargetSpec(_Spec):
+    """A model holding a conversation with a simulated user, one case per dialogue.
+
+    The assistant is a model on a provider, as in a prompt target; the case input
+    is a ``Conversation`` (``evalkit.datasets``)."""
+
+    type: Literal["conversation"]
+    provider: str = Field(default=ANTHROPIC, pattern=PROVIDER_NAME)
+    model: str = Field(default="claude-opus-5-5", min_length=1, max_length=64)
+    system: str = Field(default="", max_length=200_000)
+    max_tokens: int = Field(default=4096, ge=1, le=128_000)
+    effort: Effort = "medium"
+    fallbacks: bool = True
+    simulator: SimulatorSpec = Field(default_factory=lambda: ScriptedSimulatorSpec(type="scripted"))
+
+    def assistant_part(self) -> dict[str, Any]:
+        """The fields that decide the assistant's replies: its turn cache entries
+        do not depend on who plays the user."""
+        return self.model_dump(mode="json", exclude={"simulator", "type"})
+
+
+AnyTargetSpec = PromptTargetSpec | HttpTargetSpec | FakeTargetSpec | ConversationTargetSpec
+
+TargetSpec = Annotated[AnyTargetSpec, Field(discriminator="type")]
+
+
+def target_hash(spec: AnyTargetSpec, extra: Any = None) -> str:
     """Identity of a target: every field that can change its output, in canonical form.
 
     ``extra`` carries resolved configuration that is not in the spec, such as

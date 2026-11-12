@@ -13,9 +13,17 @@ import hashlib
 import json
 import re
 from collections.abc import Iterable, Sequence
-from typing import Annotated, Any
+from typing import Annotated, Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, JsonValue, ValidationError, field_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    JsonValue,
+    ValidationError,
+    field_validator,
+    model_validator,
+)
 from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
@@ -57,6 +65,67 @@ class Case(BaseModel):
 
     def canonical(self) -> str:
         return canonical_json(self.model_dump(mode="json"))
+
+
+MAX_TURNS = 50
+MAX_MESSAGES = 200
+MAX_MESSAGE_CHARS = 100_000
+
+
+class Message(BaseModel):
+    """One message of a conversation, as every provider takes it."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    role: Literal["user", "assistant"]
+    content: str = Field(min_length=1, max_length=MAX_MESSAGE_CHARS)
+
+
+def check_alternation(messages: Sequence[Message]) -> None:
+    """Messages start with the user and alternate. Raises ValueError otherwise."""
+    for i, message in enumerate(messages):
+        wanted = "user" if i % 2 == 0 else "assistant"
+        if message.role != wanted:
+            raise ValueError(f"messages[{i}] must be from the {wanted}: roles alternate from user")
+
+
+class Conversation(BaseModel):
+    """The input of a conversation case.
+
+    ``messages`` is the dialogue so far (it may be empty, and then the simulated
+    user opens). The simulated user plays ``persona`` and pursues ``goal``; the
+    dialogue ends when it says the goal is reached, when it gives up, or after
+    ``max_turns`` assistant turns. ``user_turns`` and ``success`` drive the
+    scripted simulator (``evalkit.simuser``): the user's messages in order, and
+    phrases that mean the goal is met when an assistant reply contains one."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    messages: tuple[Message, ...] = Field(default=(), max_length=MAX_MESSAGES)
+    persona: str = Field(default="", max_length=10_000)
+    goal: str = Field(min_length=1, max_length=10_000)
+    max_turns: int = Field(default=10, ge=1, le=MAX_TURNS)
+    user_turns: tuple[Annotated[str, Field(min_length=1, max_length=MAX_MESSAGE_CHARS)], ...] = (
+        Field(default=(), max_length=MAX_TURNS + 1)
+    )
+    success: tuple[Annotated[str, Field(min_length=1, max_length=1000)], ...] = Field(
+        default=(), max_length=32
+    )
+
+    @model_validator(mode="after")
+    def _alternating(self) -> Conversation:
+        check_alternation(self.messages)
+        return self
+
+
+def conversation_of(case: Case) -> Conversation:
+    """The conversation a case's input describes, or InvalidInputError naming the case."""
+    try:
+        return Conversation.model_validate(case.input)
+    except ValidationError as exc:
+        raise InvalidInputError(
+            f"case {case.id!r} is not a conversation: {_describe(exc)}"
+        ) from None
 
 
 def canonical_json(value: Any) -> str:
