@@ -6,8 +6,9 @@ and the API.
 
 ## 0.1.0 (unreleased)
 
-The first version: an evaluation and regression-testing harness, and the
-scale-out work of week 1 of the roadmap (#22).
+The first version: an evaluation and regression-testing harness, the
+scale-out work of week 1 of the roadmap (#22), and providers and prompts from
+week 2 (#23).
 
 ### Evaluating and gating
 
@@ -58,3 +59,41 @@ scale-out work of week 1 of the roadmap (#22).
   1%; the test allows 5%) and all pause on one 429; four share a run, one is
   killed with SIGKILL, and every case is recorded exactly once; a cancelled run
   stops on every worker within 5 seconds.
+
+### Providers and prompts (#23)
+
+- **A provider protocol.** `complete`, `count_tokens`, `embed`, `price` and
+  `classify_error` behind one interface, with errors sorted into kinds (rate
+  limit, overload, timeout, safety block and others) that decide retries. The
+  Claude client moved to `providers/anthropic.py`.
+- **OpenAI-compatible servers and Gemini** over raw HTTP with httpx2, no vendor
+  SDKs: chat completions with JSON schema output, `generateContent` with a
+  response schema and thinking levels, embeddings, and safety blocks and
+  refusals reported as such. The built-in `openai` and `gemini` providers and
+  any server listed in `EVALKIT_PROVIDERS_FILE` can be named by prompt targets
+  and judges; only configured names can be called.
+- **Judges on any provider**, with each run recording its judges' identity
+  (provider, endpoint, model, mode, effort, rubric hash). `evalkit gate`
+  refuses to compare runs graded by different judges (exit 3) unless
+  `--allow-judge-change` is given, and a process whose configuration would
+  build a different judge will not execute the run.
+- **Model matrices.** A `[matrix]` table expands model, effort and
+  `max_tokens` axes into up to 64 grouped child runs. `evalkit report matrix`
+  marks the Pareto frontier over quality, cost per case and p50 or p95 latency,
+  and compares neighbours on the frontier case by case with Holm correction.
+  `POST /v1/matrices` and `GET /v1/matrices/{id}` do the same over the API.
+- **A prompt registry.** Immutable versions identified by a content hash,
+  labels moved only by compare-and-set, `evalkit prompt push|show|list|diff|label`
+  and `/v1/prompts`. A target may name `prompt = "support@production"`; the
+  version is resolved when the run is created and frozen into it.
+- **Prices per provider.** Versioned price lists for Anthropic, OpenAI and
+  Gemini (long-context rates included), overrides per provider in
+  `EVALKIT_PRICES_FILE`, the prices a run used recorded with it (a process that
+  prices them differently refuses to execute it), and input estimates for
+  providers without a counting endpoint labelled as estimates.
+- **Tests.** Strict fake OpenAI-compatible and Gemini servers that reject any
+  request a real server would, and an end-to-end test of `examples/providers`:
+  one config on Claude, OpenAI and Gemini over local sockets, judged by a
+  fourth provider, with every provider's tokens and cost checked against its
+  price list, then a prompt version promoted to production, run and gated
+  against the matrix run it replaces.

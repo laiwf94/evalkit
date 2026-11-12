@@ -1,0 +1,47 @@
+# The same 120 support questions on Claude, OpenAI and Gemini, graded by a
+# fourth model on a self-hosted OpenAI-compatible server, so no variant is
+# graded by a judge from its own family. The prompt comes from the registry:
+# whichever version is labelled production when the matrix is created is
+# frozen into all three runs.
+#
+#   export EVALKIT_PROVIDERS_FILE=examples/providers/providers.toml
+#   export EVALKIT_PRICES_FILE=examples/providers/prices.toml
+#   export ANTHROPIC_API_KEY=... OPENAI_API_KEY=... GEMINI_API_KEY=...
+#   evalkit prompt push support examples/providers/prompt-v1.toml
+#   evalkit prompt label support@1 production
+#   evalkit estimate examples/providers/matrix.toml
+#   evalkit run examples/providers/matrix.toml
+label = "providers"
+
+[dataset]
+name = "support"
+path = "../data/support.jsonl"
+
+[target]
+type = "prompt"
+prompt = "support@production"
+max_tokens = 256
+
+[[scorers]]
+type = "judge"
+name = "correct_path"
+provider = "grader"
+model = "qwen3-32b"
+max_tokens = 1024
+rubric = """5: names the same menu path as the reference, in one sentence.
+3: right destination but a step is missing or extra.
+1: wrong destination, or no menu path at all."""
+
+[[scorers]]
+type = "token_f1"
+gate = false
+
+[matrix]
+model = [
+  "claude-sonnet-5-5",
+  { provider = "openai", model = "gpt-5-mini" },
+  { provider = "gemini", model = "gemini-2.5-flash" },
+]
+
+[options]
+concurrency = 8

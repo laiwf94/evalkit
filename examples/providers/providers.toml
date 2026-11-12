@@ -1,0 +1,7 @@
+# EVALKIT_PROVIDERS_FILE for matrix.toml. openai and gemini are built in (keys
+# from OPENAI_API_KEY and GEMINI_API_KEY); this adds the grader, a model served
+# on your own machine by any OpenAI-compatible server (vLLM, llama.cpp, Ollama).
+[providers.grader]
+kind = "openai_compat"
+base_url = "http://localhost:8000/v1"
+output_limit_field = "max_tokens"

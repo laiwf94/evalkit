@@ -240,6 +240,64 @@ wherever it was when read and refuses (exit 3) if someone else moved it in the
 meantime; `--expect 3` insists on a version, `--expect none` that the label is
 new. Versions are never changed or deleted.
 
+## Three providers, a judge from elsewhere and a promotion
+
+[examples/providers](examples/providers) puts the pieces together: the bundled
+120 support questions on Claude, OpenAI and Gemini from one config, graded by
+a fourth model on a self-hosted OpenAI-compatible server (so no variant is
+graded by its own family), with the prompt taken from the registry.
+
+```console
+$ export EVALKIT_PROVIDERS_FILE=examples/providers/providers.toml  # adds the grader
+$ export EVALKIT_PRICES_FILE=examples/providers/prices.toml        # and what it costs you
+$ export ANTHROPIC_API_KEY=... OPENAI_API_KEY=... GEMINI_API_KEY=...
+$ evalkit prompt push support examples/providers/prompt-v1.toml
+$ evalkit prompt label support@1 production
+$ evalkit estimate examples/providers/matrix.toml    # OpenAI input marked (estimated)
+$ evalkit run examples/providers/matrix.toml
+```
+
+`tests/test_providers_end_to_end.py` runs exactly these steps on strict fake
+servers over real sockets, configured only through those variables (plus
+`ANTHROPIC_BASE_URL`, and `openai` and `gemini` redefined in the providers
+file), with models that answer a known share of cases correctly:
+
+```console
+$ evalkit report matrix label:providers
+quality correct_path  latency p50  frontier over quality, cost, latency
+
+variant                  status      correct_pa            95% CI   cost/case   p50 ms  frontier
+claude-sonnet-5-5        completed        96.7%    [93.3%, 99.2%]   $0.000400       17  *
+openai:gpt-5-mini        completed        64.2%    [55.8%, 72.5%]   $0.000045       14  *
+gemini:gemini-2.5-flash  completed        82.5%    [75.8%, 89.2%]   $0.000055       15  *
+
+along the frontier, cheapest first (paired; p adjusted by Holm over 2 step(s), alpha 0.05):
+  openai:gpt-5-mini -> gemini:gemini-2.5-flash: +18.3% [+7.5, +29.2]  p 0.0027  n 120  better
+  gemini:gemini-2.5-flash -> claude-sonnet-5-5: +14.2% [+6.7, +21.7]  p 0.0020  n 120  better
+```
+
+Each child run is billed from its own provider's price list and the judge from
+the grader's, and records its prompt version, judge and prices. A verdict is
+cached by judge, case and answer, so when two models give the same answer to a
+case the second costs no judge call. Then a second prompt version is promoted
+and the chosen model run on production again:
+
+```console
+$ evalkit prompt push support examples/providers/prompt-v2.toml --note "name the path"
+$ evalkit prompt label support@2 production
+support@production: v1 -> v2
+$ evalkit run examples/providers/promoted.toml
+$ evalkit gate "label:providers[gemini:gemini-2.5-flash]" label:promoted
+metric              base    cand     diff                95% CI   p (adj)    d_z  verdict
+correct_path       82.5%   93.3%   +10.8%         [+2.5, +19.2]    0.0182  +0.23  better
+
+PASS: no regression
+```
+
+The matrix runs keep version 1 and the new run has version 2, and both were
+graded by the same judge, so the gate pairs them case by case; with a
+different judge it would refuse (exit 3) unless `--allow-judge-change` is given.
+
 ## Command line
 
 | Command | Purpose |
@@ -363,6 +421,7 @@ tests compare the bodies they received with the exact bodies expected.
 | The image as a fleet | `tests/e2e/test_containers.py` builds the image from the Dockerfile (or uses `EVALKIT_E2E_IMAGE`) and runs it as an API container and eight `evalkit worker` containers on Testcontainers PostgreSQL, with an S3-compatible blob store and a recording provider behind one key. At 200 requests/s the provider measures 199.8 to 201.1 a second across the eight (the test allows 5%), no second holds more than 209 calls, and after one 429 with Retry-After: 1 no worker calls again for a second. Four of them then share an 800-case run and one is killed with SIGKILL: every case is recorded once, only cases claimed again are called twice, `evalkit run verify` and `evalkit cache scrub` pass inside a container, and a cancelled run stops on all three remaining workers, which then exit 0 on SIGTERM. |
 | Aggregates | Summaries and comparisons from aggregates and score arrays equal those computed from the results; a Hypothesis test folds random result batches into random shards and checks the totals equal one recomputation; latency percentiles from the histogram stay within 0.99% of the exact ones (Hypothesis); `run verify` finds tampered counts, sums, arrays, histograms and percentiles and `--repair` fixes them; on PostgreSQL the four-worker run with one SIGKILLed worker verifies clean. |
 | Cache and blobs | A Hypothesis test sweeps random caches by age and size and checks the dry run reports exactly what the real sweep removes, that what is left fits the limit and is always the most recently used. An entry used between the sweep's read and its delete survives. Both blob backends round-trip random bytes; tampered blobs are refused; garbage collection never removes a referenced or recent blob (Hypothesis) and spares one written again mid-scan. Requests are signed in our own code and checked by an in-memory S3 server that recomputes every signature, and on a real S3-compatible server (versitygw in Testcontainers) together with a sweep and collection on PostgreSQL. |
+| Three providers end to end | `tests/test_providers_end_to_end.py` serves strict fake Claude, OpenAI, Gemini and grader APIs on local sockets and drives the CLI (the matrix run as a child process) through `examples/providers` unchanged: each provider gets exactly its 120 requests with the registry prompt, token counts and costs match each provider's price list, the judge is called once per distinct answer and only on the grader, the frontier and both paired steps match the known accuracies, and a promoted prompt version runs, leaves the matrix runs on version 1 and passes the gate as better. |
 | API and CLI | Every endpoint, error code and exit code, over ASGI and over the wire. |
 
 ```console
@@ -426,7 +485,7 @@ src/evalkit/redaction.py   PII redaction
 src/evalkit/api.py         HTTP API
 src/evalkit/cli.py         command line
 src/evalkit/db/            SQLAlchemy models and Alembic migrations
-examples/                  demo, bundled dataset, live configs, CI workflow
+examples/                  demo, bundled dataset, live and three-provider configs, CI workflow
 benchmarks/                harness benchmarks
 ```
 

@@ -731,6 +731,21 @@ provider configuration, differ from the recorded ones. Without this, a worker
 whose `local` provider points at another server would grade part of a run with
 a different judge than the rest.
 
+### A judge from another family
+
+A judge that shares a family with one of the variants it grades tends to prefer
+that variant's answers, so a matrix over Claude, OpenAI and Gemini is best
+graded by a fourth model. `examples/providers` does this with a model on a
+self-hosted OpenAI-compatible server, priced by the operator in
+`EVALKIT_PRICES_FILE` (`[prices.grader.<model>]`; a server from the providers
+file has no list of its own). Every child run of the matrix records the same
+judge identity, so the variants compare with each other and with later runs
+under the same judge without `--allow-judge-change`. Because the verdict cache
+is keyed by the judge's fingerprint, the case and the answer, not by the run,
+two variants that give the same answer to a case share one verdict: in the
+end-to-end test 177 judge calls grade 360 answers, and each child run is
+charged for the verdicts it was first to need.
+
 ## Deciding whether a change is real
 
 Evaluation datasets are small (tens to a few hundred cases) and scores are

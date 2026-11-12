@@ -1,0 +1,5 @@
+# EVALKIT_PRICES_FILE for matrix.toml. A self-hosted server has no published
+# prices, so give it what a million tokens costs you (here: GPU time, amortised).
+[prices.grader.qwen3-32b]
+input = 0.10
+output = 0.30

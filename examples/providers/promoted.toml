@@ -1,0 +1,35 @@
+# One model on whichever prompt version is labelled production now. After
+#   evalkit prompt push support examples/providers/prompt-v2.toml
+#   evalkit prompt label support@2 production
+# this run uses version 2, and the matrix runs keep version 1, so
+#   evalkit gate "label:providers[gemini:gemini-2.5-flash]" label:promoted
+# tests the promotion with the same judge on the same cases.
+label = "promoted"
+
+[dataset]
+name = "support"
+path = "../data/support.jsonl"
+
+[target]
+type = "prompt"
+provider = "gemini"
+model = "gemini-2.5-flash"
+prompt = "support@production"
+max_tokens = 256
+
+[[scorers]]
+type = "judge"
+name = "correct_path"
+provider = "grader"
+model = "qwen3-32b"
+max_tokens = 1024
+rubric = """5: names the same menu path as the reference, in one sentence.
+3: right destination but a step is missing or extra.
+1: wrong destination, or no menu path at all."""
+
+[[scorers]]
+type = "token_f1"
+gate = false
+
+[options]
+concurrency = 8

@@ -11,7 +11,11 @@ from evalkit.scorers.calibration import parse_labels
 from evalkit.scorers.registry import JudgeSpec
 
 EXAMPLES = Path(__file__).parent.parent / "examples"
-CONFIGS = sorted(EXAMPLES.glob("*.toml")) + sorted((EXAMPLES / "live").glob("*.toml"))
+CONFIGS = (
+    sorted(EXAMPLES.glob("*.toml"))
+    + sorted((EXAMPLES / "live").glob("*.toml"))
+    + [EXAMPLES / "providers" / name for name in ("matrix.toml", "promoted.toml")]
+)
 
 
 @pytest.mark.parametrize(
