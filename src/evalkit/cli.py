@@ -70,6 +70,17 @@ from evalkit.runner import Runner
 from evalkit.runspec import RunConfig
 from evalkit.scorers.calibration import calibrate, parse_labels, save_calibration
 from evalkit.scorers.registry import JudgeSpec, judge_from_spec
+from evalkit.targets.http import HttpTarget
+from evalkit.targets.specs import HttpTargetSpec
+from evalkit.tools.sandbox import (
+    Fixtures,
+    RecordReport,
+    fixtures_path,
+    load_sandbox,
+    parse_calls,
+    record,
+    sandbox_identity,
+)
 from evalkit.worker import Worker, listen_url
 
 VERIFY = "verify"
@@ -576,6 +587,62 @@ async def cmd_db(args: argparse.Namespace, app: App) -> int:
     return EXIT_OK
 
 
+async def cmd_tools(args: argparse.Namespace, settings: Settings, out: TextIO) -> int:
+    """``evalkit tools check|record``: tool sandboxes and their fixtures. Needs no database."""
+    sandbox_file = Path(args.sandbox)
+    if args.tools_command == "check":
+        spec, fixtures = load_sandbox(sandbox_file)
+        info = {
+            "tools": [t.name for t in spec.tools],
+            "fixtures": 0 if fixtures is None else len(fixtures),
+            "identity": sandbox_identity(spec, fixtures),
+        }
+        _emit(out, info, args.json, _format_sandbox)
+        return EXIT_OK
+    spec, _ = load_sandbox(sandbox_file, fixtures=False)
+    calls = parse_calls(_read_bytes(Path(args.calls)), spec)
+    output = Path(args.output) if args.output else fixtures_path(sandbox_file, spec)
+    existing = Fixtures.parse(_read_bytes(output), spec) if output.exists() else None
+    targets: dict[str, HttpTarget] = {}
+    for tool in spec.tools:
+        if tool.endpoint is None:
+            continue
+        endpoint = settings.http_endpoints.get(tool.endpoint)
+        if endpoint is None:
+            raise CliError(
+                f"tool {tool.name} records from endpoint {tool.endpoint!r}, which is not "
+                "configured in EVALKIT_HTTP_TARGETS_FILE",
+                EXIT_INPUT,
+            )
+        targets[tool.name] = HttpTarget(
+            HttpTargetSpec(type="http", endpoint=tool.endpoint), endpoint
+        )
+
+    def backend(target: HttpTarget) -> Callable[[str, Any], Any]:
+        async def send(name: str, arguments: Any) -> Any:
+            return await target.post({"tool": name, "arguments": arguments})
+
+        return send
+
+    try:
+        fixtures, report = await record(
+            spec,
+            calls,
+            {name: backend(t) for name, t in targets.items()},
+            existing,
+            refresh=args.refresh,
+        )
+    finally:
+        for target in targets.values():
+            await target.aclose()
+    # Write what was recorded even when some calls failed, so a rerun only makes those.
+    tmp = output.with_name(output.name + ".tmp")
+    await asyncio.to_thread(tmp.write_text, fixtures.to_jsonl(), encoding="utf-8")
+    await asyncio.to_thread(tmp.replace, output)
+    _emit(out, report, args.json, _format_record)
+    return EXIT_UNUSABLE if report.failed else EXIT_OK
+
+
 def cmd_serve(settings: Settings) -> int:
     serve(settings)
     return EXIT_OK
@@ -659,6 +726,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     _add_prompt_commands(sub)
     _add_maintenance_commands(sub)
+    _add_tools_commands(sub)
     sub.add_parser("serve", help="run the HTTP API (EVALKIT_HOST, EVALKIT_PORT)")
     return parser
 
@@ -713,6 +781,23 @@ def _add_prompt_commands(sub: Any) -> None:
         "default: wherever it is when read",
     )
     prompt.set_defaults(handler=cmd_prompt)
+
+
+def _add_tools_commands(sub: Any) -> None:
+    tools = sub.add_parser("tools", help="check tool sandboxes and record their fixtures")
+    tools_sub = tools.add_subparsers(dest="tools_command", required=True)
+    check = tools_sub.add_parser("check", help="validate a sandbox file and its fixtures")
+    check.add_argument("sandbox", help="TOML file with a [sandbox] table")
+    check.add_argument("--json", action="store_true", help="print JSON instead of a table")
+    rec = tools_sub.add_parser(
+        "record", help="send a JSONL file of calls to the tools' endpoints and keep the answers"
+    )
+    rec.add_argument("sandbox", help="TOML file with a [sandbox] table")
+    rec.add_argument("calls", help='JSONL of {"tool": ..., "arguments": {...}}')
+    rec.add_argument("-o", "--output", help="fixture file (default: the sandbox's fixtures)")
+    rec.add_argument("--refresh", action="store_true", help="call again for calls already recorded")
+    rec.add_argument("--json", action="store_true", help="print JSON instead of a table")
+    tools.set_defaults(handler=cmd_tools)
 
 
 def _add_maintenance_commands(sub: Any) -> None:
@@ -790,6 +875,8 @@ def main(argv: Sequence[str] | None = None, out: TextIO | None = None) -> int:
 
 
 async def _dispatch(args: argparse.Namespace, settings: Settings, out: TextIO) -> int:
+    if args.command == "tools":
+        return await cmd_tools(args, settings, out)
     app = App(settings, out)
     handler: Callable[[argparse.Namespace, App], Any] = args.handler
     try:
@@ -1007,6 +1094,19 @@ def _format_matrix(r: MatrixReport) -> str:
                 f"p {c.p_adjusted:.4f}  n {c.n_pairs}  {c.verdict}"
             )
     lines += [f"note: {n}" for n in r.notes]
+    return "\n".join(lines) + "\n"
+
+
+def _format_sandbox(info: dict[str, Any]) -> str:
+    return (
+        f"{len(info['tools'])} tools ({', '.join(info['tools'])}), "
+        f"{info['fixtures']} fixtures, identity {info['identity'][:12]}\n"
+    )
+
+
+def _format_record(r: RecordReport) -> str:
+    lines = [f"recorded {r.recorded}, already recorded {r.skipped}, failed {len(r.failed)}"]
+    lines += [f"  failed: {f}" for f in r.failed]
     return "\n".join(lines) + "\n"
 
 

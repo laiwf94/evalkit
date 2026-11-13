@@ -154,13 +154,19 @@ class HttpTarget(Target):
         return f"[{first}]" if first.version == 6 else str(first)
 
     async def generate(self, case: Case) -> Generation:
+        document = await self.post({"input": case.input})
+        return Generation(text=self._extract(document), stop_reason=None)
+
+    async def post(self, payload: Any) -> Any:
+        """POST ``payload`` as JSON to the endpoint, under every check above, and
+        return the parsed JSON answer. The tool recorder uses it as well."""
         address = await self._pinned_address()
         url = f"{self._scheme}://{address}:{self._port}{self._path}"
         headers = {**self.endpoint.headers, "Host": self._host_header}
         headers.update({k: v.get_secret_value() for k, v in self.endpoint.secret_headers.items()})
         extensions = {"sni_hostname": self._host} if self._scheme == "https" else {}
         request = self._client.build_request(
-            "POST", url, json={"input": case.input}, headers=headers, extensions=extensions
+            "POST", url, json=payload, headers=headers, extensions=extensions
         )
         try:
             response = await self._client.send(request, stream=True)
@@ -182,7 +188,14 @@ class HttpTarget(Target):
             body = await self._read_capped(response)
         finally:
             await response.aclose()
-        return Generation(text=self._extract(response, body), stop_reason=None)
+        try:
+            return json.loads(body)
+        except (ValueError, RecursionError):
+            raise TargetError(
+                f"endpoint {self.spec.endpoint!r} did not return JSON "
+                f"(content-type {response.headers.get('content-type', 'missing')})",
+                retryable=False,
+            ) from None
 
     async def _read_capped(self, response: httpx2.Response) -> bytes:
         status = response.status_code
@@ -221,15 +234,7 @@ class HttpTarget(Target):
             ) from None
         return b"".join(chunks)
 
-    def _extract(self, response: httpx2.Response, body: bytes) -> str:
-        try:
-            document = json.loads(body)
-        except (ValueError, RecursionError):
-            raise TargetError(
-                f"endpoint {self.spec.endpoint!r} did not return JSON "
-                f"(content-type {response.headers.get('content-type', 'missing')})",
-                retryable=False,
-            ) from None
+    def _extract(self, document: Any) -> str:
         value: Any = document
         for part in self.spec.response_field.split("."):
             if not isinstance(value, Mapping) or part not in value:

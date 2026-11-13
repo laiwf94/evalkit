@@ -107,3 +107,9 @@ week 2 (#23).
   it is paid for, so a dialogue killed or retried halfway replays its turns for
   nothing.
 
+- **A tool sandbox.** `evalkit.tools` answers an agent's tool calls without
+  real systems: tool schemas checked with jsonschema, scripted responses matched
+  on a subset of the arguments, fixtures recorded from the real tools with
+  `evalkit tools record`, per-session and per-tool call limits, and latency and
+  failures injected deterministically per case. Every call, answered or not, is
+  kept as the case's trajectory. `evalkit tools check` validates a sandbox.

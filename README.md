@@ -225,6 +225,50 @@ its tokens, cost and latency. Each turn is cached by a hash of the dialogue so
 far as soon as it is paid for, so a run killed mid-dialogue resumes from the
 turns it has, and a rerun of an unchanged target costs nothing.
 
+### Tool sandboxes
+
+Agents call tools, and an evaluation must not book real flights or depend on
+live data, so a tool sandbox answers instead. A sandbox file lists each tool
+with a JSON Schema for its arguments (and optionally its result), scripted
+responses matched on a subset of the arguments, call limits, and injected
+latency and failures:
+
+```toml
+[sandbox]
+max_calls = 20                       # per session (case), answered or not
+fixtures = "fixtures/booking.jsonl"  # recorded answers, beside this file
+
+[[sandbox.tools]]
+name = "search_flights"
+description = "Find flights between two airports on a date."
+input_schema = { type = "object", required = ["origin", "destination", "date"], properties = { origin = { type = "string" }, destination = { type = "string" }, date = { type = "string" } } }
+max_calls = 3
+latency_ms = 80                      # plus up to jitter_ms
+failure_rate = 0.05                  # or fail_calls = [2]: the second call fails
+endpoint = "flights"                 # where `evalkit tools record` gets real answers
+
+[[sandbox.tools.responses]]
+when = { origin = "LHR" }            # a subset of the arguments
+result = { flights = [{ id = "BA117", price = 420 }] }
+times = 1                            # then the next matching rule
+```
+
+A call is answered by the first scripted rule that matches, else by a recorded
+fixture for exactly those arguments, else with a `no_response` error. Unknown
+tools, invalid arguments (with the schema's reason), calls over a limit and
+injected failures are error results the agent can react to, never exceptions,
+and every call is kept in order as the case's trajectory. Failures and jitter
+are seeded per case, so a rerun sees the same ones.
+
+`evalkit tools record SANDBOX CALLS` sends each `{"tool", "arguments"}` line of
+CALLS to the tool's endpoint (one from `EVALKIT_HTTP_TARGETS_FILE`, through the
+SSRF-checked client) as `{"tool": ..., "arguments": ...}`, expects
+`{"result": ...}` or `{"error": "..."}` back, and writes the answers as
+fixtures. Calls already recorded are skipped unless `--refresh`, so an
+interrupted recording resumes; a call that fails is reported (exit 3) and the
+rest are still written. `evalkit tools check SANDBOX` validates the file and
+its fixtures and prints the sandbox's identity hash.
+
 ## Reading the verdict
 
 Each run reports means with bootstrap confidence intervals (normal intervals
@@ -353,6 +397,8 @@ different judge it would refuse (exit 3) unless `--allow-judge-change` is given.
 | `evalkit prompt show REF`, `evalkit prompt list` | A version's content and labels; every prompt with its newest version and labels. |
 | `evalkit prompt diff REF [REF]` | Unified diff of two versions (the second defaults to the newest). |
 | `evalkit prompt label REF LABEL [--expect V\|none]` | Point a label at a version by compare-and-set; exit 3 if it moved. |
+| `evalkit tools check SANDBOX` | Validate a tool sandbox and its fixtures; print its identity. |
+| `evalkit tools record SANDBOX CALLS [-o FILE] [--refresh]` | Record the tools' real answers to a JSONL list of calls as fixtures; exit 3 if any call failed. |
 | `evalkit cache sweep [--max-age 30d] [--max-size 20GiB] [--dry-run]` | Delete old and least recently used cache entries, then unreferenced blobs. |
 | `evalkit cache scrub` | Read every blob and check it against its digest; exit 3 if any is corrupt. |
 | `evalkit serve`, `evalkit db upgrade` | Run the API; migrate PostgreSQL. |
@@ -494,6 +540,8 @@ and what would change at larger scale is in [docs/DESIGN.md](docs/DESIGN.md).
 src/evalkit/datasets.py    JSONL parsing, content hashing, versioned storage
 src/evalkit/targets/       prompt, HTTP (SSRF-safe), conversation and fake targets; templates
 src/evalkit/simuser.py     simulated users: scripted, or played by a model in JSON
+src/evalkit/tools/         the tool sandbox: schemas, scripted and recorded answers, limits,
+                           latency and failure injection; recording fixtures
 src/evalkit/scorers/       built-in scorers, plugin registry, LLM judge, calibration
 src/evalkit/providers/     the Provider protocol and error kinds; the Claude client (caching,
                            structured output, fallback, cost); raw HTTP OpenAI-compatible

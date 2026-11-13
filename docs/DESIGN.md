@@ -639,6 +639,40 @@ result's tokens and cost are the sum of the turns paid for in this run, it is
 `cached` when none was, and its `result_turns` rows are written in the same
 transaction as the result, under the same lease check.
 
+### The tool sandbox
+
+An agent's tools are part of what is evaluated, but calling the real ones would
+make runs neither safe nor repeatable, so `tools/sandbox.py` answers them. A
+`ToolSandbox` is made per session (one case) and is never shared, so limits and
+scripted `times` count within a case. Each call goes through, in order: the
+session's `max_calls`, a known tool, the tool's `max_calls`, then its input
+schema (draft 2020-12; schemas are checked when the file is loaded, and so are
+scripted results against an output schema). Failing any of these is answered
+as an error the agent sees, with the reason, because how an agent recovers from
+a bad call is part of what is scored; a call that names a real tool counts
+towards its limit even when its arguments are invalid, so an agent cannot loop
+on a broken call forever.
+
+A valid call is answered by the first scripted rule whose `when` is a typed
+subset of the arguments (`1` matches `1.0` but not `true`), else by a recorded
+fixture keyed by the tool and the arguments' canonical JSON, so key order does
+not matter. Several recordings of one call replay in order and the last one
+repeats, which models a tool whose answer changes after a booking. Injected
+failures and jitter come from a hash of the seed, the session id, the tool and
+the tool's call number, not from a shared random generator, so a case sees the
+same failures however many cases run beside it, and a resumed case the same
+ones as before. Only calls that pass validation are numbered, so `fail_calls =
+[2]` means the second real call.
+
+Fixtures are recorded against the real tool through the same SSRF-checked
+client as HTTP targets: the endpoint comes from operator config, its address is
+checked and pinned, and nothing is followed. Records whose tool, arguments or
+result the current schemas reject are refused when the file is loaded, so a
+schema change cannot leave fixtures that silently never match. The sandbox's
+identity hashes the tools, the seed, the limits and the fixtures' content, but
+not the recording endpoints or the fixture file's path, so it can be part of a
+target's identity: a changed answer is a changed target, a moved file is not.
+
 ## Calling Claude
 
 All Claude calls go through one provider (`providers/anthropic.py`):
@@ -889,6 +923,10 @@ band.
 | Redaction patterns | 64, 1,000 characters each, 250 ms each | |
 | HTTP target response | 1 MiB default, 64 MiB max | Checked before buffering. |
 | HTTP target timeout | 30 s default | |
+| Tools per sandbox | 64 | |
+| Tool calls per session | 50 default, 10,000 max | Answered or not. |
+| Tool arguments, tool result | 64 KiB, 1 MiB | Canonical JSON. |
+| Fixture file | 64 MiB, 100,000 records | |
 | Case timeout | 600 s default, retries included | |
 | Retry attempts | 5 default, 20 max | |
 | Retry-After honoured | up to 120 s by default | |
