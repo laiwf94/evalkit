@@ -113,3 +113,11 @@ week 2 (#23).
   `evalkit tools record`, per-session and per-tool call limits, and latency and
   failures injected deterministically per case. Every call, answered or not, is
   kept as the case's trajectory. `evalkit tools check` validates a sandbox.
+
+- **Agent targets and stored trajectories.** An `agent` target runs a model on
+  Claude, an OpenAI-compatible server or Gemini against a tool sandbox through
+  one normalised tool loop, until it answers without a tool call or reaches
+  `max_steps`. Every model reply and tool call is a `result_steps` row
+  (migration 0013), served at `GET /v1/runs/{id}/results/{case}/trajectory`.
+  Replies are cached by a hash of the transcript so far, so a case killed or
+  retried mid-trajectory pays only for the replies it lacks.

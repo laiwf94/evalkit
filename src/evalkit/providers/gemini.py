@@ -22,6 +22,10 @@
 * ``count_tokens`` posts the same request to ``models/{model}:countTokens``.
 * ``embed`` posts to ``models/{model}:batchEmbedContents``. Its response
   carries no token counts, so embedding usage is recorded as zero tokens.
+* ``complete_tools`` declares the tools in ``functionDeclarations`` (with the
+  JSON schema as ``parametersJsonSchema``), sends the model's calls back as
+  ``functionCall`` parts with their ``thoughtSignature`` and each answer as a
+  ``functionResponse`` part. Calls without an id are named by their position.
 * Errors carry a ``google.rpc`` status; a ``RetryInfo`` detail's
   ``retryDelay`` becomes the retry delay when no Retry-After header is sent.
 """
@@ -50,6 +54,13 @@ from evalkit.providers.base import (
     ProviderError,
     as_messages,
     kind_for_status,
+)
+from evalkit.providers.tools import (
+    AgentMessage,
+    ToolCompletion,
+    ToolDefinition,
+    ToolUse,
+    check_transcript,
 )
 from evalkit.targets.base import Usage
 
@@ -154,6 +165,44 @@ class GeminiClient(HttpJsonProvider):
             return self.completion_from_payload(payload, requested_model=model)
         except (ValueError, TypeError, KeyError, IndexError, AttributeError) as exc:
             raise self.malformed(f"{type(exc).__name__}: {exc}") from None
+
+    async def complete_tools(
+        self,
+        *,
+        model: str,
+        messages: Sequence[AgentMessage],
+        tools: Sequence[ToolDefinition],
+        system: str = "",
+        max_tokens: int = 4096,
+        effort: str = "medium",
+        fallbacks: bool = True,
+    ) -> ToolCompletion:
+        self.prices.require(model)
+        check_transcript(messages)
+        config: dict[str, Any] = {"maxOutputTokens": max_tokens}
+        if self.thinking_level:
+            config["thinkingConfig"] = {"thinkingLevel": THINKING_LEVEL.get(effort, "high")}
+        body: dict[str, Any] = {
+            "contents": [_wire_content(m) for m in messages],
+            "generationConfig": config,
+        }
+        if tools:
+            body["tools"] = [{"functionDeclarations": [_declaration(t) for t in tools]}]
+        if system:
+            body["systemInstruction"] = {"parts": [{"text": system}]}
+        payload = await self.post_json(f"/{_model_path(model)}:generateContent", body)
+        try:
+            completion = self.completion_from_payload(payload, requested_model=model)
+            uses = _function_calls(payload["candidates"][0], len(messages))
+        except (ValueError, TypeError, KeyError, IndexError, AttributeError) as exc:
+            raise self.malformed(f"{type(exc).__name__}: {exc}") from None
+        return ToolCompletion(
+            text=completion.text,
+            tool_uses=uses,
+            stop_reason=completion.stop_reason,
+            usage=completion.usage,
+            model=completion.model,
+        )
 
     def completion_from_payload(
         self, payload: dict[str, Any], *, requested_model: str
@@ -272,6 +321,62 @@ def _contents(prompt: Prompt) -> list[dict[str, Any]]:
         {"role": "model" if m["role"] == "assistant" else "user", "parts": [{"text": m["content"]}]}
         for m in as_messages(prompt)
     ]
+
+
+def _declaration(tool: ToolDefinition) -> dict[str, Any]:
+    out: dict[str, Any] = {"name": tool.name, "parametersJsonSchema": tool.input_schema}
+    if tool.description:
+        out["description"] = tool.description
+    return out
+
+
+def _wire_content(message: AgentMessage) -> dict[str, Any]:
+    if message.role == "user":
+        return {"role": "user", "parts": [{"text": message.text}]}
+    if message.role == "tool":
+        return {
+            "role": "user",
+            "parts": [
+                {"functionResponse": {"id": o.id, "name": o.name, "response": o.payload()}}
+                for o in message.outcomes
+            ],
+        }
+    parts: list[dict[str, Any]] = []
+    if message.text:
+        parts.append({"text": message.text})
+    for use in message.tool_uses:
+        args = use.arguments if isinstance(use.arguments, dict) else {"value": use.arguments}
+        part: dict[str, Any] = {"functionCall": {"id": use.id, "name": use.name, "args": args}}
+        if use.signature is not None:
+            part["thoughtSignature"] = use.signature
+        parts.append(part)
+    return {"role": "model", "parts": parts}
+
+
+def _function_calls(candidate: dict[str, Any], turn: int) -> tuple[ToolUse, ...]:
+    parts = (candidate.get("content") or {}).get("parts") or []
+    uses: list[ToolUse] = []
+    for part in parts:
+        call = part.get("functionCall")
+        if call is None:
+            continue
+        name = call["name"]
+        if not isinstance(name, str) or not name:
+            raise ValueError("a functionCall has no name")
+        call_id = call.get("id")
+        if not isinstance(call_id, str) or not call_id:
+            # Deterministic, so a replayed transcript has the same ids.
+            call_id = f"call_{turn}_{len(uses)}"
+        signature = part.get("thoughtSignature")
+        uses.append(
+            ToolUse(
+                call_id,
+                name,
+                call.get("args") or {},
+                signature if isinstance(signature, str) else None,
+            )
+        )
+    return tuple(uses)
 
 
 def _model_path(model: str) -> str:

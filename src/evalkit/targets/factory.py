@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING
 
 from evalkit.errors import InvalidInputError
 from evalkit.simuser import build_simulator
+from evalkit.targets.agent import AgentTarget
 from evalkit.targets.base import Target
 from evalkit.targets.conversation import ConversationTarget
 from evalkit.targets.fake import FakeTarget
@@ -14,6 +15,7 @@ from evalkit.targets.http import HttpEndpoint, HttpTarget
 from evalkit.targets.prompt import PromptTarget
 from evalkit.targets.specs import (
     ANTHROPIC,
+    AgentTargetSpec,
     AnyTargetSpec,
     ConversationTargetSpec,
     FakeTargetSpec,
@@ -43,10 +45,11 @@ def identity(
     providers: Mapping[str, ProviderConfig] | None = None,
 ) -> str:
     """The target hash, including the resolved endpoint for HTTP targets and,
-    for a prompt target on a provider other than Claude, where that provider is."""
+    for a prompt or agent target on a provider other than Claude, where that
+    provider is."""
     if isinstance(spec, HttpTargetSpec):
         return target_hash(spec, resolve_endpoint(spec, endpoints).fingerprint())
-    if isinstance(spec, PromptTargetSpec) and spec.provider != ANTHROPIC:
+    if isinstance(spec, PromptTargetSpec | AgentTargetSpec) and spec.provider != ANTHROPIC:
         return target_hash(spec, provider_endpoint(spec.provider, providers))
     if isinstance(spec, ConversationTargetSpec):
         return target_hash(spec, conversation_endpoints(spec, providers))
@@ -92,6 +95,12 @@ def build_target(
             return HttpTarget(spec, resolve_endpoint(spec, endpoints))
         case FakeTargetSpec():
             return FakeTarget(spec)
+        case AgentTargetSpec():
+            return AgentTarget(
+                spec,
+                providers.get(spec.provider),
+                endpoint=provider_endpoint(spec.provider, providers.configs),
+            )
         case ConversationTargetSpec():
             where = conversation_endpoints(spec, providers.configs)
             simulator = spec.simulator

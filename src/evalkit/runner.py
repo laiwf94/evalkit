@@ -56,6 +56,7 @@ from evalkit.db.models import (
     Dataset,
     Matrix,
     Result,
+    ResultStep,
     ResultTurn,
     Run,
     as_utc,
@@ -87,11 +88,17 @@ from evalkit.runspec import CaseFilter, RunConfig, RunOptions
 from evalkit.scorers import Scorer, ScoreResult, ScorerSpec, build_scorers
 from evalkit.scorers.judge import LLMJudge, identity_changes
 from evalkit.simuser import LLMSimulator
-from evalkit.targets import Generation, Target, TargetError, TargetSpec, Turn, Usage
+from evalkit.targets import Generation, Step, Target, TargetError, TargetSpec, Turn, Usage
+from evalkit.targets.agent import AgentTarget
 from evalkit.targets.conversation import ConversationTarget
 from evalkit.targets.factory import build_target, identity
 from evalkit.targets.prompt import PromptTarget
-from evalkit.targets.specs import ConversationTargetSpec, LLMSimulatorSpec, PromptTargetSpec
+from evalkit.targets.specs import (
+    AgentTargetSpec,
+    ConversationTargetSpec,
+    LLMSimulatorSpec,
+    PromptTargetSpec,
+)
 
 log = logging.getLogger(__name__)
 
@@ -174,6 +181,8 @@ class CaseResult:
     fence: int = 0
     # A conversation's generated turns, written as ``result_turns`` rows.
     turns: tuple[Turn, ...] = ()
+    # An agent's trajectory, written as ``result_steps`` rows.
+    steps: tuple[Step, ...] = ()
 
     def row(self, run_id: str) -> dict[str, Any]:
         values = {f: getattr(self, f) for f in _RESULT_FIELDS}
@@ -196,9 +205,35 @@ class CaseResult:
             for t in self.turns
         ]
 
+    def step_rows(self, run_id: str) -> list[dict[str, Any]]:
+        return [
+            {
+                "run_id": run_id,
+                "case_id": self.case_id,
+                "step": s.index,
+                "kind": s.kind,
+                "text": s.text,
+                "stop_reason": _clip(s.stop_reason, 32),
+                # A model may name a tool that does not exist, at any length.
+                "tool": _clip(s.tool, 64),
+                "call_id": _clip(s.call_id, 128),
+                "arguments": s.arguments,
+                "status": s.status,
+                "result": s.result,
+                "error": s.error,
+                "source": s.source,
+                "cached": s.cached,
+                "latency_ms": s.latency_ms,
+                **_usage_fields(s.usage),
+            }
+            for s in self.steps
+        ]
+
 
 _RESULT_FIELDS = tuple(
-    f for f in CaseResult.__dataclass_fields__ if f not in ("cache_entry", "fence", "turns")
+    f
+    for f in CaseResult.__dataclass_fields__
+    if f not in ("cache_entry", "fence", "turns", "steps")
 )
 
 
@@ -400,7 +435,7 @@ class Runner:
         target = config.target
         target_id = identity(target, self.settings.http_endpoints, self.providers.configs)
         uses = [(s.provider, s.client.prices, s.model) for s in scorers if isinstance(s, LLMJudge)]
-        if isinstance(target, PromptTargetSpec):
+        if isinstance(target, PromptTargetSpec | AgentTargetSpec):
             # An unknown model would run with no cost accounting: refuse it before
             # recording the run, with the prices the target's provider will use.
             prices = self._price_table(target.provider)
@@ -724,7 +759,7 @@ class Runner:
         target_spec = config.target
         if (
             isinstance(target_spec, PromptTargetSpec) and target_spec.provider != ANTHROPIC
-        ) or isinstance(target_spec, ConversationTargetSpec):
+        ) or isinstance(target_spec, ConversationTargetSpec | AgentTargetSpec):
             # The same check as for judges: a provider whose base URL moved since the
             # run was recorded would answer under the old identity. HTTP targets are
             # not checked: workers may tag their calls with their own headers.
@@ -751,6 +786,15 @@ class Runner:
                     if simulator is None
                     else self._limiter(f"{simulator}:simuser", RateLimit())
                 ),
+                max_retry_after=options.retry.max_retry_after,
+            )
+        if isinstance(target, AgentTarget):
+            # Each model call waits on its provider's limiter; cases are not paced.
+            limit = RateLimit()
+            target.attach(
+                store=cache.TurnStore(self.sessions) if options.use_cache else None,
+                redactor=self.redactor,
+                limiter=self._limiter(target.client.name, options.rate_limit),
                 max_retry_after=options.retry.max_retry_after,
             )
         fingerprint = self.settings.redaction.fingerprint()
@@ -928,15 +972,18 @@ class Runner:
             latency_ms=latency_ms,
             attempts=attempts,
             turns=generation.turns,
+            steps=generation.steps,
             **_usage_fields(generation.usage),
         )
         if generation.turns:
             # Served from the cache when no turn was paid for in this run.
             result.cached = all(t.cached for t in generation.turns)
+        elif generation.steps:
+            result.cached = all(s.cached for s in generation.steps if s.kind == "model")
         if redacted.failed:
             # Keep the placeholder out of the cache so a rerun gets a fresh output.
             log.warning("redaction timed out; output replaced", extra={"case_id": case.id})
-        elif ctx.target.caches_cases:  # a conversation cached each turn as it went
+        elif ctx.target.caches_cases:  # conversations and agents cached each step as they went
             result.cache_entry = {
                 "key": key,
                 "target_hash": ctx.target_hash,
@@ -1251,6 +1298,7 @@ class Runner:
                 saved = [r for r in batch if r.case_id in accepted]
                 session.add_all(Result(**r.row(run_id)) for r in saved)
                 session.add_all(ResultTurn(**t) for r in saved for t in r.turn_rows(run_id))
+                session.add_all(ResultStep(**t) for r in saved for t in r.step_rows(run_id))
                 aggregates.add(session, run_id, self.owner, aggregates.fold(saved, names))
                 cache.store(session, entries)
                 session.commit()
@@ -1287,6 +1335,7 @@ class Runner:
         try:
             session.add(Result(**result.row(run_id)))
             session.add_all(ResultTurn(**t) for t in result.turn_rows(run_id))
+            session.add_all(ResultStep(**t) for t in result.step_rows(run_id))
             session.flush()
             aggregates.add(session, run_id, self.owner, aggregates.fold([result], names))
             session.commit()
@@ -1341,6 +1390,8 @@ def _check_prices(run: Run, target: Target, scorers: Sequence[Scorer]) -> None:
     uses = [(s.provider, s.client.prices, s.model) for s in scorers if isinstance(s, LLMJudge)]
     if isinstance(target, PromptTarget):
         uses.append((target.provider, target.client.prices, target.spec.model))
+    if isinstance(target, AgentTarget):
+        uses.append((target.client.name, target.client.prices, target.spec.model))
     if isinstance(target, ConversationTarget):
         spec = target.spec
         uses.append((target.assistant.name, target.assistant.prices, spec.model))
@@ -1370,6 +1421,10 @@ def _record(result: CaseResult, source: str, provider: str) -> None:
     metrics.TOKENS.labels("cache_write").inc(result.cache_write_tokens)
     metrics.COST.labels("target").inc(result.cost_usd)
     metrics.COST.labels("judge").inc(result.judge_cost_usd)
+
+
+def _clip(value: str | None, limit: int) -> str | None:
+    return value if value is None or len(value) <= limit else value[:limit]
 
 
 def _usage_fields(usage: Usage) -> dict[str, Any]:

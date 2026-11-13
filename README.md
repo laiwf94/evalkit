@@ -269,6 +269,35 @@ interrupted recording resumes; a call that fails is reported (exit 3) and the
 rest are still written. `evalkit tools check SANDBOX` validates the file and
 its fixtures and prints the sandbox's identity hash.
 
+### Agent targets
+
+An `agent` target gives a model on any provider (Claude, an OpenAI-compatible
+server or Gemini) the case as a task and the sandbox's tools, and runs the same
+tool loop on all of them: the model replies, every tool it asks for is answered
+by the sandbox and sent back, until it answers without asking for a tool or has
+replied `max_steps` times.
+
+```toml
+[target]
+type = "agent"
+provider = "anthropic"               # or any provider in EVALKIT_PROVIDERS_FILE
+model = "claude-opus-5-5"
+system = "You book restaurant tables with the tools you have."
+template = "Book a table: {{ request }}"
+max_steps = 12                       # model replies per case (stop reason max_steps)
+sandbox = "booking.toml"             # read in, with its fixtures, by evalkit run
+```
+
+The output is the model's last reply and the stop reason is the provider's
+own, or `max_steps`. The whole trajectory is stored per case in order, one row
+per model reply (text, stop reason, tokens, cost, latency) and one per tool
+call (arguments, the sandbox's status, the result or error the model got, and
+whether a script or a fixture answered), and served at
+`GET /v1/runs/{id}/results/{case}/trajectory`. Each model reply is cached by a
+hash of the transcript so far as soon as it is paid for, so a run killed or a
+case retried mid-trajectory replays the replies it has for nothing, and changing
+one tool's answer reuses every reply before the model first saw it.
+
 ## Reading the verdict
 
 Each run reports means with bootstrap confidence intervals (normal intervals
@@ -465,6 +494,7 @@ Every `/v1` route takes `Authorization: Bearer <token>`.
 | `GET /v1/runs[?label=]` | Recent runs. |
 | `GET /v1/runs/{id}` | Summary: progress, metrics with intervals, tokens, cost, latency. |
 | `GET /v1/runs/{id}/results?after=&limit=` | Per-case outputs and scores, paged. |
+| `GET /v1/runs/{id}/results/{case}/trajectory` | One case's result with its agent steps (model replies and tool calls) or conversation turns, in order. |
 | `POST /v1/runs/{id}/resume` | Put an interrupted or failed run back in the queue. |
 | `POST /v1/runs/{id}/cancel` | Cancel a run: `cancelled` at once if nobody is executing it, else `cancelling` until every worker has stopped. 409 for a completed run. |
 | `POST /v1/matrices` | Queue every run of a config with a `matrix`. 202 with the matrix id and run summaries. |
@@ -538,15 +568,16 @@ and what would change at larger scale is in [docs/DESIGN.md](docs/DESIGN.md).
 
 ```text
 src/evalkit/datasets.py    JSONL parsing, content hashing, versioned storage
-src/evalkit/targets/       prompt, HTTP (SSRF-safe), conversation and fake targets; templates
+src/evalkit/targets/       prompt, HTTP (SSRF-safe), conversation, agent and fake targets; templates
 src/evalkit/simuser.py     simulated users: scripted, or played by a model in JSON
 src/evalkit/tools/         the tool sandbox: schemas, scripted and recorded answers, limits,
-                           latency and failure injection; recording fixtures
+                           latency and failure injection; recording fixtures; the tool loop
 src/evalkit/scorers/       built-in scorers, plugin registry, LLM judge, calibration
 src/evalkit/providers/     the Provider protocol and error kinds; the Claude client (caching,
                            structured output, fallback, cost); raw HTTP OpenAI-compatible
                            and Gemini clients (JSON schema output, usage, safety blocks);
-                           the registry of named providers targets and judges use
+                           the registry of named providers targets and judges use; tool
+                           use in one provider-neutral shape (tools.py)
 src/evalkit/runner.py      worker pool, cache, resume, run completion, batch mode, cancel, drain
 src/evalkit/matrix.py      [matrix] configs expanded into grouped child runs
 src/evalkit/frontier.py    cost/quality/latency Pareto frontier and paired steps along it

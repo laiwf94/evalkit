@@ -56,7 +56,7 @@ from evalkit.datasets import (
     validate_name,
 )
 from evalkit.db import make_engine, make_session_factory, upgrade
-from evalkit.db.models import Dataset, Result, Run, as_utc, utcnow
+from evalkit.db.models import Dataset, Result, ResultStep, ResultTurn, Run, as_utc, utcnow
 from evalkit.errors import EvalkitError, InvalidInputError, NotFoundError
 from evalkit.frontier import matrix_report
 from evalkit.logs import configure_logging, log_context, scrubber
@@ -470,6 +470,39 @@ async def get_results(
     return await _in_session(svc, load)
 
 
+@router.get("/runs/{run_id}/results/{case_id:path}/trajectory")
+async def get_trajectory(run_id: str, case_id: str, svc: Svc) -> dict[str, Any]:
+    """One case's whole trajectory: an agent's model replies and tool calls
+    (``steps``), or a conversation's generated turns (``turns``), in order."""
+
+    def load(session: Session) -> dict[str, Any]:
+        if session.get(Run, run_id) is None:
+            raise NotFoundError(f"run {run_id} not found")
+        result = session.scalar(
+            select(Result).where(Result.run_id == run_id, Result.case_id == case_id)
+        )
+        if result is None:
+            raise NotFoundError(f"run {run_id} has no result for case {case_id!r}")
+        steps = session.scalars(
+            select(ResultStep)
+            .where(ResultStep.run_id == run_id, ResultStep.case_id == case_id)
+            .order_by(ResultStep.step)
+        )
+        turns = session.scalars(
+            select(ResultTurn)
+            .where(ResultTurn.run_id == run_id, ResultTurn.case_id == case_id)
+            .order_by(ResultTurn.turn)
+        )
+        return {
+            "run_id": run_id,
+            **_result_json(result),
+            "steps": [_step_json(s) for s in steps],
+            "turns": [_turn_json(t) for t in turns],
+        }
+
+    return await _in_session(svc, load)
+
+
 @router.post("/runs/{run_id}/resume", status_code=202)
 async def resume_run(run_id: str, svc: Svc) -> dict[str, Any]:
     def requeue(session: Session) -> dict[str, Any]:
@@ -567,6 +600,45 @@ def _result_json(r: Result) -> dict[str, Any]:
         "input_tokens": r.input_tokens,
         "output_tokens": r.output_tokens,
         "cost_usd": r.cost_usd + r.judge_cost_usd,
+    }
+
+
+def _usage_json(row: ResultStep | ResultTurn) -> dict[str, Any]:
+    return {
+        "input_tokens": row.input_tokens,
+        "output_tokens": row.output_tokens,
+        "cache_read_tokens": row.cache_read_tokens,
+        "cache_write_tokens": row.cache_write_tokens,
+        "cost_usd": row.cost_usd,
+    }
+
+
+def _step_json(s: ResultStep) -> dict[str, Any]:
+    out: dict[str, Any] = {"step": s.step, "kind": s.kind}
+    if s.kind == "model":
+        out |= {"text": s.text, "stop_reason": s.stop_reason}
+    else:
+        out |= {
+            "tool": s.tool,
+            "call_id": s.call_id,
+            "arguments": s.arguments,
+            "status": s.status,
+            "result": s.result,
+            "error": s.error,
+            "source": s.source,
+        }
+    return {**out, "cached": s.cached, "latency_ms": s.latency_ms, **_usage_json(s)}
+
+
+def _turn_json(t: ResultTurn) -> dict[str, Any]:
+    return {
+        "turn": t.turn,
+        "role": t.role,
+        "content": t.content,
+        "stop_reason": t.stop_reason,
+        "cached": t.cached,
+        "latency_ms": t.latency_ms,
+        **_usage_json(t),
     }
 
 

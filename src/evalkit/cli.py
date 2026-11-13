@@ -143,8 +143,12 @@ class App:
 
 
 def load_run_config(path: Path, app: App) -> RunConfig:
-    """Read a TOML run config. ``[dataset] path = ...`` imports that file first."""
+    """Read a TOML run config. ``[dataset] path = ...`` imports that file first,
+    and an agent target's ``sandbox = "FILE.toml"`` is read in with its fixtures."""
     raw = _read_toml(path)
+    target = raw.get("target")
+    if isinstance(target, dict) and isinstance(target.get("sandbox"), str):
+        inline_sandbox(target, path.parent)
     dataset = raw.get("dataset")
     if isinstance(dataset, dict) and "path" in dataset:
         data_path = (path.parent / str(dataset.pop("path"))).resolve()
@@ -156,6 +160,18 @@ def load_run_config(path: Path, app: App) -> RunConfig:
         return RunConfig.model_validate(raw)
     except ValidationError as exc:
         raise CliError(f"{path}: {_describe(exc)}", EXIT_INPUT) from None
+
+
+def inline_sandbox(target: dict[str, Any], base: Path) -> None:
+    """Replace ``target["sandbox"]``, a sandbox file relative to ``base``, by its
+    table, and its fixture file by ``target["fixtures"]``: a run carries its
+    sandbox, so any worker can answer its tool calls."""
+    if "fixtures" in target:
+        raise CliError("give fixtures in the sandbox file, not next to sandbox = FILE", EXIT_INPUT)
+    spec, fixtures = load_sandbox(base / str(target["sandbox"]))
+    target["sandbox"] = spec.model_dump(mode="json", exclude={"fixtures"})
+    if fixtures is not None:
+        target["fixtures"] = [json.loads(r.to_json()) for r in fixtures.records]
 
 
 def resolve_run(session: Session, ref: str) -> str:

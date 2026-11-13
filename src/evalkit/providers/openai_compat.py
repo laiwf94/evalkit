@@ -24,10 +24,15 @@ over httpx2, with no vendor SDK:
 * ``embed`` posts to ``/embeddings`` and returns vectors in input order.
 * The chat completions API has no token counting endpoint, so
   ``count_tokens`` raises an ``unsupported`` error.
+* ``complete_tools`` sends the tools as ``function`` tools, the assistant's
+  calls as ``tool_calls`` (arguments as JSON text) and each answer as a
+  ``tool`` message. Arguments that are not JSON are passed on as text, so the
+  sandbox can answer them as invalid instead of the case failing.
 """
 
 from __future__ import annotations
 
+import json
 from collections.abc import Sequence
 from typing import Any, Literal
 
@@ -48,6 +53,14 @@ from evalkit.providers.base import (
     ProviderError,
     as_messages,
     kind_for_status,
+)
+from evalkit.providers.tools import (
+    AgentMessage,
+    ToolCompletion,
+    ToolDefinition,
+    ToolUse,
+    check_transcript,
+    parse_arguments,
 )
 from evalkit.targets.base import Usage
 
@@ -163,6 +176,47 @@ class OpenAICompatClient(HttpJsonProvider):
             return self.completion_from_payload(payload, requested_model=model)
         except (ValueError, TypeError, KeyError, IndexError, AttributeError) as exc:
             raise self.malformed(f"{type(exc).__name__}: {exc}") from None
+
+    async def complete_tools(
+        self,
+        *,
+        model: str,
+        messages: Sequence[AgentMessage],
+        tools: Sequence[ToolDefinition],
+        system: str = "",
+        max_tokens: int = 4096,
+        effort: str = "medium",
+        fallbacks: bool = True,
+    ) -> ToolCompletion:
+        self.prices.require(model)
+        check_transcript(messages)
+        wire: list[dict[str, Any]] = []
+        if system:
+            wire.append({"role": "system", "content": system})
+        for message in messages:
+            wire.extend(_wire_messages(message))
+        body: dict[str, Any] = {
+            "model": model,
+            "messages": wire,
+            self.output_limit_field: max_tokens,
+        }
+        if self.reasoning_effort:
+            body["reasoning_effort"] = REASONING_EFFORT.get(effort, "medium")
+        if tools:
+            body["tools"] = [_wire_tool(t) for t in tools]
+        payload = await self.post_json("/chat/completions", body)
+        try:
+            completion = self.completion_from_payload(payload, requested_model=model)
+            uses = _tool_uses(payload["choices"][0]["message"])
+        except (ValueError, TypeError, KeyError, IndexError, AttributeError) as exc:
+            raise self.malformed(f"{type(exc).__name__}: {exc}") from None
+        return ToolCompletion(
+            text=completion.text,
+            tool_uses=() if completion.stop_reason == "refusal" else uses,
+            stop_reason=completion.stop_reason,
+            usage=completion.usage,
+            model=completion.model,
+        )
 
     def completion_from_payload(
         self, payload: dict[str, Any], *, requested_model: str
@@ -280,6 +334,61 @@ class OpenAICompatClient(HttpJsonProvider):
         if isinstance(code, str) and code:
             text = f"{text} ({code})" if text else code
         return text, kind, None
+
+
+def _wire_tool(tool: ToolDefinition) -> dict[str, Any]:
+    function: dict[str, Any] = {"name": tool.name, "parameters": tool.input_schema}
+    if tool.description:
+        function["description"] = tool.description
+    return {"type": "function", "function": function}
+
+
+def _wire_messages(message: AgentMessage) -> list[dict[str, Any]]:
+    if message.role == "user":
+        return [{"role": "user", "content": message.text}]
+    if message.role == "tool":
+        return [
+            {"role": "tool", "tool_call_id": o.id, "content": o.payload_text()}
+            for o in message.outcomes
+        ]
+    out: dict[str, Any] = {"role": "assistant", "content": message.text or None}
+    if message.tool_uses:
+        out["tool_calls"] = [
+            {
+                "id": use.id,
+                "type": "function",
+                "function": {
+                    "name": use.name,
+                    "arguments": (
+                        use.arguments
+                        if isinstance(use.arguments, str)
+                        else json.dumps(use.arguments, ensure_ascii=False)
+                    ),
+                },
+            }
+            for use in message.tool_uses
+        ]
+    return [out]
+
+
+def _tool_uses(message: dict[str, Any]) -> tuple[ToolUse, ...]:
+    calls = message.get("tool_calls") or []
+    if not isinstance(calls, list):
+        raise TypeError(f"tool_calls is {type(calls).__name__}")
+    uses = []
+    for position, call in enumerate(calls):
+        if call.get("type", "function") != "function":
+            continue  # a kind of tool evalkit never offered
+        function = call["function"]
+        name = function["name"]
+        if not isinstance(name, str) or not name:
+            raise ValueError("a tool call has no function name")
+        call_id = call.get("id")
+        # Some servers leave ids out; the position names the call in its reply.
+        if not isinstance(call_id, str) or not call_id:
+            call_id = f"call_{position}"
+        uses.append(ToolUse(call_id, name, parse_arguments(function.get("arguments") or "{}")))
+    return tuple(uses)
 
 
 def strict_compatible(schema: Any) -> bool:

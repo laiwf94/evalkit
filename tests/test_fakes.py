@@ -177,7 +177,12 @@ def schema(**fields: Any) -> dict[str, Any]:
         (chat(max_completion_tokens=True), "positive integer"),
         (chat(messages=[]), "non-empty array"),
         (chat(messages=[{"role": "user"}]), "exactly a role and a content"),
-        (chat(messages=[{"role": "tool", "content": "x"}]), "role 'tool' is not valid"),
+        (chat(messages=[{"role": "developer", "content": "x"}]), "role is not valid"),
+        (chat(messages=[{"role": "tool", "content": "x"}]), "tool_call_id and content"),
+        (
+            chat(messages=[*USER, {"role": "tool", "tool_call_id": "a", "content": "x"}]),
+            "no outstanding tool call",
+        ),
         (chat(messages=[{"role": "user", "content": 1}]), "must be a string"),
         (chat(messages=[*USER, {"role": "system", "content": "s"}]), "may only come first"),
         (chat(messages=[{"role": "system", "content": "s"}]), "last message must be from the user"),

@@ -22,10 +22,10 @@ Answer = Callable[[dict[str, Any]], str | httpx2.Response]
 
 CHAT_FIELDS = frozenset(
     {"model", "messages", "max_completion_tokens", "max_tokens", "reasoning_effort",
-     "response_format"}
+     "response_format", "tools"}
 )  # fmt: skip
 EMBEDDING_FIELDS = frozenset({"model", "input", "encoding_format"})
-ROLES = frozenset({"system", "user", "assistant"})
+ROLES = frozenset({"system", "user", "assistant", "tool"})
 EFFORTS = frozenset({"minimal", "low", "medium", "high"})
 SCHEMA_NAME = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 
@@ -170,6 +170,8 @@ def check_chat_body(body: dict[str, Any], output_limit_field: str) -> None:
     if not isinstance(limit, int) or isinstance(limit, bool) or limit < 1:
         raise BodyError(f"{output_limit_field} must be a positive integer", output_limit_field)
     _check_messages(body.get("messages"))
+    if "tools" in body:
+        _check_tools(body["tools"])
     if "reasoning_effort" in body and body["reasoning_effort"] not in EFFORTS:
         raise BodyError(f"unsupported reasoning_effort {body['reasoning_effort']!r}")
     if "response_format" in body:
@@ -179,17 +181,98 @@ def check_chat_body(body: dict[str, Any], output_limit_field: str) -> None:
 def _check_messages(messages: Any) -> None:
     if not isinstance(messages, list) or not messages:
         raise BodyError("messages must be a non-empty array", "messages")
+    pending: list[str] = []  # tool call ids the last assistant message is owed
     for i, message in enumerate(messages):
-        if not isinstance(message, dict) or set(message) != {"role", "content"}:
+        if not isinstance(message, dict) or message.get("role") not in ROLES:
+            raise BodyError(f"messages[{i}].role is not valid", "messages")
+        role = message["role"]
+        if role == "tool":
+            if set(message) != {"role", "tool_call_id", "content"}:
+                raise BodyError(f"messages[{i}] must have a tool_call_id and content", "messages")
+            if not pending or message["tool_call_id"] != pending.pop(0):
+                raise BodyError(f"messages[{i}] answers no outstanding tool call", "messages")
+            if not isinstance(message["content"], str):
+                raise BodyError(f"messages[{i}].content must be a string", "messages")
+            continue
+        if pending:
+            raise BodyError(f"tool calls {pending} were not answered", "messages")
+        if role == "assistant" and "tool_calls" in message:
+            if set(message) != {"role", "content", "tool_calls"}:
+                raise BodyError(f"messages[{i}] has unknown fields", "messages")
+            pending = _check_tool_calls(message["tool_calls"], i)
+            if message["content"] is not None and not isinstance(message["content"], str):
+                raise BodyError(f"messages[{i}].content must be a string or null", "messages")
+            continue
+        if set(message) != {"role", "content"}:
             raise BodyError(f"messages[{i}] must have exactly a role and a content", "messages")
-        if message["role"] not in ROLES:
-            raise BodyError(f"messages[{i}].role {message['role']!r} is not valid", "messages")
         if not isinstance(message["content"], str):
             raise BodyError(f"messages[{i}].content must be a string", "messages")
-        if message["role"] == "system" and i != 0:
+        if role == "system" and i != 0:
             raise BodyError("a system message may only come first", "messages")
-    if messages[-1]["role"] != "user":
-        raise BodyError("the last message must be from the user", "messages")
+    if pending:
+        raise BodyError(f"tool calls {pending} were not answered", "messages")
+    if messages[-1]["role"] not in ("user", "tool"):
+        raise BodyError("the last message must be from the user or a tool", "messages")
+
+
+def _check_tool_calls(calls: Any, i: int) -> list[str]:
+    if not isinstance(calls, list) or not calls:
+        raise BodyError(f"messages[{i}].tool_calls must be a non-empty array", "messages")
+    ids = []
+    for call in calls:
+        if not isinstance(call, dict) or set(call) != {"id", "type", "function"}:
+            raise BodyError(f"messages[{i}].tool_calls entries need id, type, function")
+        function = call["function"]
+        if call["type"] != "function" or not isinstance(function, dict):
+            raise BodyError(f"messages[{i}].tool_calls must be functions")
+        if set(function) != {"name", "arguments"} or not isinstance(function["arguments"], str):
+            raise BodyError(f"messages[{i}].tool_calls arguments must be a JSON string")
+        ids.append(call["id"])
+    return ids
+
+
+def _check_tools(tools: Any) -> None:
+    if not isinstance(tools, list) or not tools:
+        raise BodyError("tools must be a non-empty array", "tools")
+    for tool in tools:
+        if not isinstance(tool, dict) or set(tool) != {"type", "function"}:
+            raise BodyError("each tool needs exactly a type and a function", "tools")
+        function = tool["function"]
+        if tool["type"] != "function" or not isinstance(function, dict):
+            raise BodyError("only function tools are supported", "tools")
+        if not {"name", "parameters"} <= set(function) <= {"name", "parameters", "description"}:
+            raise BodyError("a function needs a name and parameters", "tools")
+        if not SCHEMA_NAME.match(function["name"]) or not isinstance(function["parameters"], dict):
+            raise BodyError("function names match ^[A-Za-z0-9_-]{1,64}$", "tools")
+
+
+def tool_call_response(
+    calls: list[tuple[str, str, str]], *, model: str = "gpt-test", text: str | None = None
+) -> httpx2.Response:
+    """An answer asking for tools: (id, name, arguments as JSON text) each."""
+    return httpx2.Response(
+        200,
+        json={
+            "id": "chatcmpl-fake",
+            "object": "chat.completion",
+            "model": model,
+            "choices": [
+                {
+                    "index": 0,
+                    "message": {
+                        "role": "assistant",
+                        "content": text,
+                        "tool_calls": [
+                            {"id": i, "type": "function", "function": {"name": n, "arguments": a}}
+                            for i, n, a in calls
+                        ],
+                    },
+                    "finish_reason": "tool_calls",
+                }
+            ],
+            "usage": {"prompt_tokens": 100, "completion_tokens": 10, "total_tokens": 110},
+        },
+    )
 
 
 def _check_response_format(value: Any) -> None:

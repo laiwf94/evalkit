@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
+from typing import Any, Literal
 
 from evalkit.datasets import Case
 
@@ -45,12 +46,43 @@ class Turn:
 
 
 @dataclass(frozen=True)
+class Step:
+    """One step of an agent's trajectory, stored as a ``result_steps`` row.
+
+    A ``model`` step is one reply from the model: its ``text`` and the
+    provider's ``stop_reason``; the tool calls it asked for are the ``tool``
+    steps after it. A ``tool`` step is one call answered by the sandbox:
+    ``tool``, the model's ``call_id``, the ``arguments`` it sent, the call's
+    ``status`` (``ok``, ``error``, ``invalid_arguments`` and so on), and the
+    ``result`` or ``error`` the model got back, with the answer's ``source``
+    (``script`` or ``fixture``). ``usage`` is what this run paid: nothing for a
+    tool step, or for a model step replayed from the step cache."""
+
+    index: int
+    kind: Literal["model", "tool"]
+    text: str = ""
+    stop_reason: str | None = None
+    tool: str | None = None
+    call_id: str | None = None
+    arguments: Any = None
+    status: str | None = None
+    result: Any = None
+    error: str | None = None
+    source: str | None = None
+    cached: bool = False
+    latency_ms: float = 0.0
+    usage: Usage = field(default_factory=Usage)
+
+
+@dataclass(frozen=True)
 class Generation:
     text: str
     stop_reason: str | None = None
     usage: Usage = field(default_factory=Usage)
     # The generated turns, for a conversation target; empty for a single answer.
     turns: tuple[Turn, ...] = ()
+    # The trajectory, for an agent target: model replies and the tool calls they made.
+    steps: tuple[Step, ...] = ()
 
 
 class TargetError(Exception):

@@ -9,6 +9,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 from evalkit.datasets import canonical_json, sha256_hex
 from evalkit.errors import InvalidInputError
 from evalkit.targets.template import placeholders
+from evalkit.tools.sandbox import MAX_RECORDS, Fixtures, SandboxSpec
 
 # Provider names, shared with ``evalkit.providers.registry``.
 ANTHROPIC = "anthropic"
@@ -127,7 +128,67 @@ class ConversationTargetSpec(_Spec):
         return self.model_dump(mode="json", exclude={"simulator", "type"})
 
 
-AnyTargetSpec = PromptTargetSpec | HttpTargetSpec | FakeTargetSpec | ConversationTargetSpec
+class AgentTargetSpec(_Spec):
+    """A model on a provider working on each case with tools from a sandbox.
+
+    The case input fills ``template`` as in a prompt target; the model then
+    calls the sandbox's tools (``evalkit.tools.sandbox``) until it answers
+    without asking for one, or has replied ``max_steps`` times. The sandbox is
+    given inline, with its recorded answers in ``fixtures`` (one object per
+    record, as in a fixture file); ``evalkit run`` fills both in from
+    ``sandbox = "FILE.toml"``."""
+
+    type: Literal["agent"]
+    provider: str = Field(default=ANTHROPIC, pattern=PROVIDER_NAME)
+    model: str = Field(default="claude-opus-5-5", min_length=1, max_length=64)
+    system: str = Field(default="", max_length=200_000)
+    template: str = Field(min_length=1, max_length=200_000)
+    max_tokens: int = Field(default=4096, ge=1, le=128_000)
+    effort: Effort = "medium"
+    fallbacks: bool = True
+    # Model replies per case; the case ends with stop reason ``max_steps`` after that.
+    max_steps: int = Field(default=20, ge=1, le=200)
+    sandbox: SandboxSpec
+    fixtures: list[dict[str, Any]] = Field(default_factory=list, max_length=MAX_RECORDS)
+
+    @field_validator("template")
+    @classmethod
+    def _valid_template(cls, value: str) -> str:
+        try:
+            placeholders(value)
+        except InvalidInputError as exc:
+            raise ValueError(exc.message) from None
+        return value
+
+    @model_validator(mode="after")
+    def _valid_sandbox(self) -> AgentTargetSpec:
+        if self.sandbox.fixtures is not None:
+            raise ValueError(
+                "sandbox.fixtures names a file; give the recorded answers as target.fixtures"
+            )
+        try:
+            self.recorded()
+        except InvalidInputError as exc:
+            raise ValueError(exc.message) from None
+        return self
+
+    def recorded(self) -> Fixtures:
+        """The fixtures, checked against the sandbox's tools."""
+        return Fixtures.parse(
+            "".join(canonical_json(r) + "\n" for r in self.fixtures), self.sandbox
+        )
+
+    def model_part(self) -> dict[str, Any]:
+        """The fields that decide the model's replies to a given transcript: its
+        step cache entries do not depend on how the sandbox answers."""
+        return self.model_dump(
+            mode="json", exclude={"type", "sandbox", "fixtures", "template", "max_steps"}
+        )
+
+
+AnyTargetSpec = (
+    PromptTargetSpec | HttpTargetSpec | FakeTargetSpec | ConversationTargetSpec | AgentTargetSpec
+)
 
 TargetSpec = Annotated[AnyTargetSpec, Field(discriminator="type")]
 

@@ -38,6 +38,10 @@ results         (run_id, case_id) unique; redacted output, scores (JSON), tokens
 result_turns    (run_id, case_id, turn) key; one generated turn of a conversation
                 case: role, redacted content, stop reason or the simulated user's
                 verdict, cached, latency, tokens and cost
+result_steps    (run_id, case_id, step) key; one step of an agent case's trajectory:
+                a model reply (redacted text, stop reason) or a tool call (tool,
+                call id, arguments, sandbox status, result or error, source),
+                cached, latency, tokens and cost
 run_aggregates  (run_id, shard) key; counts, token and cost sums of the results
                 written by one process (the shard)
 run_metric_aggregates  (run_id, shard, metric) key; n, sum, sum of squares, unscorable
@@ -672,6 +676,45 @@ schema change cannot leave fixtures that silently never match. The sandbox's
 identity hashes the tools, the seed, the limits and the fixtures' content, but
 not the recording endpoints or the fixture file's path, so it can be part of a
 target's identity: a changed answer is a changed target, a moved file is not.
+
+### One tool loop on every provider
+
+`providers/tools.py` describes tool use once: a transcript of `AgentMessage`s
+(the user's task, assistant replies carrying the `ToolUse`s they ask for, and
+tool messages answering each of those in order), tool definitions from the
+sandbox, and a `ToolCompletion` back. A `ToolProvider` maps that onto its own
+API: Claude `tool_use` and `tool_result` blocks, chat completions `tool_calls`
+and `tool` messages, Gemini `functionCall` and `functionResponse` parts. The
+transcript is checked before anything is sent. Results go back as
+`{"result": ...}` or `{"error": message}` everywhere, because Gemini needs an
+object there and one form keeps the transcript, and so the step cache, the same
+across providers. Two provider details must come back on the next request and
+ride through untouched: Claude's thinking blocks, sent first in the assistant's
+message, and Gemini's thought signature on the call it came with. Chat
+completions arguments that are not JSON are passed to the sandbox as text, which
+answers `invalid_arguments`, rather than failing the case: recovering from a bad
+call is the agent's job. Calls with no id are named by their position, so a
+replayed transcript has the same ids.
+
+`tools/loop.py` is the only loop. It stops when a reply asks for no tool, when a
+reply was cut off at the output limit or refused (a tool call in it may be
+incomplete, so none is run), or after `max_steps` replies. The agent target
+(`targets/agent.py`) renders the case into the task and makes a fresh
+`ToolSandbox` per attempt, seeded by the case id, so a retried case is answered
+exactly as before. A run carries its sandbox inline: `evalkit run` reads
+`sandbox = "FILE"` and its fixture file into the stored target, so any worker
+can execute the run and the sandbox's content is part of the target's identity.
+
+Each model reply is cached like a conversation turn, the moment it is paid
+for, keyed by the model's settings and endpoint, the tools it was offered and
+the whole transcript (with the redaction fingerprint), but not by how the
+sandbox answers: the answers are in the transcript. A resumed or retried case
+replays its replies for nothing, and a changed tool answer reuses every reply
+before the model saw it. Reply text is redacted before it is cached and before
+the loop goes on; tool arguments are not, because the sandbox matches on them.
+The steps are written as `result_steps` rows in the result's transaction, under
+the same lease check; a tool name or call id the model made up is clipped to the
+column's size.
 
 ## Calling Claude
 

@@ -18,11 +18,16 @@ decided once:
   non-streaming requests that may run past ten minutes.
 * The Claude API has no embeddings endpoint, so ``embed`` raises an
   ``unsupported`` error; embeddings come from another provider.
+* ``complete_tools`` sends the sandbox's tools as ``tools``, the assistant's
+  tool calls as ``tool_use`` blocks and their answers as ``tool_result``
+  blocks in one user message. Thinking blocks are kept and sent back first in
+  the assistant's message, as the API requires during tool use.
 """
 
 from __future__ import annotations
 
 import contextlib
+import json
 from collections.abc import AsyncIterator, Sequence
 from typing import Any
 
@@ -40,6 +45,13 @@ from evalkit.providers.base import (
     as_messages,
     kind_for_status,
 )
+from evalkit.providers.tools import (
+    AgentMessage,
+    ToolCompletion,
+    ToolDefinition,
+    ToolUse,
+    check_transcript,
+)
 from evalkit.ratelimit import parse_retry_after
 from evalkit.targets.base import Usage
 
@@ -51,6 +63,8 @@ FALLBACK_MODELS = frozenset(
     {"claude-fable-5-1", "claude-opus-5-5", "claude-opus-5", "claude-sonnet-5-5"}
 )
 STREAMING_THRESHOLD = 16_000
+# Content blocks a tool loop sends back verbatim on the next request.
+REASONING_BLOCKS = frozenset({"thinking", "redacted_thinking"})
 
 
 class ClaudeClient:
@@ -127,19 +141,81 @@ class ClaudeClient:
             effort=effort,
             output_schema=output_schema,
         )
+        message = await self._send(params, model=model, max_tokens=max_tokens, fallbacks=fallbacks)
+        try:
+            return self.completion_from_message(message, requested_model=model)
+        except (TypeError, AttributeError) as exc:
+            raise self.classify_error(exc) from None
+
+    async def complete_tools(
+        self,
+        *,
+        model: str,
+        messages: Sequence[AgentMessage],
+        tools: Sequence[ToolDefinition],
+        system: str = "",
+        max_tokens: int = 4096,
+        effort: str = "medium",
+        fallbacks: bool = True,
+    ) -> ToolCompletion:
+        self.prices.require(model)
+        check_transcript(messages)
+        params: dict[str, Any] = {
+            "model": model,
+            "max_tokens": max_tokens,
+            "messages": [_wire_message(m) for m in messages],
+            "output_config": {"effort": effort},
+        }
+        if tools:
+            params["tools"] = [_wire_tool(t) for t in tools]
+        if system:
+            params["system"] = [
+                {"type": "text", "text": system, "cache_control": {"type": "ephemeral"}}
+            ]
+        message = await self._send(params, model=model, max_tokens=max_tokens, fallbacks=fallbacks)
+        try:
+            return self.tool_completion_from_message(message, requested_model=model)
+        except (TypeError, AttributeError, ValueError) as exc:
+            raise self.classify_error(exc) from None
+
+    def tool_completion_from_message(self, message: Any, *, requested_model: str) -> ToolCompletion:
+        base = self.completion_from_message(message, requested_model=requested_model)
+        uses: list[ToolUse] = []
+        reasoning: list[dict[str, Any]] = []
+        for block in message.content:
+            if block.type == "tool_use":
+                if not isinstance(block.id, str) or not isinstance(block.name, str):
+                    raise ValueError("a tool_use block needs an id and a name")
+                uses.append(ToolUse(block.id, block.name, block.input))
+            elif block.type == "thinking":
+                reasoning.append(
+                    {"type": "thinking", "thinking": block.thinking, "signature": block.signature}
+                )
+            elif block.type == "redacted_thinking":
+                reasoning.append({"type": "redacted_thinking", "data": block.data})
+        refused = message.stop_reason == "refusal"
+        return ToolCompletion(
+            text=base.text,
+            # A refusal's partial tool calls are not requests to act on.
+            tool_uses=() if refused else tuple(uses),
+            stop_reason=base.stop_reason,
+            usage=base.usage,
+            model=base.model,
+            reasoning=tuple(reasoning),
+            refusal_category=base.refusal_category,
+        )
+
+    async def _send(
+        self, params: dict[str, Any], *, model: str, max_tokens: int, fallbacks: bool
+    ) -> Any:
         if fallbacks and model in FALLBACK_MODELS:
             params["betas"] = [FALLBACK_BETA]
             params["fallbacks"] = "default"
         async with self._mapped_errors():
             if max_tokens > STREAMING_THRESHOLD:
                 async with self._client.beta.messages.stream(**params) as stream:
-                    message = await stream.get_final_message()
-            else:
-                message = await self._client.beta.messages.create(**params)
-        try:
-            return self.completion_from_message(message, requested_model=model)
-        except (TypeError, AttributeError) as exc:
-            raise self.classify_error(exc) from None
+                    return await stream.get_final_message()
+            return await self._client.beta.messages.create(**params)
 
     def completion_from_message(
         self, message: Any, *, requested_model: str, batch: bool = False
@@ -256,6 +332,43 @@ class ClaudeClient:
 
     async def aclose(self) -> None:
         await self._client.close()
+
+
+def _wire_tool(tool: ToolDefinition) -> dict[str, Any]:
+    out: dict[str, Any] = {"name": tool.name, "input_schema": tool.input_schema}
+    if tool.description:
+        out["description"] = tool.description
+    return out
+
+
+def _wire_message(message: AgentMessage) -> dict[str, Any]:
+    if message.role == "user":
+        return {"role": "user", "content": message.text}
+    if message.role == "tool":
+        return {
+            "role": "user",
+            "content": [
+                {
+                    "type": "tool_result",
+                    "tool_use_id": o.id,
+                    "content": o.payload_text(),
+                    "is_error": o.is_error,
+                }
+                for o in message.outcomes
+            ],
+        }
+    blocks: list[dict[str, Any]] = [dict(b) for b in message.reasoning]
+    if message.text:  # the API refuses empty text blocks
+        blocks.append({"type": "text", "text": message.text})
+    for use in message.tool_uses:
+        arguments = use.arguments
+        if not isinstance(arguments, dict):
+            # Claude sends objects; anything else came from elsewhere and goes back as text.
+            arguments = {
+                "value": arguments if isinstance(arguments, str) else json.dumps(arguments)
+            }
+        blocks.append({"type": "tool_use", "id": use.id, "name": use.name, "input": arguments})
+    return {"role": "assistant", "content": blocks}
 
 
 def _counts(usage: Any) -> TokenCounts:

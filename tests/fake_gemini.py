@@ -21,7 +21,7 @@ import httpx2
 
 Answer = Callable[[str, dict[str, Any]], str | httpx2.Response]
 
-REQUEST_FIELDS = frozenset({"contents", "generationConfig", "systemInstruction"})
+REQUEST_FIELDS = frozenset({"contents", "generationConfig", "systemInstruction", "tools"})
 CONFIG_FIELDS = frozenset(
     {"maxOutputTokens", "responseMimeType", "responseJsonSchema", "thinkingConfig"}
 )
@@ -62,6 +62,35 @@ def generated(
                 }
             ],
             "usageMetadata": usage,
+            "modelVersion": model,
+        },
+    )
+
+
+def function_calls(
+    calls: list[tuple[str, dict[str, Any]]],
+    *,
+    model: str = "gemini-test",
+    signature: str | None = "sig-1",
+    ids: bool = False,
+) -> httpx2.Response:
+    """An answer calling functions: (name, args) each, the first with a thought signature."""
+    parts: list[dict[str, Any]] = []
+    for n, (name, args) in enumerate(calls):
+        call: dict[str, Any] = {"name": name, "args": args}
+        if ids:
+            call["id"] = f"g{n}"
+        part: dict[str, Any] = {"functionCall": call}
+        if n == 0 and signature is not None:
+            part["thoughtSignature"] = signature
+        parts.append(part)
+    return httpx2.Response(
+        200,
+        json={
+            "candidates": [
+                {"content": {"role": "model", "parts": parts}, "finishReason": "STOP", "index": 0}
+            ],
+            "usageMetadata": {"promptTokenCount": 100, "candidatesTokenCount": 10},
             "modelVersion": model,
         },
     )
@@ -184,7 +213,7 @@ def check_generate_body(body: dict[str, Any], *, allow_model: str | None = None)
             raise BodyError(f"contents[{i}] must have exactly a role and parts")
         if content["role"] not in ("user", "model"):
             raise BodyError(f"contents[{i}].role {content['role']!r}")
-        _check_parts(content["parts"], f"contents[{i}]")
+        _check_parts(content["parts"], f"contents[{i}]", content["role"])
     if contents[-1]["role"] != "user":
         raise BodyError("the last content must be from the user")
     if "systemInstruction" in body:
@@ -194,13 +223,54 @@ def check_generate_body(body: dict[str, Any], *, allow_model: str | None = None)
         _check_parts(system["parts"], "systemInstruction")
     if "generationConfig" in body:
         _check_config(body["generationConfig"])
+    if "tools" in body:
+        _check_tools(body["tools"])
 
 
-def _check_parts(parts: Any, where: str) -> None:
+def _check_tools(tools: Any) -> None:
+    if not isinstance(tools, list) or len(tools) != 1 or set(tools[0]) != {"functionDeclarations"}:
+        raise BodyError("tools must be one functionDeclarations entry")
+    for declaration in tools[0]["functionDeclarations"]:
+        keys = set(declaration)
+        if (
+            not {"name", "parametersJsonSchema"}
+            <= keys
+            <= {
+                "name",
+                "parametersJsonSchema",
+                "description",
+            }
+        ):
+            raise BodyError("a function declaration needs a name and parametersJsonSchema")
+
+
+def _check_parts(parts: Any, where: str, role: str = "user") -> None:
     if not isinstance(parts, list) or not parts:
         raise BodyError(f"{where}.parts must be a non-empty array")
     for part in parts:
-        if not isinstance(part, dict) or set(part) != {"text"} or not isinstance(part["text"], str):
+        if not isinstance(part, dict):
+            raise BodyError(f"{where}.parts must be objects")
+        if "functionCall" in part and role == "model":
+            if not set(part) <= {"functionCall", "thoughtSignature"}:
+                raise BodyError(f"{where}: unknown fields next to functionCall")
+            call = part["functionCall"]
+            if not {"name", "args"} <= set(call) <= {"id", "name", "args"}:
+                raise BodyError(f"{where}: a functionCall needs a name and args")
+            if not isinstance(call["args"], dict):
+                raise BodyError(f"{where}: functionCall.args must be an object")
+            continue
+        if "functionResponse" in part and role == "user":
+            response = part["functionResponse"]
+            if set(part) != {"functionResponse"} or not {"name", "response"} <= set(response) <= {
+                "id",
+                "name",
+                "response",
+            }:
+                raise BodyError(f"{where}: a functionResponse needs a name and a response")
+            if not isinstance(response["response"], dict):
+                raise BodyError(f"{where}: functionResponse.response must be an object")
+            continue
+        if set(part) != {"text"} or not isinstance(part["text"], str):
             raise BodyError(f"{where}.parts must be text parts")
 
 

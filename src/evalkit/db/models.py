@@ -198,6 +198,37 @@ class ResultTurn(Base):
     cost_usd: Mapped[float] = mapped_column(Float, default=0.0)
 
 
+class ResultStep(Base):
+    """One step of an agent case's trajectory, written with its result: a model
+    reply (``kind = "model"``, its text and stop reason) or a tool call
+    (``kind = "tool"``, with the arguments, the sandbox's status and the result
+    or error the model got). Costs are what this run paid: zero for a tool call
+    and for a reply replayed from the step cache."""
+
+    __tablename__ = "result_steps"
+
+    run_id: Mapped[str] = mapped_column(ForeignKey("runs.id", ondelete="CASCADE"), primary_key=True)
+    case_id: Mapped[str] = mapped_column(String(256), primary_key=True)
+    step: Mapped[int] = mapped_column(Integer, primary_key=True)
+    kind: Mapped[str] = mapped_column(String(16))
+    text: Mapped[str] = mapped_column(Text, default="")
+    stop_reason: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    tool: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    call_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    arguments: Mapped[Any] = mapped_column(JSON, nullable=True)
+    status: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    result: Mapped[Any] = mapped_column(JSON, nullable=True)
+    error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    source: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    cached: Mapped[bool] = mapped_column(Boolean, default=False)
+    latency_ms: Mapped[float] = mapped_column(Float, default=0.0)
+    input_tokens: Mapped[int] = mapped_column(Integer, default=0)
+    output_tokens: Mapped[int] = mapped_column(Integer, default=0)
+    cache_read_tokens: Mapped[int] = mapped_column(Integer, default=0)
+    cache_write_tokens: Mapped[int] = mapped_column(Integer, default=0)
+    cost_usd: Mapped[float] = mapped_column(Float, default=0.0)
+
+
 class RunAggregate(Base):
     """Running totals of one run's results, kept in the transaction that writes them.
     Each writing process has its own ``shard`` row, so processes never wait on each
