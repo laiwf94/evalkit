@@ -222,3 +222,22 @@ def test_compare_aligned_matches_compare_many_and_checks_shapes() -> None:
         compare_aligned({"m": (np.array([1.0, np.nan]), np.array([np.nan, 1.0]))})
     with pytest.raises(ValueError, match="finite"):
         compare_many({"m": ({"a": float("nan")}, {"a": 1.0})})
+
+
+@pytest.mark.parametrize("bad", [float("nan"), float("inf"), float("-inf")])
+def test_compare_many_names_the_metric_and_side_of_a_non_finite_score(bad: float) -> None:
+    good = {"a": 1.0, "b": 0.0}
+    with pytest.raises(ValueError, match=r"metric 'f1': baseline scores must be finite"):
+        compare_many({"exact": (good, good), "f1": ({"a": bad, "b": 0.0}, good)})
+    with pytest.raises(ValueError, match=r"metric 'f1': candidate scores must be finite"):
+        compare_many({"exact": (good, good), "f1": (good, {"a": 1.0, "b": bad})})
+
+
+def test_compare_aligned_rejects_infinity_but_keeps_nan_as_missing() -> None:
+    ok = np.array([1.0, 0.0, 1.0])
+    with pytest.raises(ValueError, match=r"metric 'm': baseline scores must be finite"):
+        compare_aligned({"m": (np.array([np.inf, 0.0, 1.0]), ok)})
+    with pytest.raises(ValueError, match=r"metric 'm': candidate scores must be finite"):
+        compare_aligned({"m": (ok, np.array([1.0, -np.inf, 1.0]))})
+    [result] = compare_aligned({"m": (np.array([1.0, np.nan, 0.0]), ok)}, resamples=200)
+    assert (result.n_pairs, result.n_unpaired) == (2, 1)

@@ -77,6 +77,11 @@ def _as_array(values: Sequence[float] | FloatArray) -> FloatArray:
     return arr
 
 
+def _require_finite(metric: str, side: str, arr: FloatArray) -> None:
+    if arr.size and not np.all(np.isfinite(arr)):
+        raise ValueError(f"metric {metric!r}: {side} scores must be finite")
+
+
 def _bootstrap_means(values: FloatArray, resamples: int, rng: np.random.Generator) -> FloatArray:
     n = values.size
     out = np.empty(resamples, dtype=np.float64)
@@ -248,8 +253,8 @@ def compare_many(
     aligned = {}
     for name, (base, cand) in metrics.items():
         # NaN marks a missing score below, so a given score must be finite.
-        _as_array(list(base.values()))
-        _as_array(list(cand.values()))
+        _require_finite(name, "baseline", np.asarray(list(base.values()), dtype=np.float64))
+        _require_finite(name, "candidate", np.asarray(list(cand.values()), dtype=np.float64))
         keys = sorted(base.keys() | cand.keys())
         aligned[name] = (
             np.array([base.get(k, math.nan) for k in keys], dtype=np.float64),
@@ -284,6 +289,10 @@ def compare_aligned(
     for name, (base, cand) in metrics.items():
         if base.shape != cand.shape or base.ndim != 1:
             raise ValueError(f"metric {name!r}: score arrays do not line up")
+        # NaN is a missing score here; infinity is never a valid one.
+        for side, scores in (("baseline", base), ("candidate", cand)):
+            if np.isinf(scores).any():
+                raise ValueError(f"metric {name!r}: {side} scores must be finite")
         has_b, has_c = ~np.isnan(base), ~np.isnan(cand)
         both = has_b & has_c
         if not both.any():
