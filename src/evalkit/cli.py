@@ -29,7 +29,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, TextIO
 
-from pydantic import ValidationError
+from pydantic import TypeAdapter, ValidationError
 from sqlalchemy import select
 from sqlalchemy.engine import make_url
 from sqlalchemy.orm import Session, sessionmaker
@@ -69,7 +69,7 @@ from evalkit.report import CompareReport, RunSummary, compare_runs, summarize
 from evalkit.runner import Runner
 from evalkit.runspec import RunConfig
 from evalkit.scorers.calibration import calibrate, parse_labels, save_calibration
-from evalkit.scorers.registry import JudgeSpec, judge_from_spec
+from evalkit.scorers.registry import AnyJudgeSpec, judge_from_spec
 from evalkit.targets.http import HttpTarget
 from evalkit.targets.specs import HttpTargetSpec
 from evalkit.tools.sandbox import (
@@ -86,6 +86,7 @@ from evalkit.worker import Worker, listen_url
 VERIFY = "verify"
 EXIT_OK, EXIT_REGRESSION, EXIT_INPUT, EXIT_UNUSABLE, EXIT_INTERRUPTED = 0, 1, 2, 3, 130
 MAX_CONFIG_BYTES = 1024 * 1024
+JUDGE_SPEC: TypeAdapter[AnyJudgeSpec] = TypeAdapter(AnyJudgeSpec)
 
 
 class CliError(Exception):
@@ -475,11 +476,11 @@ async def cmd_calibrate(args: argparse.Namespace, app: App) -> int:
     if not isinstance(table, dict):
         raise CliError(f"{args.judge} has no [judge] table", EXIT_INPUT)
     try:
-        spec = JudgeSpec.model_validate({"type": "judge", **table})
+        spec = JUDGE_SPEC.validate_python({"type": "judge", **table})
     except ValidationError as exc:
         raise CliError(f"{args.judge}: {_describe(exc)}", EXIT_INPUT) from None
     judge = judge_from_spec(spec, app.providers())
-    items = parse_labels(_read_bytes(Path(args.labels)), spec.mode)
+    items = parse_labels(_read_bytes(Path(args.labels)), judge.mode)
     report = await calibrate(judge, items, concurrency=args.concurrency)
     with app.sessions() as session:
         save_calibration(session, judge, report)

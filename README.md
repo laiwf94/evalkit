@@ -84,7 +84,8 @@ server config (never a URL from the request), or a fake target with known
 accuracy for demos and tests.
 
 Scorers grade each answer by exact match, regex, JSON Schema, numeric
-tolerance, token F1, or an LLM judge with a rubric. The pairwise judge runs
+tolerance, token F1, or an LLM judge with a rubric, and an agent's tool calls
+by the trajectory scorers below. The pairwise judge runs
 every comparison twice with the answers swapped, so a judge that prefers a
 position cannot decide the result, and judges are calibrated against human
 labels with Cohen's kappa. A judge can run on Claude, OpenAI, Gemini or any
@@ -297,6 +298,49 @@ whether a script or a fixture answered), and served at
 hash of the transcript so far as soon as it is paid for, so a run killed or a
 case retried mid-trajectory replays the replies it has for nothing, and changing
 one tool's answer reuses every reply before the model first saw it.
+
+### Trajectory scorers
+
+Four scorers grade what the agent did rather than only what it said. They read
+the stored trajectory; for a target that is not an agent they are unscorable,
+never zero. The reference comes from the config or from each case's `expected`
+(`tool_calls`, `optimal_steps` and `forbidden_tools` keys by default):
+
+```json
+{"id": "b001", "input": {"request": "two at 7pm on Friday"},
+ "expected": {"tool_calls": [{"tool": "find_slots", "arguments": {"party": 2}}, "book"],
+              "optimal_steps": 2, "forbidden_tools": ["cancel_*"]}}
+```
+
+```toml
+[[scorers]]
+type = "tool_calls"                  # the matched fraction of expected calls
+order = "ordered"                    # or "unordered"
+arguments = "subset"                 # "exact", "schema" (a JSON Schema per call) or "ignore"
+allow_extra = true                   # false: every unexpected call counts against it
+
+[[scorers]]
+type = "step_efficiency"             # min(1, budget / used)
+count = "tool_calls"                 # or "model_steps"; budget = 4 to fix it in the config
+
+[[scorers]]
+type = "forbidden_tools"             # 0 if any call matches, answered or not
+tools = ["delete_*"]
+
+[[scorers]]
+type = "trajectory_judge"            # an LLM judge of the whole trajectory, 1-5
+provider = "openai"
+model = "gpt-5.1"
+rubric = "Looks availability up before booking and never books twice."
+```
+
+Ordered matching finds the longest run of expected calls the agent made in
+order, so one wrong call early does not void every later one; unordered
+matching pairs each expected call with a distinct actual call, as many as
+possible. The trajectory judge is a judge like any other: its verdicts are
+cached, its identity is recorded with the run and checked by the gate, and
+`evalkit calibrate` measures it against people's labels when each labelled line
+carries the `trajectory` the trajectory endpoint served (its `steps`).
 
 ## Reading the verdict
 
@@ -572,7 +616,7 @@ src/evalkit/targets/       prompt, HTTP (SSRF-safe), conversation, agent and fak
 src/evalkit/simuser.py     simulated users: scripted, or played by a model in JSON
 src/evalkit/tools/         the tool sandbox: schemas, scripted and recorded answers, limits,
                            latency and failure injection; recording fixtures; the tool loop
-src/evalkit/scorers/       built-in scorers, plugin registry, LLM judge, calibration
+src/evalkit/scorers/       built-in and trajectory scorers, plugin registry, LLM judges, calibration
 src/evalkit/providers/     the Provider protocol and error kinds; the Claude client (caching,
                            structured output, fallback, cost); raw HTTP OpenAI-compatible
                            and Gemini clients (JSON schema output, usage, safety blocks);

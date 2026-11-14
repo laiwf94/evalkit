@@ -769,12 +769,48 @@ example, the case has no expected value), which is different from 0.
 | `numeric` | 1 if the first, last or whole number is within absolute/relative tolerance. |
 | `token_f1` | Bag-of-tokens F1 after SQuAD normalisation (Rajpurkar et al.): partial credit without embeddings. |
 | `judge` | Rubric 1-5 mapped to (s-1)/4, or pairwise win/tie/loss against the reference. |
+| `tool_calls` | Matched fraction of the expected tool calls, in order or not; arguments exact, subset, schema or ignored. |
+| `step_efficiency` | min(1, budget / used), counting tool calls or model replies. |
+| `forbidden_tools` | 0 if any tool call matches a forbidden pattern, else 1. |
+| `trajectory_judge` | Rubric 1-5 over the whole trajectory, mapped to (s-1)/4. |
 | `plugin` | Any `Scorer` subclass from an `evalkit.scorers` entry point. |
 
 A failed call scores 0 and an unscorable case is left out. If the target
 errored after all retries, every metric gets 0 for that case: the system did
 not produce an answer, and the gate must see that. Unscorable cases are counted
 separately and excluded from that metric.
+
+### Trajectory scorers
+
+The runner calls `Scorer.score_steps(case, output, steps)` with the agent's
+trajectory, the same `Step`s it writes as `result_steps` rows; the default
+implementation ignores the steps and calls `score`, so output scorers and
+plugins are unchanged. A result without steps (a prompt or HTTP target) leaves
+every trajectory metric unscorable rather than zero: "made no calls" and "was
+not an agent" are different facts.
+
+Ordered tool call matching is a longest common subsequence under a match
+predicate (tool name, then the argument mode), not a greedy scan: with expected
+`[B, C, D]` and actual `[C, D, B]` a greedy scan takes `B` and then finds
+nothing, while the longest ordered match is `C, D`. Ties keep the earlier
+expectation, so the call reported missing is the later one. Unordered matching
+is a maximum bipartite matching (augmenting paths), so a loosely specified call
+cannot take the only actual call a stricter one could match. Both are O(n·m)
+predicate checks, with at most 200 expected calls and the sandbox's call limit
+bounding m. `exact` and `subset` compare JSON strictly (`true` is not `1`,
+unlike Python's `==`); `subset` lists must have the same length and match by
+position; `schema` treats each expected `arguments` as a Draft 2020-12 schema,
+checked when the config is built if it is in the config and per case
+(unscorable when invalid) otherwise, with no remote references fetched.
+
+Deterministic trajectory scorers read raw tool arguments, which are never
+redacted because the sandbox matches on them. The trajectory judge renders
+every step as one numbered line (a step is cut at 2,000 characters; a
+trajectory over 60,000 keeps its first and last steps and says how many were
+left out between), then redacts the whole prompt before it is sent, so a tool
+result carrying an email address does not leave the process. It records its
+identity with mode `trajectory`, so its cached verdicts, calibrations and gate
+comparisons never mix with a rubric judge's on the same rubric.
 
 Scorers see redacted text, because redaction happens before scoring. The judge
 therefore never receives personal data, and a cached rerun (which only has

@@ -87,6 +87,7 @@ from evalkit.redaction import Redactor
 from evalkit.runspec import CaseFilter, RunConfig, RunOptions
 from evalkit.scorers import Scorer, ScoreResult, ScorerSpec, build_scorers
 from evalkit.scorers.judge import LLMJudge, identity_changes
+from evalkit.scorers.trajectory import TrajectoryJudge
 from evalkit.simuser import LLMSimulator
 from evalkit.targets import Generation, Step, Target, TargetError, TargetSpec, Turn, Usage
 from evalkit.targets.agent import AgentTarget
@@ -756,6 +757,10 @@ class Runner:
         for scorer in scorers:
             if isinstance(scorer, LLMJudge):
                 scorer.limiter = self._limiter(f"{scorer.provider}:judge", RateLimit())
+            if isinstance(scorer, TrajectoryJudge):
+                # Tool arguments and results are not redacted in the trajectory;
+                # the judge's prompt is, before it leaves the process.
+                scorer.redactor = self.redactor
         target_spec = config.target
         if (
             isinstance(target_spec, PromptTargetSpec) and target_spec.provider != ANTHROPIC
@@ -1020,7 +1025,7 @@ class Runner:
         output = result.output or ""
         for scorer in scorers:
             try:
-                outcome = await scorer.score(case, output)
+                outcome = await scorer.score_steps(case, output, result.steps)
             except Exception as exc:  # a plugin bug must not take the run down
                 log.warning(
                     "scorer raised",

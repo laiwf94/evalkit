@@ -121,3 +121,13 @@ week 2 (#23).
   (migration 0013), served at `GET /v1/runs/{id}/results/{case}/trajectory`.
   Replies are cached by a hash of the transcript so far, so a case killed or
   retried mid-trajectory pays only for the replies it lacks.
+
+- **Trajectory scorers.** `tool_calls` matches expected tool calls in order
+  (longest ordered subsequence) or out of order (maximum matching), with
+  arguments compared exactly, as a subset or against a JSON Schema, and can
+  count unexpected calls against the score; `step_efficiency` scores tool calls
+  or model replies against a budget; `forbidden_tools` fails any call matching a
+  pattern; `trajectory_judge` grades the whole trajectory with a rubric, its
+  prompt redacted, and is calibrated by `evalkit calibrate` on labelled
+  trajectories. Scorers receive the trajectory through `Scorer.score_steps`;
+  without one, trajectory metrics are unscorable.

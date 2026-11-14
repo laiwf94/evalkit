@@ -13,7 +13,9 @@ Labelled file, one JSON object per line:
     {"id": "c1", "input": ..., "expected": ..., "output": "...", "label": 4}
 
 ``label`` is 1-5 for rubric judges and "win", "tie" or "loss" (the output
-against the reference) for pairwise judges.
+against the reference) for pairwise judges. A trajectory judge also reads each
+item's ``trajectory``: its steps as the trajectory endpoint serves them
+(``GET /v1/runs/{id}/results/{case}/trajectory``, the ``steps`` list).
 """
 
 from __future__ import annotations
@@ -37,7 +39,8 @@ from sqlalchemy.orm import Session
 from evalkit.datasets import Case
 from evalkit.db.models import Calibration
 from evalkit.errors import InvalidInputError
-from evalkit.scorers.judge import LLMJudge
+from evalkit.scorers.judge import Judgement, LLMJudge
+from evalkit.scorers.trajectory import LabelledStep, TrajectoryJudge
 
 RUBRIC_LABELS: tuple[int, ...] = (1, 2, 3, 4, 5)
 PAIR_LABELS: tuple[str, ...] = ("loss", "tie", "win")
@@ -52,6 +55,7 @@ class LabelledItem(BaseModel):
     expected: JsonValue = None
     output: str = Field(max_length=200_000)
     label: StrictInt | StrictStr
+    trajectory: list[LabelledStep] | None = Field(default=None, max_length=10_000)
 
 
 @dataclass(frozen=True)
@@ -137,9 +141,19 @@ async def calibrate(
     """Run ``judge`` on every labelled item and measure agreement with the labels."""
     gate = asyncio.Semaphore(concurrency)
 
-    async def one(item: LabelledItem) -> Any:
+    if isinstance(judge, TrajectoryJudge):
+        missing = [item.id for item in items if not item.trajectory]
+        if missing:
+            raise InvalidInputError(
+                f"a trajectory judge needs a trajectory on every item; missing on {missing[0]}"
+            )
+
+    async def one(item: LabelledItem) -> Judgement:
         async with gate:
             case = Case(id=item.id, input=item.input, expected=item.expected)
+            if isinstance(judge, TrajectoryJudge):
+                steps = [s.to_step() for s in item.trajectory or ()]
+                return await judge.judge_steps(case, item.output, steps)
             return await judge.judge(case, item.output)
 
     judgements = await asyncio.gather(*(one(item) for item in items))

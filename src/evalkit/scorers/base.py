@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
+from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Any
 
 from evalkit.datasets import Case
+from evalkit.targets.base import Step
 
 
 @dataclass(frozen=True)
@@ -43,6 +45,13 @@ class Scorer(ABC):
     @abstractmethod
     async def score(self, case: Case, output: str) -> ScoreResult:
         """Return a score for ``output``; raise only for programming errors."""
+
+    async def score_steps(self, case: Case, output: str, steps: Sequence[Step]) -> ScoreResult:
+        """Score with the agent's trajectory: every model reply and tool call, in
+        order, or nothing when the target is not an agent (or the result came
+        from the response cache). The runner calls this; scorers that grade only
+        the output keep the default, which ignores ``steps``."""
+        return await self.score(case, output)
 
 
 def expected_value(case: Case, key: str | None) -> Any:

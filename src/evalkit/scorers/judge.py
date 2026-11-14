@@ -283,6 +283,10 @@ class LLMJudge(Scorer):
 
     async def _rubric(self, case: Case, output: str) -> Judgement:
         (prompt,) = self.prompts(case, output)
+        return await self._grade(prompt)
+
+    async def _grade(self, prompt: str) -> Judgement:
+        """One rubric verdict on ``prompt``, 1-5 mapped to [0, 1]."""
         try:
             completion = await self._call(prompt, RUBRIC_SCHEMA)
         except TargetError as exc:

@@ -24,6 +24,13 @@ from evalkit.providers.registry import ANTHROPIC, PROVIDER_NAME, ProviderRegistr
 from evalkit.scorers.base import Scorer
 from evalkit.scorers.builtin import ExactMatch, JsonSchemaMatch, NumericMatch, RegexMatch, TokenF1
 from evalkit.scorers.judge import LLMJudge
+from evalkit.scorers.trajectory import (
+    MAX_EXPECTED_CALLS,
+    ForbiddenTools,
+    StepEfficiency,
+    ToolCallMatch,
+    TrajectoryJudge,
+)
 
 ENTRY_POINT_GROUP = "evalkit.scorers"
 Name = Annotated[str, Field(pattern=r"^[a-z][a-z0-9_]{0,47}$")]
@@ -82,6 +89,43 @@ class JudgeSpec(_Spec):
     max_tokens: int = Field(default=4096, ge=256, le=16_000)
 
 
+class ToolCallsSpec(_Spec):
+    type: Literal["tool_calls"]
+    # The expected calls for every case; without them, each case's own
+    # (``expected[expected_key]``, or ``expected`` itself when the key is null).
+    calls: list[JsonValue] | None = Field(default=None, max_length=MAX_EXPECTED_CALLS)
+    expected_key: str | None = "tool_calls"
+    order: Literal["ordered", "unordered"] = "ordered"
+    arguments: Literal["exact", "subset", "schema", "ignore"] = "subset"
+    allow_extra: bool = True
+    only_ok: bool = False
+
+
+class StepEfficiencySpec(_Spec):
+    type: Literal["step_efficiency"]
+    budget: int | None = Field(default=None, ge=0, le=10_000)
+    count: Literal["tool_calls", "model_steps"] = "tool_calls"
+    budget_key: str | None = "optimal_steps"
+    calls_key: str | None = "tool_calls"
+
+
+class ForbiddenToolsSpec(_Spec):
+    type: Literal["forbidden_tools"]
+    tools: list[Annotated[str, Field(min_length=1, max_length=200)]] = Field(
+        default_factory=list, max_length=1000
+    )
+    expected_key: str | None = "forbidden_tools"
+
+
+class TrajectoryJudgeSpec(_Spec):
+    type: Literal["trajectory_judge"]
+    provider: str = Field(default=ANTHROPIC, pattern=PROVIDER_NAME)
+    rubric: str = Field(min_length=1, max_length=20_000)
+    model: str = Field(default="claude-opus-5-5", min_length=1, max_length=64)
+    effort: Literal["low", "medium", "high", "xhigh", "max"] = "medium"
+    max_tokens: int = Field(default=4096, ge=256, le=16_000)
+
+
 class PluginSpec(_Spec):
     type: Literal["plugin"]
     entry: str = Field(min_length=1, max_length=200)
@@ -89,9 +133,21 @@ class PluginSpec(_Spec):
 
 
 ScorerSpec = Annotated[
-    ExactSpec | RegexSpec | JsonSchemaSpec | NumericSpec | TokenF1Spec | JudgeSpec | PluginSpec,
+    ExactSpec
+    | RegexSpec
+    | JsonSchemaSpec
+    | NumericSpec
+    | TokenF1Spec
+    | JudgeSpec
+    | ToolCallsSpec
+    | StepEfficiencySpec
+    | ForbiddenToolsSpec
+    | TrajectoryJudgeSpec
+    | PluginSpec,
     Field(discriminator="type"),
 ]
+# What ``evalkit calibrate`` accepts in its [judge] table.
+AnyJudgeSpec = Annotated[JudgeSpec | TrajectoryJudgeSpec, Field(discriminator="type")]
 
 
 def build_scorers(
@@ -146,24 +202,58 @@ def _build(spec: ScorerSpec, *, allow_import_paths: bool, providers: ProviderReg
                 )
             case TokenF1Spec():
                 return TokenF1(name, expected_key=spec.expected_key)
-            case JudgeSpec():
+            case JudgeSpec() | TrajectoryJudgeSpec():
                 return judge_from_spec(spec, providers, name)
+            case ToolCallsSpec():
+                return ToolCallMatch(
+                    name,
+                    calls=spec.calls,
+                    expected_key=spec.expected_key,
+                    order=spec.order,
+                    arguments=spec.arguments,
+                    allow_extra=spec.allow_extra,
+                    only_ok=spec.only_ok,
+                )
+            case StepEfficiencySpec():
+                return StepEfficiency(
+                    name,
+                    budget=spec.budget,
+                    count=spec.count,
+                    budget_key=spec.budget_key,
+                    calls_key=spec.calls_key,
+                )
+            case ForbiddenToolsSpec():
+                return ForbiddenTools(name, tools=spec.tools, expected_key=spec.expected_key)
             case PluginSpec():
                 return _load_plugin(spec, name, allow_import_paths=allow_import_paths)
     except SchemaError as exc:
         raise InvalidInputError(f"scorer {name}: invalid JSON schema: {exc.message}") from None
     except regex.error as exc:
         raise InvalidInputError(f"scorer {name}: invalid pattern: {exc}") from None
+    except ValueError as exc:
+        raise InvalidInputError(f"scorer {name}: {exc}") from None
     raise InvalidInputError(f"unknown scorer type for {name}")  # pragma: no cover
 
 
-def judge_from_spec(spec: JudgeSpec, providers: ProviderRegistry, name: str = "") -> LLMJudge:
+def judge_from_spec(
+    spec: JudgeSpec | TrajectoryJudgeSpec, providers: ProviderRegistry, name: str = ""
+) -> LLMJudge:
     name = name or spec.resolved_name()
     try:
         client = providers.get(spec.provider)
         endpoint = providers.endpoint(spec.provider)
     except InvalidInputError as exc:
         raise InvalidInputError(f"scorer {name}: {exc.message}") from None
+    if isinstance(spec, TrajectoryJudgeSpec):
+        return TrajectoryJudge(
+            name,
+            client=client,
+            endpoint=endpoint,
+            rubric=spec.rubric,
+            model=spec.model,
+            effort=spec.effort,
+            max_tokens=spec.max_tokens,
+        )
     return LLMJudge(
         name,
         client=client,
