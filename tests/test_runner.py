@@ -1,4 +1,5 @@
 import asyncio
+import threading
 from datetime import timedelta
 from typing import Any
 
@@ -579,6 +580,46 @@ def test_interrupt_saves_queued_results(sessions: sessionmaker[Session], dataset
 
     asyncio.run(main())
     assert result_count(sessions, run.id) == 2
+
+
+def test_a_cancel_during_a_write_does_not_write_the_batch_twice(
+    sessions: sessionmaker[Session], dataset: str
+) -> None:
+    # The cancel arrives while a batch is in its write thread, which runs to the
+    # end regardless. The interrupt path must not then save that batch again,
+    # where every case would be refused as taken over by another process.
+    r = runner(sessions, target_factory=CountingFactory())
+    run = r.create_run(config(latency_ms=5))
+    original = r._write
+    writing, go = threading.Event(), threading.Event()
+    refused: list[int] = []
+
+    def held_write(run_id: str, batch: list[CaseResult]) -> int:
+        if not writing.is_set():
+            writing.set()
+            go.wait(10)
+        n = original(run_id, batch)
+        refused.append(n)
+        return n
+
+    r._write = held_write  # type: ignore[method-assign]
+
+    async def main() -> None:
+        task = asyncio.create_task(r.execute(run.id))
+        while not writing.is_set():
+            await asyncio.sleep(0.005)
+        assert r.request_cancel(run.id)
+        await asyncio.sleep(0.05)
+        go.set()
+        report = await task
+        assert report.status == "cancelled"
+
+    asyncio.run(main())
+    assert refused
+    assert sum(refused) == 0
+    with sessions() as s:
+        assert leases.outstanding(s, run.id, r.owner).mine == 0
+    assert result_count(sessions, run.id) > 0
 
 
 def test_an_interrupted_process_leaves_the_status_to_the_others(

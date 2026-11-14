@@ -14,12 +14,13 @@ from sqlalchemy.orm import Session, sessionmaker
 
 from evalkit import runqueue
 from evalkit.config import Settings
-from evalkit.datasets import import_dataset
+from evalkit.datasets import Case, import_dataset
 from evalkit.db import make_engine, make_session_factory, upgrade
 from evalkit.db.models import CaseLease, Result, Run, RunWorker, utcnow
 from evalkit.errors import ConflictError, NotFoundError
 from evalkit.runner import Runner
 from evalkit.runspec import RunConfig
+from evalkit.targets.fake import FakeTarget
 from evalkit.worker import Worker, listen_url
 from tests.test_cli import run_cli, write_config
 from tests.test_runner import CountingFactory, make_cases
@@ -237,11 +238,34 @@ async def test_cancel_reaches_a_worker_through_a_notification(
         assert held == 0
 
 
+class Stalling(FakeTarget):
+    """Answers its first ``free`` cases; the rest wait until they are cancelled,
+    so only a noticed cancellation can end the run, however slow the machine."""
+
+    free = 8
+
+    def __init__(self, spec: Any) -> None:
+        super().__init__(spec)
+        self.started = 0
+
+    async def generate(self, case: Case) -> Any:
+        self.started += 1
+        if self.started > self.free:
+            await asyncio.Event().wait()
+        return await super().generate(case)
+
+
 async def test_cancel_is_noticed_by_the_heartbeat_without_notifications(
     sessions: sessionmaker[Session], dataset: str
 ) -> None:
     run_id = queue(sessions, config(latency_ms=50))
-    runner = make_runner(sessions, lease_ttl=timedelta(seconds=2), heartbeat_seconds=0.1)
+    runner = Runner(
+        sessions,
+        Settings.from_env({}),
+        target_factory=Stalling,
+        lease_ttl=LEASE,
+        heartbeat_seconds=0.1,
+    )
     worker = make_worker(sessions, runner)
     async with running(worker):
         await until(lambda: len(results(sessions, run_id)) >= 4)
@@ -249,7 +273,10 @@ async def test_cancel_is_noticed_by_the_heartbeat_without_notifications(
             runqueue.cancel(s, run_id, utcnow())
             s.commit()
         await until(lambda: status(sessions, run_id) == "cancelled", seconds=3)
-    assert len(results(sessions, run_id)) < 40
+        await until(lambda: not worker.runs)
+    # The answered cases are saved once each; the stalled ones were given back.
+    assert sorted(results(sessions, run_id)) == sorted(set(results(sessions, run_id)))
+    assert len(results(sessions, run_id)) == Stalling.free
 
 
 async def test_sigterm_drain_finishes_cases_in_flight_and_requeues(

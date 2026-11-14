@@ -1068,7 +1068,22 @@ class Runner:
                         break
                     batch.append(nxt)
             if batch:
-                refused = await asyncio.to_thread(self._write, ctx.run_id, list(batch))
+                # A cancel cannot stop a write already in its thread, so wait for
+                # it to land before passing the cancel on: otherwise ``batch``
+                # still holds what it saved, and the interrupt path
+                # (``_save_unwritten``) writes it a second time, where every
+                # case is refused as taken over.
+                write = asyncio.ensure_future(
+                    asyncio.to_thread(self._write, ctx.run_id, list(batch))
+                )
+                try:
+                    refused = await asyncio.shield(write)
+                except asyncio.CancelledError:
+                    await asyncio.wait([write])
+                    if not write.cancelled() and write.exception() is None:
+                        ctx.counts["refused"] += write.result()
+                        batch.clear()
+                    raise
                 ctx.counts["refused"] += refused
                 batch.clear()
                 ctx.written.set()
