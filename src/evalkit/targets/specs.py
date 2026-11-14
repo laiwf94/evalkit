@@ -128,40 +128,16 @@ class ConversationTargetSpec(_Spec):
         return self.model_dump(mode="json", exclude={"simulator", "type"})
 
 
-class AgentTargetSpec(_Spec):
-    """A model on a provider working on each case with tools from a sandbox.
+class _SandboxedSpec(_Spec):
+    """A target whose tool calls the sandbox answers: the sandbox inline, with
+    its recorded answers in ``fixtures`` (one object per record, as in a fixture
+    file). ``evalkit run`` fills both in from ``sandbox = "FILE.toml"``."""
 
-    The case input fills ``template`` as in a prompt target; the model then
-    calls the sandbox's tools (``evalkit.tools.sandbox``) until it answers
-    without asking for one, or has replied ``max_steps`` times. The sandbox is
-    given inline, with its recorded answers in ``fixtures`` (one object per
-    record, as in a fixture file); ``evalkit run`` fills both in from
-    ``sandbox = "FILE.toml"``."""
-
-    type: Literal["agent"]
-    provider: str = Field(default=ANTHROPIC, pattern=PROVIDER_NAME)
-    model: str = Field(default="claude-opus-5-5", min_length=1, max_length=64)
-    system: str = Field(default="", max_length=200_000)
-    template: str = Field(min_length=1, max_length=200_000)
-    max_tokens: int = Field(default=4096, ge=1, le=128_000)
-    effort: Effort = "medium"
-    fallbacks: bool = True
-    # Model replies per case; the case ends with stop reason ``max_steps`` after that.
-    max_steps: int = Field(default=20, ge=1, le=200)
     sandbox: SandboxSpec
     fixtures: list[dict[str, Any]] = Field(default_factory=list, max_length=MAX_RECORDS)
 
-    @field_validator("template")
-    @classmethod
-    def _valid_template(cls, value: str) -> str:
-        try:
-            placeholders(value)
-        except InvalidInputError as exc:
-            raise ValueError(exc.message) from None
-        return value
-
     @model_validator(mode="after")
-    def _valid_sandbox(self) -> AgentTargetSpec:
+    def _valid_sandbox(self) -> _SandboxedSpec:
         if self.sandbox.fixtures is not None:
             raise ValueError(
                 "sandbox.fixtures names a file; give the recorded answers as target.fixtures"
@@ -178,6 +154,38 @@ class AgentTargetSpec(_Spec):
             "".join(canonical_json(r) + "\n" for r in self.fixtures), self.sandbox
         )
 
+
+def _check_template(value: str) -> str:
+    try:
+        placeholders(value)
+    except InvalidInputError as exc:
+        raise ValueError(exc.message) from None
+    return value
+
+
+class AgentTargetSpec(_SandboxedSpec):
+    """A model on a provider working on each case with tools from a sandbox.
+
+    The case input fills ``template`` as in a prompt target; the model then
+    calls the sandbox's tools (``evalkit.tools.sandbox``) until it answers
+    without asking for one, or has replied ``max_steps`` times."""
+
+    type: Literal["agent"]
+    provider: str = Field(default=ANTHROPIC, pattern=PROVIDER_NAME)
+    model: str = Field(default="claude-opus-5-5", min_length=1, max_length=64)
+    system: str = Field(default="", max_length=200_000)
+    template: str = Field(min_length=1, max_length=200_000)
+    max_tokens: int = Field(default=4096, ge=1, le=128_000)
+    effort: Effort = "medium"
+    fallbacks: bool = True
+    # Model replies per case; the case ends with stop reason ``max_steps`` after that.
+    max_steps: int = Field(default=20, ge=1, le=200)
+
+    @field_validator("template")
+    @classmethod
+    def _valid_template(cls, value: str) -> str:
+        return _check_template(value)
+
     def model_part(self) -> dict[str, Any]:
         """The fields that decide the model's replies to a given transcript: its
         step cache entries do not depend on how the sandbox answers."""
@@ -186,8 +194,53 @@ class AgentTargetSpec(_Spec):
         )
 
 
+class HttpAgentTargetSpec(_SandboxedSpec):
+    """An agent behind an endpoint named in operator config, driven step by step
+    over the session protocol (``docs/agent-protocol.md``).
+
+    Each request carries the session so far and the agent answers with its next
+    message, which may ask for tools; the sandbox answers those, so the agent
+    never reaches a real tool during a run. Without a ``simulator`` a session is
+    one task, rendered from the case input by ``template``. With one, the case
+    input is a ``Conversation`` and a simulated user talks to the agent until
+    the goal is reached, the user gives up or the agent has finished
+    ``max_turns`` replies.
+
+    ``max_steps`` and ``max_tokens`` are the session's budgets: agent replies,
+    and the input plus output tokens the agent reports, over the whole session.
+    A session that spends one ends with stop reason ``max_steps`` or
+    ``token_budget``."""
+
+    type: Literal["http_agent"]
+    endpoint: str = Field(pattern=r"^[a-z0-9][a-z0-9_-]{0,63}$")
+    template: str = Field(default="", max_length=200_000)
+    max_steps: int = Field(default=20, ge=1, le=500)
+    max_tokens: int | None = Field(default=None, ge=1, le=100_000_000)
+    simulator: SimulatorSpec | None = None
+
+    @field_validator("template")
+    @classmethod
+    def _valid_template(cls, value: str) -> str:
+        return _check_template(value)
+
+    @model_validator(mode="after")
+    def _task_or_dialogue(self) -> HttpAgentTargetSpec:
+        if self.simulator is None and not self.template:
+            raise ValueError("give a template for the task, or a simulator for conversation cases")
+        if self.simulator is not None and self.template:
+            raise ValueError(
+                "a session with a simulated user opens with the case's messages; give no template"
+            )
+        return self
+
+
 AnyTargetSpec = (
-    PromptTargetSpec | HttpTargetSpec | FakeTargetSpec | ConversationTargetSpec | AgentTargetSpec
+    PromptTargetSpec
+    | HttpTargetSpec
+    | FakeTargetSpec
+    | ConversationTargetSpec
+    | AgentTargetSpec
+    | HttpAgentTargetSpec
 )
 
 TargetSpec = Annotated[AnyTargetSpec, Field(discriminator="type")]

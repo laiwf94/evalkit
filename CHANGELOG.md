@@ -139,3 +139,16 @@ week 2 (#23).
   prompt redacted, and is calibrated by `evalkit calibrate` on labelled
   trajectories. Scorers receive the trajectory through `Scorer.score_steps`;
   without one, trajectory metrics are unscorable.
+
+- **A session protocol and HTTP agent targets.** `docs/agent-protocol.md`
+  defines `evalkit-agent/1`: evalkit posts the whole session (transcript, tools,
+  budget left) to an agent service one step at a time, and the agent answers
+  with its next message and the tools it asks for. An `http_agent` target
+  speaks it on the SSRF-safe client:
+  - the sandbox answers tool calls;
+  - a simulated user is optional for conversation cases;
+  - every request carries an idempotency key derived from its content;
+  - each answer is cached on arrival;
+  - responses are validated strictly;
+  - the session has budgets for agent replies (`max_steps`) and reported tokens
+    (`max_tokens`).

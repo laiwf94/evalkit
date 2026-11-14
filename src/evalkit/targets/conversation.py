@@ -37,7 +37,7 @@ from evalkit.ratelimit import RateLimiter
 from evalkit.redaction import Redactor
 from evalkit.simuser import Simulator, UserTurn
 from evalkit.targets.base import Generation, Target, TargetError, Turn, Usage
-from evalkit.targets.specs import ConversationTargetSpec
+from evalkit.targets.specs import ConversationTargetSpec, SimulatorSpec
 
 # How a dialogue ended, besides the simulated user's own verdicts.
 MAX_TURNS = "max_turns"
@@ -94,11 +94,7 @@ class ConversationTarget(Target):
         self.assistant_hash = sha256_hex(
             canonical_json({"assistant": spec.assistant_part(), "extra": assistant_endpoint})
         )
-        self.simulator_hash = sha256_hex(
-            canonical_json(
-                {"simulator": spec.simulator.model_dump(mode="json"), "extra": simulator_endpoint}
-            )
-        )
+        self.simulator_hash = simulator_hash(spec.simulator, simulator_endpoint)
         self.store: TurnStore | None = None
         self.redactor = Redactor()
         self.fingerprint = self.redactor.config.fingerprint()
@@ -187,32 +183,18 @@ class ConversationTarget(Target):
     async def _user_turn(
         self, conversation: Conversation, transcript: list[Message]
     ) -> tuple[UserTurn, Turn]:
-        index = len(transcript)
-        seen = {
-            "case": conversation.model_dump(mode="json", exclude={"messages"}),
-            "transcript": _dump(transcript),
-        }
-        key = turn_key("user", self.simulator_hash, seen, self.fingerprint)
-        hit = await self.store.get(key) if self.store is not None else None
-        if hit is not None:
-            try:
-                cached = UserTurn.from_json(hit.output)
-            except ValueError:
-                cached = None  # not a turn this version wrote; ask again
-            if cached is not None:
-                return cached, Turn(index, "user", cached.message, cached.status, cached=True)
-        start = time.perf_counter()
-        user = await self._call(
-            self.simulator_limiter, lambda: self.simulator.next_turn(conversation, transcript)
+        user, turn = await simulated_turn(
+            self.simulator,
+            self.simulator_hash,
+            conversation,
+            transcript,
+            store=self.store,
+            redactor=self.redactor,
+            limiter=self.simulator_limiter,
+            max_retry_after=self.max_retry_after,
         )
-        latency = (time.perf_counter() - start) * 1000
-        redacted = self.redactor.redact(user.message)
-        user = UserTurn(user.status, redacted.text, user.usage)
-        if self.simulator.provider is not None:
+        if not turn.cached and self.simulator.provider is not None:
             self.fresh_turns += 1
-        if self.store is not None and not redacted.failed:
-            await self.store.put(key, self.simulator_hash, user.to_json(), user.status, user.usage)
-        turn = Turn(index, "user", user.message, user.status, latency_ms=latency, usage=user.usage)
         return user, turn
 
     async def _keep(self, key: str, text: str, stop_reason: str | None, usage: Usage) -> str:
@@ -225,14 +207,71 @@ class ConversationTarget(Target):
         return redacted.text
 
     async def _call[T](self, limiter: RateLimiter | None, call: Callable[[], Awaitable[T]]) -> T:
-        """One paid call under its provider's limiter. A Retry-After holds back
-        every caller of that provider; retrying is the run's job, and a retried
-        dialogue replays its cached turns for nothing."""
-        if limiter is not None:
-            await limiter.acquire()
+        return await call_limited(limiter, self.max_retry_after, call)
+
+
+def simulator_hash(spec: SimulatorSpec, endpoint: str | None) -> str:
+    """Whose turns a user turn cache entry holds: the simulator and where it calls."""
+    return sha256_hex(
+        canonical_json({"simulator": spec.model_dump(mode="json"), "extra": endpoint})
+    )
+
+
+async def simulated_turn(
+    simulator: Simulator,
+    owner_hash: str,
+    conversation: Conversation,
+    transcript: Sequence[Message],
+    *,
+    store: TurnStore | None,
+    redactor: Redactor,
+    limiter: RateLimiter | None,
+    max_retry_after: float,
+) -> tuple[UserTurn, Turn]:
+    """The simulated user's next turn of ``conversation`` after ``transcript``:
+    from the turn cache when it has one, else asked for, redacted and cached at
+    once. Any target that talks to a simulated user uses this, so a user turn is
+    never paid for twice."""
+    index = len(transcript)
+    fingerprint = redactor.config.fingerprint()
+    seen = {
+        "case": conversation.model_dump(mode="json", exclude={"messages"}),
+        "transcript": _dump(transcript),
+    }
+    key = turn_key("user", owner_hash, seen, fingerprint)
+    hit = await store.get(key) if store is not None else None
+    if hit is not None:
         try:
-            return await call()
-        except TargetError as exc:
-            if limiter is not None and exc.retry_after is not None:
-                await limiter.cool_down(min(exc.retry_after, self.max_retry_after))
-            raise
+            cached = UserTurn.from_json(hit.output)
+        except ValueError:
+            cached = None  # not a turn this version wrote; ask again
+        if cached is not None:
+            return cached, Turn(index, "user", cached.message, cached.status, cached=True)
+    start = time.perf_counter()
+    snapshot = list(transcript)
+    user = await call_limited(
+        limiter, max_retry_after, lambda: simulator.next_turn(conversation, snapshot)
+    )
+    latency = (time.perf_counter() - start) * 1000
+    redacted = redactor.redact(user.message)
+    user = UserTurn(user.status, redacted.text, user.usage)
+    if store is not None and not redacted.failed:
+        await store.put(key, owner_hash, user.to_json(), user.status, user.usage)
+    turn = Turn(index, "user", user.message, user.status, latency_ms=latency, usage=user.usage)
+    return user, turn
+
+
+async def call_limited[T](
+    limiter: RateLimiter | None, max_retry_after: float, call: Callable[[], Awaitable[T]]
+) -> T:
+    """One paid call under its provider's limiter. A Retry-After holds back every
+    caller of that provider; retrying is the run's job, and a retried dialogue
+    replays its cached turns for nothing."""
+    if limiter is not None:
+        await limiter.acquire()
+    try:
+        return await call()
+    except TargetError as exc:
+        if limiter is not None and exc.retry_after is not None:
+            await limiter.cool_down(min(exc.retry_after, max_retry_after))
+        raise

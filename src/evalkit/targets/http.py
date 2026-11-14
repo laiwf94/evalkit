@@ -157,12 +157,14 @@ class HttpTarget(Target):
         document = await self.post({"input": case.input})
         return Generation(text=self._extract(document), stop_reason=None)
 
-    async def post(self, payload: Any) -> Any:
+    async def post(self, payload: Any, headers: Mapping[str, str] | None = None) -> Any:
         """POST ``payload`` as JSON to the endpoint, under every check above, and
-        return the parsed JSON answer. The tool recorder uses it as well."""
+        return the parsed JSON answer. ``headers`` go after the endpoint's own and
+        before its secret ones. The tool recorder and the HTTP agent target
+        (``evalkit.targets.http_agent``) use it as well."""
         address = await self._pinned_address()
         url = f"{self._scheme}://{address}:{self._port}{self._path}"
-        headers = {**self.endpoint.headers, "Host": self._host_header}
+        headers = {**self.endpoint.headers, **(headers or {}), "Host": self._host_header}
         headers.update({k: v.get_secret_value() for k, v in self.endpoint.secret_headers.items()})
         extensions = {"sni_hostname": self._host} if self._scheme == "https" else {}
         request = self._client.build_request(

@@ -6,12 +6,13 @@ from collections.abc import Mapping
 from typing import TYPE_CHECKING
 
 from evalkit.errors import InvalidInputError
-from evalkit.simuser import build_simulator
+from evalkit.simuser import Simulator, build_simulator
 from evalkit.targets.agent import AgentTarget
 from evalkit.targets.base import Target
 from evalkit.targets.conversation import ConversationTarget
 from evalkit.targets.fake import FakeTarget
 from evalkit.targets.http import HttpEndpoint, HttpTarget
+from evalkit.targets.http_agent import HttpAgentTarget
 from evalkit.targets.prompt import PromptTarget
 from evalkit.targets.specs import (
     ANTHROPIC,
@@ -19,9 +20,11 @@ from evalkit.targets.specs import (
     AnyTargetSpec,
     ConversationTargetSpec,
     FakeTargetSpec,
+    HttpAgentTargetSpec,
     HttpTargetSpec,
     LLMSimulatorSpec,
     PromptTargetSpec,
+    SimulatorSpec,
     target_hash,
 )
 
@@ -31,7 +34,9 @@ if TYPE_CHECKING:
 AnySpec = AnyTargetSpec
 
 
-def resolve_endpoint(spec: HttpTargetSpec, endpoints: Mapping[str, HttpEndpoint]) -> HttpEndpoint:
+def resolve_endpoint(
+    spec: HttpTargetSpec | HttpAgentTargetSpec, endpoints: Mapping[str, HttpEndpoint]
+) -> HttpEndpoint:
     endpoint = endpoints.get(spec.endpoint)
     if endpoint is None:
         known = ", ".join(sorted(endpoints)) or "none configured"
@@ -46,9 +51,18 @@ def identity(
 ) -> str:
     """The target hash, including the resolved endpoint for HTTP targets and,
     for a prompt or agent target on a provider other than Claude, where that
-    provider is."""
+    provider is. An HTTP agent's includes its endpoint and where its simulated
+    user is."""
     if isinstance(spec, HttpTargetSpec):
         return target_hash(spec, resolve_endpoint(spec, endpoints).fingerprint())
+    if isinstance(spec, HttpAgentTargetSpec):
+        return target_hash(
+            spec,
+            {
+                "endpoint": resolve_endpoint(spec, endpoints).fingerprint(),
+                "simulator": simulator_endpoint(spec.simulator, providers),
+            },
+        )
     if isinstance(spec, PromptTargetSpec | AgentTargetSpec) and spec.provider != ANTHROPIC:
         return target_hash(spec, provider_endpoint(spec.provider, providers))
     if isinstance(spec, ConversationTargetSpec):
@@ -71,15 +85,24 @@ def conversation_endpoints(
     spec: ConversationTargetSpec, providers: Mapping[str, ProviderConfig] | None
 ) -> dict[str, str | None]:
     """Where a conversation's assistant and simulated user send their requests."""
-    simulator = spec.simulator
     return {
         "assistant": provider_endpoint(spec.provider, providers),
-        "simulator": (
-            provider_endpoint(simulator.provider, providers)
-            if isinstance(simulator, LLMSimulatorSpec)
-            else None
-        ),
+        "simulator": simulator_endpoint(spec.simulator, providers),
     }
+
+
+def simulator_endpoint(
+    simulator: SimulatorSpec | None, providers: Mapping[str, ProviderConfig] | None
+) -> str | None:
+    """Where a simulated user sends its requests: None when it makes none."""
+    if isinstance(simulator, LLMSimulatorSpec):
+        return provider_endpoint(simulator.provider, providers)
+    return None
+
+
+def simulator_for(spec: SimulatorSpec, providers: ProviderRegistry) -> Simulator:
+    client = providers.get(spec.provider) if isinstance(spec, LLMSimulatorSpec) else None
+    return build_simulator(spec, client)
 
 
 def build_target(
@@ -101,18 +124,19 @@ def build_target(
                 providers.get(spec.provider),
                 endpoint=provider_endpoint(spec.provider, providers.configs),
             )
+        case HttpAgentTargetSpec():
+            return HttpAgentTarget(
+                spec,
+                resolve_endpoint(spec, endpoints),
+                None if spec.simulator is None else simulator_for(spec.simulator, providers),
+                simulator_endpoint=simulator_endpoint(spec.simulator, providers.configs),
+            )
         case ConversationTargetSpec():
             where = conversation_endpoints(spec, providers.configs)
-            simulator = spec.simulator
-            client = (
-                providers.get(simulator.provider)
-                if isinstance(simulator, LLMSimulatorSpec)
-                else None
-            )
             return ConversationTarget(
                 spec,
                 providers.get(spec.provider),
-                build_simulator(simulator, client),
+                simulator_for(spec.simulator, providers),
                 assistant_endpoint=where["assistant"],
                 simulator_endpoint=where["simulator"],
             )

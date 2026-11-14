@@ -93,10 +93,12 @@ from evalkit.targets import Generation, Step, Target, TargetError, TargetSpec, T
 from evalkit.targets.agent import AgentTarget
 from evalkit.targets.conversation import ConversationTarget
 from evalkit.targets.factory import build_target, identity
+from evalkit.targets.http_agent import HttpAgentTarget
 from evalkit.targets.prompt import PromptTarget
 from evalkit.targets.specs import (
     AgentTargetSpec,
     ConversationTargetSpec,
+    HttpAgentTargetSpec,
     LLMSimulatorSpec,
     PromptTargetSpec,
 )
@@ -444,6 +446,13 @@ class Runner:
             uses.insert(0, (target.provider, prices, target.model))
         if isinstance(target, ConversationTargetSpec):
             uses[:0] = self._conversation_prices(target)
+        if isinstance(target, HttpAgentTargetSpec) and isinstance(
+            target.simulator, LLMSimulatorSpec
+        ):
+            # The agent reports its own cost; only its simulated user is priced here.
+            prices = self._price_table(target.simulator.provider)
+            prices.require(target.simulator.model)
+            uses.insert(0, (target.simulator.provider, prices, target.simulator.model))
         if config.options.mode == "batch" and not (
             isinstance(target, PromptTargetSpec) and target.provider == ANTHROPIC
         ):
@@ -476,7 +485,9 @@ class Runner:
         cases = load_cases(session, dataset, config.filter.split, config.filter.tags)
         if not cases:
             raise InvalidInputError("the filter selects no cases from the dataset")
-        if isinstance(config.target, ConversationTargetSpec):
+        if isinstance(config.target, ConversationTargetSpec) or (
+            isinstance(config.target, HttpAgentTargetSpec) and config.target.simulator is not None
+        ):
             # Say which case is malformed now, not as an error on every bad case.
             for case in cases:
                 conversation_of(case)
@@ -800,6 +811,21 @@ class Runner:
                 store=cache.TurnStore(self.sessions) if options.use_cache else None,
                 redactor=self.redactor,
                 limiter=self._limiter(target.client.name, options.rate_limit),
+                max_retry_after=options.retry.max_retry_after,
+            )
+        if isinstance(target, HttpAgentTarget):
+            # Each request waits on the endpoint's limiter; sessions are not paced.
+            limit = RateLimit()
+            simulator = target.simulator.provider if target.simulator is not None else None
+            target.attach(
+                store=cache.TurnStore(self.sessions) if options.use_cache else None,
+                redactor=self.redactor,
+                limiter=self._limiter(target.provider, options.rate_limit),
+                simulator_limiter=(
+                    None
+                    if simulator is None
+                    else self._limiter(f"{simulator}:simuser", RateLimit())
+                ),
                 max_retry_after=options.retry.max_retry_after,
             )
         fingerprint = self.settings.redaction.fingerprint()
@@ -1415,6 +1441,7 @@ def _check_prices(run: Run, target: Target, scorers: Sequence[Scorer]) -> None:
     if isinstance(target, ConversationTarget):
         spec = target.spec
         uses.append((target.assistant.name, target.assistant.prices, spec.model))
+    if isinstance(target, ConversationTarget | HttpAgentTarget):
         simulator = target.simulator
         if isinstance(simulator, LLMSimulator):
             uses.append((simulator.client.name, simulator.client.prices, simulator.spec.model))

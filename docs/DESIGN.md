@@ -726,6 +726,53 @@ The steps are written as `result_steps` rows in the result's transaction, under
 the same lease check; a tool name or call id the model made up is clipped to the
 column's size.
 
+### Agents behind HTTP
+
+`targets/http_agent.py` speaks the session protocol (`docs/agent-protocol.md`)
+to an agent service. The protocol is stateless on purpose:
+
+- evalkit owns the session, and every request carries the whole transcript.
+- The sandbox, not the agent, answers tool calls.
+
+Holding the session lets evalkit treat an external agent exactly like a model
+in the tool loop. The trajectory it stores is the one the agent saw, every case
+gets the same tool answers and faults, and each step can be cached by a hash of
+the request. A stateful protocol, where the agent keeps the session and
+evalkit sends only the new message, would make a resumed run depend on the
+agent having kept state across the crash. It would also make the agent's own
+tool calls invisible.
+
+**Idempotent requests.** The request id is a hash of the request body. The
+session id is derived from the agent's configuration and the case id, so it is
+stable across attempts and processes. A retry after a timeout therefore resends
+the same `Idempotency-Key`, and an agent that stores answers by key never does
+the same work twice. Caching each answer the moment it arrives means a resumed
+run never resends a step that was answered.
+
+**Budgets.** Both budgets are per session: replies (`max_steps`) and reported
+tokens (`max_tokens`). Neither is per turn, because a conversation that spends
+its budget in one turn should stop there. A cached reply stores the tokens it
+was answered with, so a replayed session spends its budget the same way. Its
+cost to this run is still zero. Token counts and cost are the agent's own
+report, because evalkit cannot see the models behind the endpoint. Only a
+simulated user played by a model is priced from evalkit's price lists.
+
+**Limits.** Each request waits on the endpoint's limiter (`http:NAME`, shared
+with `http` targets on the same endpoint), and sessions are not paced. A
+Retry-After cools down the endpoint for every session. Responses are checked
+strictly and unknown fields are ignored, so later versions can add fields:
+
+- types are strict, so a number sent as a string is refused;
+- at most 64 tool calls, with ids unique within a reply;
+- usage must be non-negative and finite.
+
+A violation fails the case without a retry and names the field. An agent that
+answers malformed once usually does again.
+
+Simulated user turns go through the same function as in a `conversation`
+target (`simulated_turn`). Both cache and redact a user turn the same way, so
+the two targets cannot drift apart.
+
 ## Calling Claude
 
 All Claude calls go through one provider (`providers/anthropic.py`):

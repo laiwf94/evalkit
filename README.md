@@ -299,6 +299,39 @@ hash of the transcript so far as soon as it is paid for, so a run killed or a
 case retried mid-trajectory replays the replies it has for nothing, and changing
 one tool's answer reuses every reply before the model first saw it.
 
+### HTTP agents
+
+An `http_agent` target evaluates your own agent service over the session
+protocol in [docs/agent-protocol.md](docs/agent-protocol.md). evalkit holds the
+session and posts it to the endpoint one step at a time: the transcript so far,
+the sandbox's tools and the budget left. The agent answers with its next
+message. Tool calls in it are answered by the sandbox, so the agent never
+reaches a real system during a run.
+
+```toml
+[target]
+type = "http_agent"
+endpoint = "booker"                  # named in EVALKIT_HTTP_TARGETS_FILE, never a URL
+template = "Book a table: {{ request }}"
+sandbox = "booking.toml"
+max_steps = 12                       # agent replies per session (stop reason max_steps)
+max_tokens = 20000                   # tokens the agent reports per session (token_budget)
+```
+
+For conversation cases, leave out `template` and add a `[target.simulator]` as
+for a `conversation` target. The simulated user then talks to the agent, and
+each agent turn may call tools. Requests use the SSRF-safe client of `http`
+targets.
+
+- Every request carries a `request_id`, also sent as `Idempotency-Key`. It is
+  derived from the request, so a retry sends the same key.
+- Every answer is cached the moment it arrives. A killed run resumes
+  mid-session without asking for a step twice.
+- The agent reports its own tokens and cost, and the token budget counts those
+  tokens.
+- Steps are stored in `result_steps` and turns in `result_turns`, so trajectory
+  scorers work unchanged.
+
 ### Trajectory scorers
 
 Four scorers grade what the agent did rather than only what it said. They read
@@ -612,7 +645,8 @@ and what would change at larger scale is in [docs/DESIGN.md](docs/DESIGN.md).
 
 ```text
 src/evalkit/datasets.py    JSONL parsing, content hashing, versioned storage
-src/evalkit/targets/       prompt, HTTP (SSRF-safe), conversation, agent and fake targets; templates
+src/evalkit/targets/       prompt, HTTP (SSRF-safe), conversation, agent, HTTP agent (session
+                           protocol, docs/agent-protocol.md) and fake targets; templates
 src/evalkit/simuser.py     simulated users: scripted, or played by a model in JSON
 src/evalkit/tools/         the tool sandbox: schemas, scripted and recorded answers, limits,
                            latency and failure injection; recording fixtures; the tool loop
