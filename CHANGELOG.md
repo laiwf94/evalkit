@@ -97,6 +97,14 @@ week 2 (#23).
   fourth provider, with every provider's tokens and cost checked against its
   price list, then a prompt version promoted to production, run and gated
   against the matrix run it replaces.
+### Fixes
+
+- The shared rate limiter's writes no longer wait for the WAL flush while
+  holding the row lock, so a slow disk no longer pushes a fleet below its rate
+  (#81).
+- Cancelling a run while a batch of results was being written no longer writes
+  that batch a second time and reports its cases as refused (#81).
+
 ### Agents and conversations (#24)
 
 - **Conversation cases and simulated users.** A `conversation` target holds a

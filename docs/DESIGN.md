@@ -365,6 +365,16 @@ may execute one run (and several runs one provider), it lives in a row of
   rather than one per round trip.
 - Times are the database server's clock, and callers only sleep for the
   difference between two readings of it, so worker clocks need not agree.
+- Writes to the row commit asynchronously: each statement turns
+  `synchronous_commit` off for its own transaction, with `set_config(...,
+  true)` in the same round trip, so pooled connections keep the server's
+  setting. The row lock is held until commit, and with a WAL flush inside it
+  every slow fsync stalls every process at once. With a background job
+  fsyncing the same disk, the eight-worker test below fell to 160-168 requests
+  a second, with calls 150-165 ms after their slots. With asynchronous commit
+  it held 199.7-200.0 a second, 11-15 ms after. The row is coordination state:
+  a database crash can lose its last fraction of a second of updates, which at
+  worst admits that much again once.
 - Every admission returns the current cool-down. A caller whose knowledge of it
   is older than 100 ms when its slot arrives reads it again, so a 429 on one
   worker pauses the others within about 100 ms. A provider with no configured

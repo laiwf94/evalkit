@@ -202,3 +202,28 @@ def test_the_postgresql_statements_never_exceed_the_rate(postgres_url: str) -> N
         check()
     finally:
         engine.dispose()
+
+
+def test_limiter_writes_do_not_wait_for_the_disk(postgres_url: str) -> None:
+    # Each write turns synchronous commit off for its own transaction only: the
+    # row lock is not held through a WAL flush, and the pooled connection, which
+    # also saves results, keeps the server's setting.
+    engine = make_engine(postgres_url)
+    try:
+        limiter = PgRateLimiter(
+            make_session_factory(engine), f"sync-{next(keys)}", RateLimit(requests_per_second=100)
+        )
+        asyncio.run(limiter.acquire())
+        asyncio.run(limiter.cool_down(0.01))
+        with engine.connect() as conn:
+            assert conn.exec_driver_sql("SHOW synchronous_commit").scalar() == "on"
+            params = limiter._params({"count": 1})
+            conn.execute(limiter._admit, params)
+            assert conn.exec_driver_sql("SHOW synchronous_commit").scalar() == "off"
+            conn.rollback()
+            assert conn.exec_driver_sql("SHOW synchronous_commit").scalar() == "on"
+        for statement in (limiter._admit, limiter._refund_sql, limiter._announce_sql):
+            assert "set_config('synchronous_commit', 'off', true)" in str(statement)
+        assert "synchronous_commit" not in str(limiter._peek_sql)
+    finally:
+        engine.dispose()

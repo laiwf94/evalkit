@@ -15,6 +15,12 @@ provider key:
   process, no transaction outlives the statement, and callers sleep for the
   difference between two readings of the server's clock, so workers whose own
   clocks disagree still agree on the schedule.
+* Every write commits asynchronously (``synchronous_commit`` off for that one
+  transaction): the row lock is released at commit, and waiting for the WAL to
+  reach the disk while holding it would stall every process behind each slow
+  fsync, so on a busy disk the fleet falls behind its own schedule. The row is
+  coordination state, not a record: a database crash can lose its last fraction
+  of a second of updates, which at worst admits that much again once.
 * A cool-down (Retry-After) moves ``cooldown_until`` forward. Every admission
   returns it, and a caller whose knowledge of it is older than ``peek_seconds``
   when its slot arrives reads it again, so a 429 on one worker pauses the others
@@ -90,10 +96,17 @@ class PgRateLimiter(GcraLimiter):
             now = time.time
         self._now = now
         now_sql = ":now" if now is not None else PG_NOW
-        names = {"GREATEST": "greatest" if postgres else "max", "NOW": now_sql}
+        # Applies to the statement's own (autocommit) transaction only, so the
+        # pooled connection goes back unchanged.
+        no_flush = " AND set_config('synchronous_commit', 'off', true) IS NOT NULL"
+        names = {
+            "GREATEST": "greatest" if postgres else "max",
+            "NOW": now_sql,
+            " ASYNC": no_flush if postgres else "",
+        }
 
         def sql(template: str) -> Any:
-            # Only the two constants above are spliced in; values are bound parameters.
+            # Only the constants above are spliced in; values are bound parameters.
             for name, value in names.items():
                 template = template.replace(name, value)
             return text(template)
@@ -111,18 +124,18 @@ class PgRateLimiter(GcraLimiter):
             "UPDATE rate_limits "
             "SET tat = GREATEST(tat, GREATEST(tat - :tolerance, NOW, cooldown_until)) "
             "+ :count * :interval "
-            "WHERE key = :key "
+            "WHERE key = :key ASYNC "
             "RETURNING GREATEST(tat - :count * :interval - :tolerance, NOW, cooldown_until), "
             "NOW, tat, cooldown_until"
         )
         self._refund_sql = sql(
             "UPDATE rate_limits SET tat = GREATEST(tat - :interval, cooldown_until + :tolerance) "
-            "WHERE key = :key AND tat = :tat"
+            "WHERE key = :key AND tat = :tat ASYNC"
         )
         self._announce_sql = sql(
             "UPDATE rate_limits SET cooldown_until = GREATEST(cooldown_until, NOW + :seconds), "
             "tat = GREATEST(tat, NOW + :seconds + :tolerance) "
-            "WHERE key = :key RETURNING cooldown_until, NOW"
+            "WHERE key = :key ASYNC RETURNING cooldown_until, NOW"
         )
         self._peek_sql = sql("SELECT cooldown_until, NOW FROM rate_limits WHERE key = :key")
         self._ready = False
