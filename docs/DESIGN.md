@@ -769,6 +769,23 @@ strictly and unknown fields are ignored, so later versions can add fields:
 A violation fails the case without a retry and names the field. An agent that
 answers malformed once usually does again.
 
+**Conformance.** `conformance.py` builds its requests with the same
+functions as the target (`wire_messages`, `request_id`, `parse_reply`) and
+sends them through the same `HttpTarget.post`. So what it checks is what a run
+sends, and the two cannot drift apart. It probes the properties a run relies
+on and that a single session cannot show:
+
+- Answering by `request_id` is what makes retries safe.
+- Statelessness is what makes a resume and concurrent cases safe.
+- Recovery from tool errors is what keeps fault injection from turning into
+  `max_steps`.
+
+The probes compare answers as well as validate them. A difference only warns:
+an agent backed by a sampled model may answer a recomputed step differently,
+and the protocol allows that. A refused or malformed answer fails, because a
+run would fail on it. The checker never retries, so a flaky agent shows as
+flaky rather than as passing.
+
 Simulated user turns go through the same function as in a `conversation`
 target (`simulated_turn`). Both cache and redact a user turn the same way, so
 the two targets cannot drift apart.

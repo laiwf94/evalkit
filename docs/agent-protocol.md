@@ -161,6 +161,23 @@ max_tokens = 20000
 
 Requests go through the same SSRF-safe client as `http` targets. evalkit resolves the host and refuses private, loopback, link-local and metadata addresses unless the endpoint sets `allow_private`. It connects to the address it checked, so DNS rebinding cannot redirect a request. It ignores proxy variables, follows no redirects and caps the response size.
 
+## Conformance
+
+`evalkit agent conformance ENDPOINT --sandbox FILE` checks an agent against this protocol before a run. The tasks it sends are the `--task` options, or else the `tasks` list in the sandbox file's `[conformance]` table. Each check passes, warns or fails, and the command exits 1 when one fails (with `--strict`, also when one warns):
+
+| Check | What it sends | Fails when | Warns when |
+|---|---|---|---|
+| `protocol_version` | a first request in `evalkit-agent/999` | the agent answers 5xx or cannot be reached | it answers 200, or a 4xx other than 400 |
+| `schemas` | one session per task, with tools answered by the sandbox | a reply breaks the protocol, a call names a tool that was not offered or has arguments that break its `input_schema`, or a session does not finish within `--max-steps` | |
+| `idempotent_retries` | every step of the first session again, same body and `request_id`; its first step twice at once | a repeat is not answered | an answer differs from the first (fine without side effects) |
+| `ordering` | the first session's steps last first, under a new session; every task at once, under new sessions | one of those is not answered | an answer differs from the sequential run |
+| `tool_errors` | the first task, with every tool call answered by an error | a reply breaks the protocol, or the session does not finish | |
+| `timeouts` | | a request ran out of the endpoint's `timeout_seconds` | the slowest took over 80% of it |
+
+When `schemas` gets no valid reply at all, the three checks after it are skipped, and a skip counts as a failure. Session ids are new on every invocation, so an agent that stores answers cannot pass `ordering` from an earlier run. The checker does not retry: a 429 or a 5xx is reported in the check where it happened.
+
+`examples/agent_server.py` is a reference agent that passes every check, with its tools in `examples/agents/booking.toml`. It answers from the transcript alone, keeps answers by `request_id`, refuses other versions with 400, and answers in text when one step is left.
+
 ## Versioning
 
 Additive changes (new optional request or response fields) keep the version. A change that an agent written for `evalkit-agent/1` could not handle gets a new version string. Every request names the version it speaks in `protocol`, and an agent that does not recognise it should answer 400.

@@ -174,7 +174,7 @@ class HttpTarget(Target):
             response = await self._client.send(request, stream=True)
         except httpx2.TimeoutException:
             raise TargetError(
-                f"endpoint {self.spec.endpoint!r} timed out", retryable=True
+                f"endpoint {self.spec.endpoint!r} timed out", retryable=True, timed_out=True
             ) from None
         except httpx2.TransportError as exc:
             raise TargetError(
@@ -206,6 +206,7 @@ class HttpTarget(Target):
                 f"endpoint {self.spec.endpoint!r} answered with a redirect ({status}); "
                 "redirects are not followed",
                 retryable=False,
+                status=status,
             )
         if status >= 400:
             retry_after = parse_retry_after(response.headers.get("retry-after"))
@@ -213,6 +214,7 @@ class HttpTarget(Target):
                 f"endpoint {self.spec.endpoint!r} returned {status}",
                 retryable=status in (408, 429) or status >= 500,
                 retry_after=retry_after,
+                status=status,
             )
         limit = self.endpoint.max_response_bytes
         declared = response.headers.get("content-length")
@@ -229,6 +231,10 @@ class HttpTarget(Target):
         except httpx2.DecodingError:
             raise TargetError(
                 f"response from {self.spec.endpoint!r} could not be decoded", retryable=False
+            ) from None
+        except httpx2.TimeoutException:
+            raise TargetError(
+                f"response from {self.spec.endpoint!r} timed out", retryable=True, timed_out=True
             ) from None
         except httpx2.TransportError as exc:
             raise TargetError(

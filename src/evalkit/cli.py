@@ -4,7 +4,7 @@ Exit codes are part of the interface, so CI can tell a regression from a
 broken job:
 
     0  success; for ``gate``, no regression
-    1  ``gate`` found a regression
+    1  ``gate`` found a regression; ``agent conformance`` found a failing check
     2  bad input: config, arguments, unknown dataset or run
     3  the run cannot be used: it failed, is incomplete, is being executed by
        another process, or cannot be paired; also any unexpected error
@@ -37,6 +37,7 @@ from sqlalchemy.orm import Session, sessionmaker
 from evalkit import __version__, aggregates, blobs, cache, runqueue
 from evalkit.api import serve
 from evalkit.config import ConfigError, Settings, parse_duration, parse_size
+from evalkit.conformance import AgentConformance, ConformanceReport
 from evalkit.datasets import (
     get_dataset,
     import_dataset,
@@ -660,6 +661,46 @@ async def cmd_tools(args: argparse.Namespace, settings: Settings, out: TextIO) -
     return EXIT_UNUSABLE if report.failed else EXIT_OK
 
 
+async def cmd_agent(args: argparse.Namespace, settings: Settings, out: TextIO) -> int:
+    """``evalkit agent conformance ENDPOINT``: probe an agent on the session protocol
+    (``evalkit.conformance``). Exits 1 when a check fails. Needs no database."""
+    endpoint = settings.http_endpoints.get(args.endpoint)
+    if endpoint is None:
+        raise CliError(
+            f"endpoint {args.endpoint!r} is not configured in EVALKIT_HTTP_TARGETS_FILE",
+            EXIT_INPUT,
+        )
+    sandbox_file = Path(args.sandbox)
+    spec, fixtures = load_sandbox(sandbox_file)
+    tasks: list[str] = list(args.task or [])
+    if not tasks:
+        table = _read_toml(sandbox_file).get("conformance", {})
+        listed = table.get("tasks") if isinstance(table, dict) else None
+        if not isinstance(listed, list) or not all(isinstance(t, str) and t for t in listed):
+            raise CliError(
+                f"give --task, or tasks = [...] in the [conformance] table of {sandbox_file}",
+                EXIT_INPUT,
+            )
+        tasks = listed
+    try:
+        checker = AgentConformance(
+            args.endpoint,
+            endpoint,
+            spec,
+            tasks,
+            fixtures=fixtures,
+            max_steps=args.max_steps,
+        )
+    except ValueError as exc:
+        raise CliError(str(exc), EXIT_INPUT) from None
+    report = await checker.run()
+    if args.json:
+        out.write(json.dumps(report.to_dict(), indent=2) + "\n")
+    else:
+        out.write(_format_conformance(report))
+    return EXIT_OK if report.passed(strict=args.strict) else EXIT_REGRESSION
+
+
 def cmd_serve(settings: Settings) -> int:
     serve(settings)
     return EXIT_OK
@@ -744,6 +785,7 @@ def build_parser() -> argparse.ArgumentParser:
     _add_prompt_commands(sub)
     _add_maintenance_commands(sub)
     _add_tools_commands(sub)
+    _add_agent_commands(sub)
     sub.add_parser("serve", help="run the HTTP API (EVALKIT_HOST, EVALKIT_PORT)")
     return parser
 
@@ -815,6 +857,26 @@ def _add_tools_commands(sub: Any) -> None:
     rec.add_argument("--refresh", action="store_true", help="call again for calls already recorded")
     rec.add_argument("--json", action="store_true", help="print JSON instead of a table")
     tools.set_defaults(handler=cmd_tools)
+
+
+def _add_agent_commands(sub: Any) -> None:
+    agent = sub.add_parser("agent", help="check agents that run behind an endpoint")
+    agent_sub = agent.add_subparsers(dest="agent_command", required=True)
+    conf = agent_sub.add_parser(
+        "conformance",
+        help="probe an endpoint's agent on the session protocol; exit 1 when a check fails",
+    )
+    conf.add_argument("endpoint", help="endpoint name in EVALKIT_HTTP_TARGETS_FILE")
+    conf.add_argument("--sandbox", required=True, help="TOML file with the [sandbox] of tools")
+    conf.add_argument(
+        "--task",
+        action="append",
+        help="a user's message to start a session with (repeatable; default: the "
+        "sandbox file's [conformance] tasks)",
+    )
+    conf.add_argument("--max-steps", type=int, default=20, help="replies per session")
+    conf.add_argument("--strict", action="store_true", help="exit 1 on warnings too")
+    conf.add_argument("--json", action="store_true", help="print JSON instead of a table")
 
 
 def _add_maintenance_commands(sub: Any) -> None:
@@ -894,6 +956,8 @@ def main(argv: Sequence[str] | None = None, out: TextIO | None = None) -> int:
 async def _dispatch(args: argparse.Namespace, settings: Settings, out: TextIO) -> int:
     if args.command == "tools":
         return await cmd_tools(args, settings, out)
+    if args.command == "agent":
+        return await cmd_agent(args, settings, out)
     app = App(settings, out)
     handler: Callable[[argparse.Namespace, App], Any] = args.handler
     try:
@@ -1119,6 +1183,19 @@ def _format_sandbox(info: dict[str, Any]) -> str:
         f"{len(info['tools'])} tools ({', '.join(info['tools'])}), "
         f"{info['fixtures']} fixtures, identity {info['identity'][:12]}\n"
     )
+
+
+def _format_conformance(r: ConformanceReport) -> str:
+    counts = {s: sum(c.status == s for c in r.checks) for s in ("pass", "warn", "fail", "skip")}
+    summary = ", ".join(f"{n} {s}" for s, n in counts.items() if n)
+    lines = [f"agent {r.endpoint} on {r.protocol}: {summary}"]
+    width = max(len(c.name) for c in r.checks)
+    lines += [f"  {c.status:<4}  {c.name:<{width}}  {c.detail}" for c in r.checks]
+    lines.append(
+        f"{r.requests} requests, latency p50 {r.latency_ms_p50:.0f} ms, "
+        f"max {r.latency_ms_max:.0f} ms (timeout {r.timeout_seconds:g} s)"
+    )
+    return "\n".join(lines) + "\n"
 
 
 def _format_record(r: RecordReport) -> str:

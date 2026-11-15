@@ -1,0 +1,39 @@
+# The tools of the reference booking agent (examples/agent_server.py), answered
+# by evalkit's tool sandbox. Check it with: evalkit tools check examples/agents/booking.toml
+
+[sandbox]
+seed = 3
+max_calls = 20
+
+[[sandbox.tools]]
+name = "find_slots"
+description = "The free table times on a date, as HH:MM strings"
+input_schema = { type = "object", properties = { date = { type = "string", pattern = "^\\d{4}-\\d{2}-\\d{2}$" } }, required = ["date"], additionalProperties = false }
+output_schema = { type = "array", items = { type = "string" } }
+responses = [
+  { when = { date = "2026-12-24" }, result = [] },
+  { when = { date = "2026-12-31" }, result = ["22:30"] },
+  { result = ["19:00", "20:30", "21:15"] },
+]
+
+[[sandbox.tools]]
+name = "book"
+description = "Book the table at a time on a date; answers a confirmation code"
+input_schema = { type = "object", properties = { date = { type = "string" }, slot = { type = "string", pattern = "^\\d{2}:\\d{2}$" } }, required = ["date", "slot"], additionalProperties = false }
+output_schema = { type = "object", properties = { confirmation = { type = "string" } }, required = ["confirmation"] }
+responses = [
+  { when = { slot = "19:00" }, result = { confirmation = "BK-1900" } },
+  { when = { slot = "20:30" }, result = { confirmation = "BK-2030" } },
+  { when = { slot = "21:15" }, result = { confirmation = "BK-2115" } },
+  { when = { slot = "22:30" }, result = { confirmation = "BK-2230" } },
+  { error = "that table is no longer free" },
+]
+
+# The users' messages `evalkit agent conformance` sends when no --task is given.
+[conformance]
+tasks = [
+  "Book a table for two on 2026-11-20",
+  "I'd like a table on 2026-11-21 at 20:30 please",
+  "Is anything free on 2026-12-24?",
+  "Book me something",
+]

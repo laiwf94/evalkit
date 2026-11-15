@@ -86,13 +86,25 @@ class Generation:
 
 
 class TargetError(Exception):
-    """A failed call. ``retryable`` failures go back through the retry policy."""
+    """A failed call. ``retryable`` failures go back through the retry policy.
+    ``status`` is the HTTP status when the other side answered with an error, and
+    ``timed_out`` says the call ran out of time."""
 
-    def __init__(self, message: str, *, retryable: bool, retry_after: float | None = None) -> None:
+    def __init__(
+        self,
+        message: str,
+        *,
+        retryable: bool,
+        retry_after: float | None = None,
+        status: int | None = None,
+        timed_out: bool = False,
+    ) -> None:
         super().__init__(message)
         self.message = message
         self.retryable = retryable
         self.retry_after = retry_after
+        self.status = status
+        self.timed_out = timed_out
 
 
 class Target(ABC):

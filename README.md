@@ -332,6 +332,31 @@ targets.
 - Steps are stored in `result_steps` and turns in `result_turns`, so trajectory
   scorers work unchanged.
 
+Before a run, `evalkit agent conformance ENDPOINT --sandbox FILE` checks that
+the agent speaks the protocol. It drives a few short sessions through the
+sandbox and reports pass, warn or fail for each check. It exits 1 when one
+fails, or with `--strict` when one warns:
+
+- `protocol_version`: an unknown protocol version gets 400.
+- `schemas`: every reply is valid, and every tool call names an offered tool
+  with arguments that match its schema.
+- `idempotent_retries`: a repeated `request_id`, also sent twice at once, is
+  answered as before.
+- `ordering`: a session resumed at a later step, and sessions interleaved,
+  answer as when run in order.
+- `tool_errors`: with every tool failing, the agent still finishes.
+- `timeouts`: no request runs out of the endpoint's timeout.
+
+[examples/agent_server.py](examples/agent_server.py) is a reference agent that
+passes every check. It is a table-booking agent with no dependencies, and its
+tools are in [examples/agents/booking.toml](examples/agents/booking.toml):
+
+```bash
+python examples/agent_server.py --port 8765 &
+# endpoints.toml: [endpoints.booker] url = "http://127.0.0.1:8765/v1/step", allow_private = true
+evalkit agent conformance booker --sandbox examples/agents/booking.toml
+```
+
 ### Trajectory scorers
 
 Four scorers grade what the agent did rather than only what it said. They read
@@ -505,6 +530,7 @@ different judge it would refuse (exit 3) unless `--allow-judge-change` is given.
 | `evalkit prompt label REF LABEL [--expect V\|none]` | Point a label at a version by compare-and-set; exit 3 if it moved. |
 | `evalkit tools check SANDBOX` | Validate a tool sandbox and its fixtures; print its identity. |
 | `evalkit tools record SANDBOX CALLS [-o FILE] [--refresh]` | Record the tools' real answers to a JSONL list of calls as fixtures; exit 3 if any call failed. |
+| `evalkit agent conformance ENDPOINT --sandbox FILE [--task T]... [--max-steps N] [--strict]` | Probe an agent on the session protocol; exit 1 if a check fails (or warns, with `--strict`). |
 | `evalkit cache sweep [--max-age 30d] [--max-size 20GiB] [--dry-run]` | Delete old and least recently used cache entries, then unreferenced blobs. |
 | `evalkit cache scrub` | Read every blob and check it against its digest; exit 3 if any is corrupt. |
 | `evalkit serve`, `evalkit db upgrade` | Run the API; migrate PostgreSQL. |
@@ -648,6 +674,7 @@ src/evalkit/datasets.py    JSONL parsing, content hashing, versioned storage
 src/evalkit/targets/       prompt, HTTP (SSRF-safe), conversation, agent, HTTP agent (session
                            protocol, docs/agent-protocol.md) and fake targets; templates
 src/evalkit/simuser.py     simulated users: scripted, or played by a model in JSON
+src/evalkit/conformance.py `evalkit agent conformance`: session protocol checks for agents
 src/evalkit/tools/         the tool sandbox: schemas, scripted and recorded answers, limits,
                            latency and failure injection; recording fixtures; the tool loop
 src/evalkit/scorers/       built-in and trajectory scorers, plugin registry, LLM judges, calibration

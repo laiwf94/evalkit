@@ -6,7 +6,12 @@ cd "$(dirname "$0")/.."
 
 EVALKIT=${EVALKIT:-"uv run evalkit"}
 DB_DIR=$(mktemp -d)
-trap 'rm -rf "$DB_DIR"' EXIT
+AGENT_PID=
+cleanup() {
+  if [ -n "$AGENT_PID" ]; then kill "$AGENT_PID" 2>/dev/null || true; fi
+  rm -rf "$DB_DIR"
+}
+trap cleanup EXIT
 export EVALKIT_DATABASE_URL="sqlite:///$DB_DIR/demo.db"
 
 step() { printf '\n== %s\n' "$*"; }
@@ -33,3 +38,20 @@ if [ "$code" -ne 1 ]; then
   exit 1
 fi
 step "The gate exited 1 for candidate B, which is what fails the CI job"
+
+step "An agent service: the reference agent passes evalkit agent conformance"
+uv run python examples/agent_server.py --port 0 --port-file "$DB_DIR/agent.port" 2>/dev/null &
+AGENT_PID=$!
+for _ in $(seq 1 100); do [ -s "$DB_DIR/agent.port" ] && break; sleep 0.1; done
+if [ ! -s "$DB_DIR/agent.port" ]; then
+  echo "the reference agent did not start" >&2
+  exit 1
+fi
+cat > "$DB_DIR/endpoints.toml" <<EOF
+[endpoints.booker]
+url = "http://127.0.0.1:$(cat "$DB_DIR/agent.port")/v1/step"
+allow_private = true
+timeout_seconds = 10
+EOF
+EVALKIT_HTTP_TARGETS_FILE="$DB_DIR/endpoints.toml" \
+  $EVALKIT agent conformance booker --sandbox examples/agents/booking.toml --strict
