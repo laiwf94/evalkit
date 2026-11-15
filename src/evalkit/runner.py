@@ -285,6 +285,8 @@ class _Context:
     # Set by a worker when the work queue falls to ``low_water``, to wake the feeder.
     drained: asyncio.Event = field(default_factory=asyncio.Event)
     low_water: int = 0
+    # Cases a worker took off the queue after a drain began, to give back.
+    unstarted: list[str] = field(default_factory=list)
     counts: dict[str, int] = field(
         default_factory=lambda: dict.fromkeys(
             ("executed", "cached", "errors", "batched", "refused"), 0
@@ -637,11 +639,16 @@ class Runner:
                 )
                 await asyncio.gather(
                     *(
-                        group.create_task(self._worker(ctx, work, results))
+                        group.create_task(
+                            self._worker(ctx, work, results, draining=control.draining)
+                        )
                         for _ in range(concurrency)
                     )
                 )
                 await feeder
+                if ctx.unstarted:
+                    # Taken off the queue after the drain began, and not started.
+                    await asyncio.to_thread(self._release_cases, run.id, ctx.unstarted)
                 await results.put(None)
                 await writer
                 heartbeat.cancel()
@@ -669,7 +676,12 @@ class Runner:
         )
 
     async def _worker(
-        self, ctx: _Context, work: _WorkQueue, results: asyncio.Queue[CaseResult | None]
+        self,
+        ctx: _Context,
+        work: _WorkQueue,
+        results: asyncio.Queue[CaseResult | None],
+        *,
+        draining: asyncio.Event,
     ) -> None:
         counts = ctx.counts
         while True:
@@ -679,6 +691,10 @@ class Runner:
             if item is None:
                 return
             case, fence = item
+            if draining.is_set():
+                # A drain starts nothing new, even a case already off the queue.
+                ctx.unstarted.append(case.id)
+                continue
             hit = ctx.hits.get(ctx.keys[case.id])
             if hit is not None:
                 result = await self._from_cache(case, hit, ctx.scorers)

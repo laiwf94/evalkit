@@ -115,7 +115,10 @@ class Worker:
 
     async def serve(self, stop: asyncio.Event) -> None:
         """Execute queued runs until ``stop`` is set, then drain."""
-        background = [asyncio.create_task(self._heartbeat(), name="worker-heartbeat")]
+        background = [
+            asyncio.create_task(self._heartbeat(), name="worker-heartbeat"),
+            asyncio.create_task(self._drain_when(stop), name="worker-drain"),
+        ]
         if self.maintain_cache:
             background.append(asyncio.create_task(self._maintain_cache(), name="worker-cache"))
         if self.listen is not None:
@@ -174,6 +177,15 @@ class Worker:
             await asyncio.to_thread(self._leave_now, run_id)
         except Exception:  # the slot expires on its own after one lease length
             log.warning("could not give the slot back", extra={"run_id": run_id}, exc_info=True)
+
+    async def _drain_when(self, stop: asyncio.Event) -> None:
+        """Ask every run to drain the moment ``stop`` is set. The serve loop may
+        be in the middle of a sweep or a claim, and cases that finish meanwhile
+        must not take on more work."""
+        await stop.wait()
+        self._stopping = True
+        for run_id in list(self._tasks):
+            self.runner.request_drain(run_id)
 
     async def _drain(self) -> None:
         self._stopping = True

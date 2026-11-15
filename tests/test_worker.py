@@ -2,6 +2,7 @@ import asyncio
 import os
 import signal
 import threading
+import time
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from datetime import timedelta
@@ -298,6 +299,34 @@ async def test_sigterm_drain_finishes_cases_in_flight_and_requeues(
         )
         assert held == 0
     # Another worker picks the run up and executes only the rest.
+    second_factory = CountingFactory()
+    second = make_worker(sessions, make_runner(sessions, second_factory))
+    async with running(second):
+        await until(lambda: status(sessions, run_id) == "completed")
+    assert second_factory.calls == 32
+    final = results(sessions, run_id)
+    assert len(final) == len(set(final)) == 40
+
+
+async def test_a_drain_after_a_stalled_event_loop_starts_nothing_new(
+    sessions: sessionmaker[Session], dataset: str
+) -> None:
+    # The loop stalls (a busy machine) while eight cases are in flight, past the
+    # point they finish. When it runs again the stop and the finished cases are
+    # handled in the same passes: no finished case may start another (#84).
+    run_id = queue(sessions, config(latency_ms=300, options={"concurrency": 8}))
+    factory = CountingFactory()
+    first = make_worker(sessions, make_runner(sessions, factory))
+    async with running(first):
+        await until(lambda: factory.calls >= 8)
+        time.sleep(0.4)  # noqa: ASYNC251 - the stall is the point: it blocks the loop
+    assert factory.calls == factory.finished == len(results(sessions, run_id)) == 8
+    assert status(sessions, run_id) == "queued"
+    with sessions() as s:
+        held = s.scalar(
+            select(func.count()).select_from(CaseLease).where(CaseLease.owner.is_not(None))
+        )
+        assert held == 0
     second_factory = CountingFactory()
     second = make_worker(sessions, make_runner(sessions, second_factory))
     async with running(second):

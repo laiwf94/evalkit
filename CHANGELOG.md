@@ -104,6 +104,9 @@ week 2 (#23).
   (#81).
 - Cancelling a run while a batch of results was being written no longer writes
   that batch a second time and reports its cases as refused (#81).
+- A worker draining on SIGTERM no longer starts new cases when its event loop
+  ran late. Before, cases that finished in the same passes as the stop could
+  each take the next case off the queue before the drain was requested (#84).
 
 ### Agents and conversations (#24)
 
