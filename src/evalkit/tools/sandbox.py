@@ -41,7 +41,15 @@ from typing import Any, Literal
 
 from jsonschema import Draft202012Validator
 from jsonschema.exceptions import SchemaError
-from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    SerializerFunctionWrapHandler,
+    ValidationError,
+    model_serializer,
+    model_validator,
+)
 from referencing.exceptions import Unresolvable
 
 from evalkit.datasets import canonical_json, sha256_hex
@@ -143,6 +151,16 @@ class ScriptedResponse(_Spec):
         if has_result and _json_size(self.result) > MAX_RESULT_BYTES:
             raise ValueError(f"result is larger than {MAX_RESULT_BYTES} bytes")
         return self
+
+    @model_serializer(mode="wrap")
+    def _dump(self, handler: SerializerFunctionWrapHandler) -> dict[str, Any]:
+        # An error response has no result. Leaving ``result: null`` in the dump
+        # would read back as a response with both, so a stored run (and a run
+        # config that inlines its sandbox file) could not be loaded again.
+        dumped: dict[str, Any] = handler(self)
+        if self.error is not None:
+            dumped.pop("result", None)
+        return dumped
 
 
 class ToolSpec(_Spec):

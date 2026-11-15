@@ -708,3 +708,29 @@ def test_cli_record_needs_the_endpoint_configured(
     assert "not configured in EVALKIT_HTTP_TARGETS_FILE" in capsys.readouterr().err
     code, _ = run_cli("tools", "check", str(tmp_path / "missing.toml"))
     assert code == cli.EXIT_INPUT
+
+
+def test_a_dumped_sandbox_reads_back_with_its_error_responses(tmp_path: Path) -> None:
+    # A run stores its target spec as JSON and validates it again to execute or
+    # resume, and `sandbox = FILE` goes through the same dump: an error response
+    # must not come back as one with a null result as well.
+    responses = [
+        {"when": {"flight": "XX0"}, "error": "no such flight"},
+        {"when": {"flight": "NULL"}, "result": None},
+        {"result": {"ref": "R1"}},
+    ]
+    script = spec({**BOOK, "responses": responses})
+    dumped = script.model_dump(mode="json")
+    stored = dumped["tools"][0]["responses"]
+    assert "result" not in stored[0]
+    assert stored[1]["result"] is None
+    assert stored[1]["error"] is None
+    again = SandboxSpec.model_validate(json.loads(json.dumps(dumped)))
+    assert again == script
+    assert sandbox_identity(again, None) == sandbox_identity(script, None)
+    without_fixtures = SANDBOX_TOML.replace('fixtures = "fixtures/booking.jsonl"\n', "")
+    (tmp_path / "sandbox.toml").write_text(without_fixtures)
+    target: dict[str, Any] = {"sandbox": "sandbox.toml"}
+    cli.inline_sandbox(target, tmp_path)
+    loaded = SandboxSpec.model_validate(target["sandbox"])
+    assert loaded.tools[0].responses[0].error == "no such flight"
