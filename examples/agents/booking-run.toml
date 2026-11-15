@@ -1,0 +1,41 @@
+# 50 booking conversations: a scripted simulated user (examples/agents/booking.jsonl)
+# talks to the reference agent (examples/agent_server.py) behind the "booker"
+# endpoint, whose tools the sandbox in booking.toml answers. The endpoint's URL
+# is operator config (EVALKIT_HTTP_TARGETS_FILE), never part of the run.
+label = "booker"
+
+[dataset]
+name = "booking"
+path = "booking.jsonl"
+
+[target]
+type = "http_agent"
+endpoint = "booker"
+sandbox = "booking.toml"
+max_steps = 12
+
+[target.simulator]
+type = "scripted"
+
+# The calls each case expects, in order, with the arguments that matter.
+[[scorers]]
+type = "tool_calls"
+name = "tool_calls"
+order = "ordered"
+arguments = "subset"
+
+# No more tool calls than the reference makes.
+[[scorers]]
+type = "step_efficiency"
+name = "efficiency"
+gate = false
+
+# The dialogue ended with a confirmation code.
+[[scorers]]
+type = "regex"
+name = "confirmed"
+pattern = "confirmation BK-\\d{4}"
+gate = false
+
+[options]
+concurrency = 8

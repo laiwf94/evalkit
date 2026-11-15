@@ -7,8 +7,10 @@ cd "$(dirname "$0")/.."
 EVALKIT=${EVALKIT:-"uv run evalkit"}
 DB_DIR=$(mktemp -d)
 AGENT_PID=
+BLIND_PID=
 cleanup() {
   if [ -n "$AGENT_PID" ]; then kill "$AGENT_PID" 2>/dev/null || true; fi
+  if [ -n "$BLIND_PID" ]; then kill "$BLIND_PID" 2>/dev/null || true; fi
   rm -rf "$DB_DIR"
 }
 trap cleanup EXIT
@@ -55,3 +57,30 @@ timeout_seconds = 10
 EOF
 EVALKIT_HTTP_TARGETS_FILE="$DB_DIR/endpoints.toml" \
   $EVALKIT agent conformance booker --sandbox examples/agents/booking.toml --strict
+
+step "50 booking conversations with a simulated user, then an agent that books without looking"
+uv run python examples/agent_server.py --skip-lookup --port 0 --port-file "$DB_DIR/blind.port" 2>/dev/null &
+BLIND_PID=$!
+for _ in $(seq 1 100); do [ -s "$DB_DIR/blind.port" ] && break; sleep 0.1; done
+if [ ! -s "$DB_DIR/blind.port" ]; then
+  echo "the reference agent with --skip-lookup did not start" >&2
+  exit 1
+fi
+cat >> "$DB_DIR/endpoints.toml" <<EOF
+[endpoints.booker-blind]
+url = "http://127.0.0.1:$(cat "$DB_DIR/blind.port")/v1/step"
+allow_private = true
+timeout_seconds = 10
+EOF
+export EVALKIT_HTTP_TARGETS_FILE="$DB_DIR/endpoints.toml"
+$EVALKIT run examples/agents/booking-run.toml | grep -E "^cases|^tool_calls|^confirmed"
+$EVALKIT run examples/agents/booking-blind.toml | grep -E "^cases|^tool_calls|^confirmed"
+set +e
+$EVALKIT gate label:booker label:booker-blind
+code=$?
+set -e
+if [ "$code" -ne 1 ]; then
+  echo "expected the gate to fail the blind agent with exit code 1, got $code" >&2
+  exit 1
+fi
+step "The gate exited 1: the blind agent confirms as many bookings, but skips find_slots"

@@ -400,6 +400,54 @@ cached, its identity is recorded with the run and checked by the gate, and
 `evalkit calibrate` measures it against people's labels when each labelled line
 carries the `trajectory` the trajectory endpoint served (its `steps`).
 
+### A booking agent end to end
+
+[examples/agents](examples/agents) puts these together. It has 50 booking
+conversations ([booking.jsonl](examples/agents/booking.jsonl)), each with a
+persona, a scripted user, the phrase that means the goal is reached and the
+tool calls a good agent makes. They are run on the reference agent with a
+simulated user ([booking-run.toml](examples/agents/booking-run.toml)), and then
+on the same agent started with `--skip-lookup`, which books without checking
+`find_slots` first ([booking-blind.toml](examples/agents/booking-blind.toml)).
+The dialogues end in all three ways: 42 reach the goal, 4 give up (Christmas
+Eve is full) and 4 hit `max_turns` (a user who never names a day).
+
+```console
+$ python examples/agent_server.py --port 8765 &
+$ python examples/agent_server.py --port 8766 --skip-lookup &
+$ export EVALKIT_HTTP_TARGETS_FILE=endpoints.toml   # booker on 8765, booker-blind on 8766
+$ evalkit run examples/agents/booking-run.toml
+cases 50/50  ok 50  errors 0  cached 0
+
+metric                   mean              95% CI      n  unscorable
+tool_calls             100.0%    [100.0%, 100.0%]     50           0
+efficiency             100.0%    [100.0%, 100.0%]     50           0  (not gated)
+confirmed               84.0%      [74.0%, 94.0%]     50           0  (not gated)
+$ evalkit run examples/agents/booking-blind.toml
+tool_calls              46.0%      [39.0%, 53.0%]     50           0
+confirmed               84.0%      [74.0%, 94.0%]     50           0  (not gated)
+$ evalkit gate label:booker label:booker-blind
+metric              base    cand     diff                95% CI   p (adj)    d_z  verdict
+tool_calls        100.0%   46.0%   -54.0%        [-61.0, -47.0]    0.0001  -2.21  worse
+
+FAIL: tool_calls
+```
+
+Scored on its answers alone, the blind agent looks as good: it confirms 42
+bookings too. They are the wrong 42. It books a table on the full night, and it
+fails on New Year's Eve because it asks for a time that has gone, twice. Only
+the trajectory shows the missing lookup, and the gate fails on it.
+
+`tests/test_booking_end_to_end.py` runs these steps on the reference agent over
+local sockets, and it also kills the run. The run is started as the installed
+command in a child process and SIGKILLed once 15 cases are saved and a dialogue
+is part way through a turn. `evalkit run --resume` then finishes it with every
+case's outcome, steps and turns equal to an uninterrupted run. The agent
+answers each step once over the two processes. A request cut off by the kill is
+sent again with the same `request_id`, and the agent replays its stored answer.
+A rerun is answered entirely from the cache. `examples/demo.sh` ends with the
+gate above.
+
 ## Reading the verdict
 
 Each run reports means with bootstrap confidence intervals (normal intervals
@@ -635,6 +683,7 @@ tests compare the bodies they received with the exact bodies expected.
 | Aggregates | Summaries and comparisons from aggregates and score arrays equal those computed from the results; a Hypothesis test folds random result batches into random shards and checks the totals equal one recomputation; latency percentiles from the histogram stay within 0.99% of the exact ones (Hypothesis); `run verify` finds tampered counts, sums, arrays, histograms and percentiles and `--repair` fixes them; on PostgreSQL the four-worker run with one SIGKILLed worker verifies clean. |
 | Cache and blobs | A Hypothesis test sweeps random caches by age and size and checks the dry run reports exactly what the real sweep removes, that what is left fits the limit and is always the most recently used. An entry used between the sweep's read and its delete survives. Both blob backends round-trip random bytes; tampered blobs are refused; garbage collection never removes a referenced or recent blob (Hypothesis) and spares one written again mid-scan. Requests are signed in our own code and checked by an in-memory S3 server that recomputes every signature, and on a real S3-compatible server (versitygw in Testcontainers) together with a sweep and collection on PostgreSQL. |
 | Three providers end to end | `tests/test_providers_end_to_end.py` serves strict fake Claude, OpenAI, Gemini and grader APIs on local sockets and drives the CLI (the matrix run as a child process) through `examples/providers` unchanged: each provider gets exactly its 120 requests with the registry prompt, token counts and costs match each provider's price list, the judge is called once per distinct answer and only on the grader, the frontier and both paired steps match the known accuracies, and a promoted prompt version runs, leaves the matrix runs on version 1 and passes the gate as better. |
+| A booking agent end to end | `tests/test_booking_end_to_end.py` serves the reference agent and its `--skip-lookup` twin on local sockets and drives the CLI through `examples/agents` unchanged. 50 dialogues with a scripted user end on goal reached, give-up or the turn limit. A run SIGKILLed mid-dialogue in a child process resumes with every outcome, step and turn equal to an uninterrupted run, the agent answers each step once over both processes, and at least one dialogue is finished from where the kill left it. The blind agent confirms as many bookings and fails the gate on `tool_calls` (-54%). |
 | API and CLI | Every endpoint, error code and exit code, over ASGI and over the wire. |
 
 ```console

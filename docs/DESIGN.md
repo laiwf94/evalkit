@@ -790,6 +790,26 @@ Simulated user turns go through the same function as in a `conversation`
 target (`simulated_turn`). Both cache and redact a user turn the same way, so
 the two targets cannot drift apart.
 
+**What the end-to-end test shows.** `tests/test_booking_end_to_end.py` checks
+the properties above together, on the reference agent over real sockets. The
+run is killed with SIGKILL, not cancelled, because a cancelled run gets to mark
+itself interrupted and release its leases, and a crash does not. The test
+waits until a dialogue is known to be part way through a turn before the kill.
+The agent's last answer in that session asked for a tool after an earlier
+answer, so at least one reply is stored and one more is needed. That makes
+"resumes mid-dialogue" a fact the test checks, not a likely outcome of the
+timing. The resumed run is compared with an uninterrupted run of the same
+config on a fresh database, case by case: outcome, scores, every step and
+every turn. A cached reply costs this run nothing (see Budgets), so a case
+resumed part way is charged only for the replies asked after the resume. #83
+tracks counting what the run paid before the crash.
+
+The gate compares the reference agent with its `--skip-lookup` twin on
+`tool_calls`, not on whether a booking was confirmed. On this dataset both
+agents confirm 42 bookings, so an answer-only metric shows no change. The blind
+agent's 42 are a different set: it books the full night and fails the late one.
+That is the failure trajectory scoring exists to catch.
+
 ## Calling Claude
 
 All Claude calls go through one provider (`providers/anthropic.py`):

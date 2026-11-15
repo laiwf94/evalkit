@@ -5,6 +5,7 @@ from pathlib import Path
 
 import pytest
 
+from evalkit import cli
 from evalkit.datasets import parse_jsonl
 from evalkit.runspec import RunConfig
 from evalkit.scorers.calibration import parse_labels
@@ -15,6 +16,7 @@ CONFIGS = (
     sorted(EXAMPLES.glob("*.toml"))
     + sorted((EXAMPLES / "live").glob("*.toml"))
     + [EXAMPLES / "providers" / name for name in ("matrix.toml", "promoted.toml")]
+    + [EXAMPLES / "agents" / name for name in ("booking-run.toml", "booking-blind.toml")]
 )
 
 
@@ -25,6 +27,8 @@ def test_run_configs_parse(path: Path) -> None:
     raw = tomllib.loads(path.read_text())
     data_file = path.parent / raw["dataset"].pop("path")
     assert parse_jsonl(data_file.read_bytes())
+    if isinstance(raw["target"].get("sandbox"), str):
+        cli.inline_sandbox(raw["target"], path.parent)  # as evalkit run reads it
     RunConfig.model_validate(raw)
 
 

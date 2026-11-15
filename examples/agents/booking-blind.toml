@@ -1,0 +1,40 @@
+# The run of examples/agents/booking-run.toml on the "booker-blind" endpoint:
+# the reference agent started with --skip-lookup, which books without asking
+# find_slots first. The gate against the "booker" run fails on tool_calls.
+label = "booker-blind"
+
+[dataset]
+name = "booking"
+path = "booking.jsonl"
+
+[target]
+type = "http_agent"
+endpoint = "booker-blind"
+sandbox = "booking.toml"
+max_steps = 12
+
+[target.simulator]
+type = "scripted"
+
+# The calls each case expects, in order, with the arguments that matter.
+[[scorers]]
+type = "tool_calls"
+name = "tool_calls"
+order = "ordered"
+arguments = "subset"
+
+# No more tool calls than the reference makes.
+[[scorers]]
+type = "step_efficiency"
+name = "efficiency"
+gate = false
+
+# The dialogue ended with a confirmation code.
+[[scorers]]
+type = "regex"
+name = "confirmed"
+pattern = "confirmation BK-\\d{4}"
+gate = false
+
+[options]
+concurrency = 8

@@ -7,8 +7,8 @@ and the API.
 ## 0.1.0 (unreleased)
 
 The first version: an evaluation and regression-testing harness, the
-scale-out work of week 1 of the roadmap (#22), and providers and prompts from
-week 2 (#23).
+scale-out work of week 1 of the roadmap (#22), providers and prompts from
+week 2 (#23), and agents and conversations from week 3 (#24).
 
 ### Evaluating and gating
 
@@ -107,6 +107,9 @@ week 2 (#23).
 - A worker draining on SIGTERM no longer starts new cases when its event loop
   ran late. Before, cases that finished in the same passes as the stop could
   each take the next case off the queue before the drain was requested (#84).
+- A sandbox with an error response can be stored and read back. Before, it was
+  refused by `evalkit run` with `sandbox = FILE`, and a run submitted with one
+  could not execute (#82).
 
 ### Agents and conversations (#24)
 
@@ -155,3 +158,19 @@ week 2 (#23).
   - responses are validated strictly;
   - the session has budgets for agent replies (`max_steps`) and reported tokens
     (`max_tokens`).
+
+- **Agent conformance and a reference agent.** `evalkit agent conformance
+  ENDPOINT --sandbox FILE` checks that an agent speaks the protocol before a
+  run: protocol version, schemas, idempotent retries (also concurrent ones),
+  ordering of resumed and interleaved sessions, recovery from tool errors and
+  timeouts. It exits 1 on a failing check, or on a warning with `--strict`.
+  `examples/agent_server.py` is a table-booking agent with no dependencies that
+  passes every check.
+
+- **Tests.** An end-to-end test of `examples/agents`: 50 booking conversations
+  between a scripted simulated user and the reference agent over local sockets,
+  ending on goal reached, give-up and the turn limit. The run is killed with
+  SIGKILL mid-dialogue and resumed, and it matches an uninterrupted run case by
+  case, with every agent step answered once. The gate then fails an agent that
+  books without looking up free tables on `tool_calls` (-54%), although it
+  confirms as many bookings. `examples/demo.sh` ends with that gate.
