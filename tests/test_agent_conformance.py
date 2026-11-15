@@ -7,6 +7,7 @@ import importlib.util
 import io
 import itertools
 import json
+import socket
 import threading
 from collections.abc import Callable, Iterator
 from pathlib import Path
@@ -181,6 +182,31 @@ def test_the_reference_server_refuses_what_is_not_a_protocol_request(
         assert big.status_code == 413
         ok = client.post("/v1/step", json=request([user("on 2026-11-20")]))
         assert ok.json()["message"]["tool_calls"][0]["name"] == "find_slots"
+
+
+@pytest.mark.parametrize(
+    "headers",
+    [f"Content-Length: {1024 * 1024 + 1}\r\n", ""],
+    ids=["too large", "no length"],
+)
+def test_a_refused_body_is_never_read_as_the_next_request(
+    agent_url: tuple[str, Any], headers: str
+) -> None:
+    # A body the server refuses unread may hold anything, here a request of its
+    # own: the server must close the connection, not answer that request (#85).
+    url, _ = agent_url
+    host, port = url.removeprefix("http://").split(":")
+    smuggled = b"GET /healthz HTTP/1.1\r\nHost: agent\r\n\r\n"
+    head = f"POST /v1/step HTTP/1.1\r\nHost: agent\r\n{headers}\r\n".encode()
+    with socket.create_connection((host, int(port)), timeout=5) as conn:
+        conn.sendall(head + smuggled)
+        received = b""
+        while chunk := conn.recv(65536):
+            received += chunk
+    assert received.count(b"HTTP/1.1 ") == 1
+    assert received.startswith((b"HTTP/1.1 413", b"HTTP/1.1 411"))
+    assert b"Connection: close" in received
+    assert b"ok" not in received.split(b"\r\n\r\n", 1)[1]
 
 
 def test_the_cli_checks_an_endpoint_and_exits_1_on_a_failing_check(

@@ -110,6 +110,9 @@ week 2 (#23), and agents and conversations from week 3 (#24).
 - A sandbox with an error response can be stored and read back. Before, it was
   refused by `evalkit run` with `sandbox = FILE`, and a run submitted with one
   could not execute (#82).
+- The reference agent closes the connection when it refuses a request without
+  reading its body (too large, or without a length), instead of reading that
+  body as the next request (#85).
 
 ### Agents and conversations (#24)
 

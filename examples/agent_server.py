@@ -251,19 +251,29 @@ def make_server(host: str, port: int, agent: Agent) -> ThreadingHTTPServer:
         def do_POST(self) -> None:
             length = self.headers.get("Content-Length", "")
             if not length.isdigit():
-                self._send(HTTPStatus.LENGTH_REQUIRED, _error("send a Content-Length"))
+                self._refuse(HTTPStatus.LENGTH_REQUIRED, _error("send a Content-Length"))
                 return
             if int(length) > MAX_BODY:
-                self._send(HTTPStatus.REQUEST_ENTITY_TOO_LARGE, _error("the body is too large"))
+                self._refuse(HTTPStatus.REQUEST_ENTITY_TOO_LARGE, _error("the body is too large"))
                 return
             raw = self.rfile.read(int(length))
             status, payload = agent.handle(raw, self.headers.get("Idempotency-Key"))
             self._send(status, payload)
 
-        def _send(self, status: int, payload: bytes, kind: str = "application/json") -> None:
+        def _refuse(self, status: int, payload: bytes) -> None:
+            # The body is not read, so where the next request would start is
+            # unknown: close the connection rather than parse the body as one.
+            self.close_connection = True
+            self._send(status, payload, close=True)
+
+        def _send(
+            self, status: int, payload: bytes, kind: str = "application/json", close: bool = False
+        ) -> None:
             self.send_response(status)
             self.send_header("Content-Type", kind)
             self.send_header("Content-Length", str(len(payload)))
+            if close:
+                self.send_header("Connection", "close")
             self.end_headers()
             self.wfile.write(payload)
 
