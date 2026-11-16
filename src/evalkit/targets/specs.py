@@ -69,6 +69,25 @@ class HttpTargetSpec(_Spec):
     response_field: str = Field(default="output", pattern=r"^[A-Za-z0-9_]+(\.[A-Za-z0-9_]+)*$")
 
 
+class RetrievalTargetSpec(_Spec):
+    """A retriever behind an endpoint named in operator config.
+
+    Each case's input is a query (a string, or ``{"query": ..., "filters": {...}}``);
+    the request is ``{"query", "k", "filters"}`` and the ranked documents are read
+    from ``results_field`` of the answer: a list of ids, or of objects with the
+    id in ``id_field`` and optionally a score and a text. The output is the top
+    ``k`` as JSON (``evalkit.targets.retrieval``), which the ranking scorers grade
+    against the case's graded relevance labels."""
+
+    type: Literal["retrieval"]
+    endpoint: str = Field(pattern=r"^[a-z0-9][a-z0-9_-]{0,63}$")
+    k: int = Field(default=10, ge=1, le=1000)
+    results_field: str = Field(default="results", pattern=r"^[A-Za-z0-9_]+(\.[A-Za-z0-9_]+)*$")
+    id_field: str = Field(default="id", pattern=r"^[A-Za-z0-9_]{1,64}$")
+    score_field: str = Field(default="score", pattern=r"^[A-Za-z0-9_]{1,64}$")
+    text_field: str = Field(default="text", pattern=r"^[A-Za-z0-9_]{1,64}$")
+
+
 class FakeTargetSpec(_Spec):
     """Deterministic stand-in for demos, tests and benchmarks; makes no network calls."""
 
@@ -237,6 +256,7 @@ class HttpAgentTargetSpec(_SandboxedSpec):
 AnyTargetSpec = (
     PromptTargetSpec
     | HttpTargetSpec
+    | RetrievalTargetSpec
     | FakeTargetSpec
     | ConversationTargetSpec
     | AgentTargetSpec

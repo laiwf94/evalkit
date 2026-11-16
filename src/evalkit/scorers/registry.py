@@ -15,7 +15,7 @@ from typing import Annotated, Any, Literal
 
 import regex
 from jsonschema.exceptions import SchemaError
-from pydantic import BaseModel, ConfigDict, Field, JsonValue
+from pydantic import BaseModel, ConfigDict, Field, JsonValue, model_validator
 
 from evalkit.errors import InvalidInputError
 from evalkit.pricing import PriceBook
@@ -24,6 +24,9 @@ from evalkit.providers.registry import ANTHROPIC, PROVIDER_NAME, ProviderRegistr
 from evalkit.scorers.base import Scorer
 from evalkit.scorers.builtin import ExactMatch, JsonSchemaMatch, NumericMatch, RegexMatch, TokenF1
 from evalkit.scorers.judge import LLMJudge
+from evalkit.scorers.ranking import METRICS as RANKING_METRICS
+from evalkit.scorers.ranking import Metric as RankingMetricName
+from evalkit.scorers.ranking import RankingMetric, default_name
 from evalkit.scorers.trajectory import (
     MAX_EXPECTED_CALLS,
     ForbiddenTools,
@@ -31,6 +34,7 @@ from evalkit.scorers.trajectory import (
     ToolCallMatch,
     TrajectoryJudge,
 )
+from evalkit.targets.retrieval import MAX_GRADE
 
 ENTRY_POINT_GROUP = "evalkit.scorers"
 Name = Annotated[str, Field(pattern=r"^[a-z][a-z0-9_]{0,47}$")]
@@ -126,6 +130,33 @@ class TrajectoryJudgeSpec(_Spec):
     max_tokens: int = Field(default=4096, ge=256, le=16_000)
 
 
+class RankingSpec(_Spec):
+    """A ranking metric over a retrieval target's output (``evalkit.scorers.ranking``).
+    Its name defaults to ``recall_at_10``, ``ndcg_at_5``, ``mrr`` and so on."""
+
+    type: Literal["ranking"]
+    metric: RankingMetricName
+    # The cut-off: 10 by default, except for MRR, which reads the whole ranking.
+    k: int | None = Field(default=None, ge=1, le=1000)
+    expected_key: str | None = "relevance"
+    min_grade: int = Field(default=1, ge=1, le=MAX_GRADE)
+    gain: Literal["linear", "exponential"] = "linear"
+
+    @model_validator(mode="before")
+    @classmethod
+    def _named(cls, data: Any) -> Any:
+        """Fill in the cut-off and the name, so the run stores the metric under the
+        name it is reported and gated by."""
+        if not isinstance(data, dict) or data.get("metric") not in RANKING_METRICS:
+            return data
+        data = dict(data)
+        if data.get("k") is None and data["metric"] != "mrr":
+            data["k"] = 10
+        if data.get("name") is None and isinstance(data.get("k"), int | None):
+            data["name"] = default_name(data["metric"], data.get("k"))
+        return data
+
+
 class PluginSpec(_Spec):
     type: Literal["plugin"]
     entry: str = Field(min_length=1, max_length=200)
@@ -143,6 +174,7 @@ ScorerSpec = Annotated[
     | StepEfficiencySpec
     | ForbiddenToolsSpec
     | TrajectoryJudgeSpec
+    | RankingSpec
     | PluginSpec,
     Field(discriminator="type"),
 ]
@@ -224,6 +256,15 @@ def _build(spec: ScorerSpec, *, allow_import_paths: bool, providers: ProviderReg
                 )
             case ForbiddenToolsSpec():
                 return ForbiddenTools(name, tools=spec.tools, expected_key=spec.expected_key)
+            case RankingSpec():
+                return RankingMetric(
+                    name,
+                    metric=spec.metric,
+                    k=spec.k,
+                    expected_key=spec.expected_key,
+                    min_grade=spec.min_grade,
+                    gain=spec.gain,
+                )
             case PluginSpec():
                 return _load_plugin(spec, name, allow_import_paths=allow_import_paths)
     except SchemaError as exc:

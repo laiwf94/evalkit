@@ -177,3 +177,17 @@ week 2 (#23), and agents and conversations from week 3 (#24).
   case, with every agent step answered once. The gate then fails an agent that
   books without looking up free tables on `tool_calls` (-54%), although it
   confirms as many bookings. `examples/demo.sh` ends with that gate.
+
+### RAG evaluation (#25, in progress)
+
+- **Retrieval targets and ranking metrics.** A `retrieval` target posts each
+  case's query (a string, or a query with filters) to a retriever named in
+  operator config, on the SSRF-safe client, and keeps the top `k` documents it
+  returns: ids, scores and texts, read from configurable fields, each id at its
+  first rank. Retrieval cases label documents with grades from 0 to 10 in
+  `expected.relevance`. The `ranking` scorer computes `recall@k`,
+  `precision@k`, `hit_rate@k`, `mrr`, `map@k` and `ndcg@k` (linear or
+  exponential gain) against those labels, and a case with no relevant label is
+  unscorable rather than zero. Rankings are kept in a retrieval cache keyed by
+  the retriever and the request, with texts redacted, and identical queries in
+  flight at the same time make one request.

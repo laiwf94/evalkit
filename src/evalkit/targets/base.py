@@ -83,6 +83,9 @@ class Generation:
     turns: tuple[Turn, ...] = ()
     # The trajectory, for an agent target: model replies and the tool calls they made.
     steps: tuple[Step, ...] = ()
+    # Whether this run paid nothing for the output: a target that caches its own
+    # calls (a retriever) says so here; turns and steps say it for themselves.
+    cached: bool = False
 
 
 class TargetError(Exception):

@@ -95,12 +95,14 @@ from evalkit.targets.conversation import ConversationTarget
 from evalkit.targets.factory import build_target, identity
 from evalkit.targets.http_agent import HttpAgentTarget
 from evalkit.targets.prompt import PromptTarget
+from evalkit.targets.retrieval import RetrievalTarget, query_of
 from evalkit.targets.specs import (
     AgentTargetSpec,
     ConversationTargetSpec,
     HttpAgentTargetSpec,
     LLMSimulatorSpec,
     PromptTargetSpec,
+    RetrievalTargetSpec,
 )
 
 log = logging.getLogger(__name__)
@@ -493,6 +495,9 @@ class Runner:
             # Say which case is malformed now, not as an error on every bad case.
             for case in cases:
                 conversation_of(case)
+        if isinstance(config.target, RetrievalTargetSpec):
+            for case in cases:
+                query_of(case)
         return cases
 
     @staticmethod
@@ -844,6 +849,15 @@ class Runner:
                 ),
                 max_retry_after=options.retry.max_retry_after,
             )
+        if isinstance(target, RetrievalTarget):
+            # Only requests the retrieval cache cannot answer wait on the endpoint's limiter.
+            limit = RateLimit()
+            target.attach(
+                store=cache.TurnStore(self.sessions) if options.use_cache else None,
+                redactor=self.redactor,
+                limiter=self._limiter(target.provider, options.rate_limit),
+                max_retry_after=options.retry.max_retry_after,
+            )
         fingerprint = self.settings.redaction.fingerprint()
         keys = {
             c.id: cache.cache_key(run.target_hash, c.input, fingerprint) for c in pending.values()
@@ -1027,6 +1041,8 @@ class Runner:
             result.cached = all(t.cached for t in generation.turns)
         elif generation.steps:
             result.cached = all(s.cached for s in generation.steps if s.kind == "model")
+        else:
+            result.cached = generation.cached
         if redacted.failed:
             # Keep the placeholder out of the cache so a rerun gets a fresh output.
             log.warning("redaction timed out; output replaced", extra={"case_id": case.id})

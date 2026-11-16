@@ -448,6 +448,35 @@ sent again with the same `request_id`, and the agent replays its stored answer.
 A rerun is answered entirely from the cache. `examples/demo.sh` ends with the
 gate above.
 
+## Retrieval
+
+A `retrieval` target evaluates a retriever on its own. Each case asks a query
+and grades the documents that answer it, from 0 (judged, not relevant) up:
+
+```json
+{"id": "q1", "input": "how do I reset my password", "expected": {"relevance": {"kb-12": 3, "kb-40": 1, "kb-7": 0}}}
+```
+
+```toml
+[target]
+type = "retrieval"
+endpoint = "search"     # named in EVALKIT_HTTP_TARGETS_FILE, like an HTTP target
+k = 5                   # request {"query", "k", "filters"}; read "results": [{"id", "score", "text"}]
+
+[[scorers]]
+type = "ranking"
+metric = "ndcg"         # recall, precision, hit_rate, mrr, map or ndcg
+k = 5                   # reported and gated as ndcg_at_5
+```
+
+`ndcg` uses the grade as the gain (`gain = "exponential"` for 2^grade - 1),
+the others count a document as relevant from `min_grade` (1). Rankings are
+cached by retriever and query, so rerunning with other scorers sends no
+request, and a gate between two retrievers works like any other: in
+`tests/test_retrieval.py` a retriever that loses the best document for two
+queries in three fails on `recall_at_5` and `ndcg_at_5`, while `mrr` holds
+because another relevant document still comes first.
+
 ## Reading the verdict
 
 Each run reports means with bootstrap confidence intervals (normal intervals
@@ -720,13 +749,13 @@ and what would change at larger scale is in [docs/DESIGN.md](docs/DESIGN.md).
 
 ```text
 src/evalkit/datasets.py    JSONL parsing, content hashing, versioned storage
-src/evalkit/targets/       prompt, HTTP (SSRF-safe), conversation, agent, HTTP agent (session
-                           protocol, docs/agent-protocol.md) and fake targets; templates
+src/evalkit/targets/       prompt, HTTP (SSRF-safe), retrieval, conversation, agent, HTTP agent
+                           (session protocol, docs/agent-protocol.md) and fake targets; templates
 src/evalkit/simuser.py     simulated users: scripted, or played by a model in JSON
 src/evalkit/conformance.py `evalkit agent conformance`: session protocol checks for agents
 src/evalkit/tools/         the tool sandbox: schemas, scripted and recorded answers, limits,
                            latency and failure injection; recording fixtures; the tool loop
-src/evalkit/scorers/       built-in and trajectory scorers, plugin registry, LLM judges, calibration
+src/evalkit/scorers/       built-in, ranking and trajectory scorers, plugin registry, LLM judges, calibration
 src/evalkit/providers/     the Provider protocol and error kinds; the Claude client (caching,
                            structured output, fallback, cost); raw HTTP OpenAI-compatible
                            and Gemini clients (JSON schema output, usage, safety blocks);

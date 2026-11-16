@@ -8,6 +8,7 @@ from evalkit.targets.specs import (
     HttpAgentTargetSpec,
     HttpTargetSpec,
     PromptTargetSpec,
+    RetrievalTargetSpec,
     TargetSpec,
     target_hash,
 )
@@ -20,6 +21,7 @@ __all__ = [
     "HttpAgentTargetSpec",
     "HttpTargetSpec",
     "PromptTargetSpec",
+    "RetrievalTargetSpec",
     "Step",
     "Target",
     "TargetError",

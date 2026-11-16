@@ -867,6 +867,7 @@ example, the case has no expected value), which is different from 0.
 | `step_efficiency` | min(1, budget / used), counting tool calls or model replies. |
 | `forbidden_tools` | 0 if any tool call matches a forbidden pattern, else 1. |
 | `trajectory_judge` | Rubric 1-5 over the whole trajectory, mapped to (s-1)/4. |
+| `ranking` | `recall@k`, `precision@k`, `hit_rate@k`, `mrr`, `map@k` or `ndcg@k` of a retrieval target's ranking against graded labels. |
 | `plugin` | Any `Scorer` subclass from an `evalkit.scorers` entry point. |
 
 A failed call scores 0 and an unscorable case is left out. If the target
@@ -911,6 +912,37 @@ therefore never receives personal data, and a cached rerun (which only has
 the redacted text) scores exactly like the original. The cost is that an
 expected answer which itself contains, say, an email address will not match;
 disable that pattern for such datasets.
+
+### Ranking metrics
+
+A retrieval target (`evalkit.targets.retrieval`) writes its output as canonical
+JSON, `{"documents": [{"id", "score", "text"}]}`, best first, each id at its
+first rank and cut to `k`: a retriever that repeats a document cannot count it
+twice. The ranking scorers parse that and the case's labels,
+`expected.relevance` as `{id: grade}` with integer grades 0 to 10 (a list of
+ids is grade 1 each). Unlabelled documents are not relevant, which is the usual
+pooled-judgement assumption. Definitions follow trec_eval: precision@k divides
+by k even when fewer documents came back, so returning less is not rewarded;
+MAP@k divides by min(|R|, k), so a perfect top k scores 1 when there are more
+relevant documents than k; nDCG uses log2(i + 1) discounts with linear gain by
+default, and the ideal ranking is built from every labelled grade, not only
+from the returned documents, so a retriever cannot score well by returning
+little. A case
+with no document at `min_grade` or above is unscorable for every metric: its
+recall is 0/0, and calling it 0 or 1 would move the mean for no reason.
+
+The ranking scorer's config fills in its cut-off and its name (`ndcg_at_5`)
+when it is validated, so the stored run, the report and the gate all use the
+name the metric is computed under.
+
+Rankings have their own cache entries in the response cache table, keyed by a
+hash of the retriever (endpoint fingerprint, `k` and the fields read) and the
+request, so anything that wraps the same retriever reuses them. Texts are
+redacted before they are stored; a text whose redaction times out is replaced
+by the placeholder and the ranking is not cached. Identical queries in flight
+at once share one request: the first caller sends it and the others await it.
+A waiter whose own case is cancelled leaves the request running; if the
+sender's case is cancelled, the waiters send their own.
 
 ## The judge
 

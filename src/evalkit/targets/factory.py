@@ -14,6 +14,7 @@ from evalkit.targets.fake import FakeTarget
 from evalkit.targets.http import HttpEndpoint, HttpTarget
 from evalkit.targets.http_agent import HttpAgentTarget
 from evalkit.targets.prompt import PromptTarget
+from evalkit.targets.retrieval import RetrievalTarget
 from evalkit.targets.specs import (
     ANTHROPIC,
     AgentTargetSpec,
@@ -24,6 +25,7 @@ from evalkit.targets.specs import (
     HttpTargetSpec,
     LLMSimulatorSpec,
     PromptTargetSpec,
+    RetrievalTargetSpec,
     SimulatorSpec,
     target_hash,
 )
@@ -35,7 +37,8 @@ AnySpec = AnyTargetSpec
 
 
 def resolve_endpoint(
-    spec: HttpTargetSpec | HttpAgentTargetSpec, endpoints: Mapping[str, HttpEndpoint]
+    spec: HttpTargetSpec | HttpAgentTargetSpec | RetrievalTargetSpec,
+    endpoints: Mapping[str, HttpEndpoint],
 ) -> HttpEndpoint:
     endpoint = endpoints.get(spec.endpoint)
     if endpoint is None:
@@ -53,7 +56,7 @@ def identity(
     for a prompt or agent target on a provider other than Claude, where that
     provider is. An HTTP agent's includes its endpoint and where its simulated
     user is."""
-    if isinstance(spec, HttpTargetSpec):
+    if isinstance(spec, HttpTargetSpec | RetrievalTargetSpec):
         return target_hash(spec, resolve_endpoint(spec, endpoints).fingerprint())
     if isinstance(spec, HttpAgentTargetSpec):
         return target_hash(
@@ -116,6 +119,8 @@ def build_target(
             return PromptTarget(spec, providers.get(spec.provider))
         case HttpTargetSpec():
             return HttpTarget(spec, resolve_endpoint(spec, endpoints))
+        case RetrievalTargetSpec():
+            return RetrievalTarget(spec, resolve_endpoint(spec, endpoints))
         case FakeTargetSpec():
             return FakeTarget(spec)
         case AgentTargetSpec():
