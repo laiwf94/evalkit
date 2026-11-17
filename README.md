@@ -477,6 +477,35 @@ request, and a gate between two retrievers works like any other: in
 queries in three fails on `recall_at_5` and `ndcg_at_5`, while `mrr` holds
 because another relevant document still comes first.
 
+### Grounded answers
+
+Generation cases carry the sources the answer was written from under
+`contexts` (texts, `{"id", "text"}` objects or a retrieval ranking), in the
+input or the expected value:
+
+```json
+{"id": "a1", "input": {"question": "When was the tower built?", "contexts": [{"id": "kb-2", "text": "The Eiffel Tower was completed in 1889."}]}}
+```
+
+```toml
+[[scorers]]
+type = "faithfulness"        # supported claims / claims, against the sources
+batch_size = 10              # claims per support check; checks run at once
+
+[[scorers]]
+type = "citation_accuracy"   # citations whose source supports the cited sentence
+require_citations = false    # true: an answer that cites nothing scores 0
+```
+
+`faithfulness` makes one judge call to split the answer into claims and one
+per batch to check them; its detail names each claim the sources do not
+support or contradict, such as `1/3 claims supported; unsupported: "The Eiffel
+Tower opened in 1925." (contradicted by kb-2: ...)`. `citation_accuracy` reads
+`[1]`, `[1, 3]`, `[2-4]`, `[^1]` and `[kb-2]`: numbers are positions in the
+source list unless a source has that id, and a citation of a source that does
+not exist counts as wrong. Both take the provider, model and effort options of
+`judge` and are cached and gated like it.
+
 ## Reading the verdict
 
 Each run reports means with bootstrap confidence intervals (normal intervals
@@ -755,7 +784,7 @@ src/evalkit/simuser.py     simulated users: scripted, or played by a model in JS
 src/evalkit/conformance.py `evalkit agent conformance`: session protocol checks for agents
 src/evalkit/tools/         the tool sandbox: schemas, scripted and recorded answers, limits,
                            latency and failure injection; recording fixtures; the tool loop
-src/evalkit/scorers/       built-in, ranking and trajectory scorers, plugin registry, LLM judges, calibration
+src/evalkit/scorers/       built-in, ranking, trajectory and faithfulness scorers, plugin registry, LLM judges, calibration
 src/evalkit/providers/     the Provider protocol and error kinds; the Claude client (caching,
                            structured output, fallback, cost); raw HTTP OpenAI-compatible
                            and Gemini clients (JSON schema output, usage, safety blocks);

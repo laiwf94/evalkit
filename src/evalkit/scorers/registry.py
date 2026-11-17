@@ -23,6 +23,12 @@ from evalkit.providers.anthropic import ClaudeClient
 from evalkit.providers.registry import ANTHROPIC, PROVIDER_NAME, ProviderRegistry
 from evalkit.scorers.base import Scorer
 from evalkit.scorers.builtin import ExactMatch, JsonSchemaMatch, NumericMatch, RegexMatch, TokenF1
+from evalkit.scorers.faithfulness import (
+    DEFAULT_BATCH,
+    MAX_BATCH,
+    CitationAccuracyJudge,
+    FaithfulnessJudge,
+)
 from evalkit.scorers.judge import LLMJudge
 from evalkit.scorers.ranking import METRICS as RANKING_METRICS
 from evalkit.scorers.ranking import Metric as RankingMetricName
@@ -157,6 +163,35 @@ class RankingSpec(_Spec):
         return data
 
 
+class FaithfulnessSpec(_Spec):
+    """Claim-level faithfulness of the answer to the case's sources
+    (``evalkit.scorers.faithfulness``)."""
+
+    type: Literal["faithfulness"]
+    provider: str = Field(default=ANTHROPIC, pattern=PROVIDER_NAME)
+    model: str = Field(default="claude-opus-5-5", min_length=1, max_length=64)
+    effort: Literal["low", "medium", "high", "xhigh", "max"] = "medium"
+    max_tokens: int = Field(default=4096, ge=256, le=16_000)
+    # Where the sources are: this key of the case's input, or else of its expected value.
+    contexts_key: str = Field(default="contexts", min_length=1, max_length=200)
+    # Claims checked per judge call.
+    batch_size: int = Field(default=DEFAULT_BATCH, ge=1, le=MAX_BATCH)
+
+
+class CitationAccuracySpec(_Spec):
+    """The share of the answer's citations whose source supports the sentence."""
+
+    type: Literal["citation_accuracy"]
+    provider: str = Field(default=ANTHROPIC, pattern=PROVIDER_NAME)
+    model: str = Field(default="claude-opus-5-5", min_length=1, max_length=64)
+    effort: Literal["low", "medium", "high", "xhigh", "max"] = "medium"
+    max_tokens: int = Field(default=4096, ge=256, le=16_000)
+    contexts_key: str = Field(default="contexts", min_length=1, max_length=200)
+    batch_size: int = Field(default=DEFAULT_BATCH, ge=1, le=MAX_BATCH)
+    # An answer that cites nothing scores 0 instead of being unscorable.
+    require_citations: bool = False
+
+
 class PluginSpec(_Spec):
     type: Literal["plugin"]
     entry: str = Field(min_length=1, max_length=200)
@@ -175,6 +210,8 @@ ScorerSpec = Annotated[
     | ForbiddenToolsSpec
     | TrajectoryJudgeSpec
     | RankingSpec
+    | FaithfulnessSpec
+    | CitationAccuracySpec
     | PluginSpec,
     Field(discriminator="type"),
 ]
@@ -234,7 +271,7 @@ def _build(spec: ScorerSpec, *, allow_import_paths: bool, providers: ProviderReg
                 )
             case TokenF1Spec():
                 return TokenF1(name, expected_key=spec.expected_key)
-            case JudgeSpec() | TrajectoryJudgeSpec():
+            case JudgeSpec() | TrajectoryJudgeSpec() | FaithfulnessSpec() | CitationAccuracySpec():
                 return judge_from_spec(spec, providers, name)
             case ToolCallsSpec():
                 return ToolCallMatch(
@@ -276,8 +313,13 @@ def _build(spec: ScorerSpec, *, allow_import_paths: bool, providers: ProviderReg
     raise InvalidInputError(f"unknown scorer type for {name}")  # pragma: no cover
 
 
+AnySourcesSpec = FaithfulnessSpec | CitationAccuracySpec
+
+
 def judge_from_spec(
-    spec: JudgeSpec | TrajectoryJudgeSpec, providers: ProviderRegistry, name: str = ""
+    spec: JudgeSpec | TrajectoryJudgeSpec | AnySourcesSpec,
+    providers: ProviderRegistry,
+    name: str = "",
 ) -> LLMJudge:
     name = name or spec.resolved_name()
     try:
@@ -285,6 +327,29 @@ def judge_from_spec(
         endpoint = providers.endpoint(spec.provider)
     except InvalidInputError as exc:
         raise InvalidInputError(f"scorer {name}: {exc.message}") from None
+    if isinstance(spec, FaithfulnessSpec):
+        return FaithfulnessJudge(
+            name,
+            client=client,
+            endpoint=endpoint,
+            model=spec.model,
+            effort=spec.effort,
+            max_tokens=spec.max_tokens,
+            contexts_key=spec.contexts_key,
+            batch_size=spec.batch_size,
+        )
+    if isinstance(spec, CitationAccuracySpec):
+        return CitationAccuracyJudge(
+            name,
+            client=client,
+            endpoint=endpoint,
+            model=spec.model,
+            effort=spec.effort,
+            max_tokens=spec.max_tokens,
+            contexts_key=spec.contexts_key,
+            batch_size=spec.batch_size,
+            require_citations=spec.require_citations,
+        )
     if isinstance(spec, TrajectoryJudgeSpec):
         return TrajectoryJudge(
             name,

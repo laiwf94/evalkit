@@ -191,3 +191,16 @@ week 2 (#23), and agents and conversations from week 3 (#24).
   unscorable rather than zero. Rankings are kept in a retrieval cache keyed by
   the retriever and the request, with texts redacted, and identical queries in
   flight at the same time make one request.
+- **Claim-level faithfulness and citation accuracy.** The `faithfulness`
+  scorer has a judge split the answer into self-contained claims, then checks
+  them against the case's sources in concurrent batches (`batch_size`, 10 by
+  default), each claim supported, unsupported or contradicted with the ids of
+  the sources that decide it. It scores supported / claims and its detail lists
+  every unsupported claim. The `citation_accuracy` scorer parses `[1]`,
+  `[1, 3]`, `[2-4]`, `[^1]` and `[source-id]` citations, attaches each to the
+  sentence it closes, and checks every cited sentence against each source it
+  cites: accurate citations / citations, with citations of sources that do not
+  exist counted as wrong. Sources are texts, `{id, text}` objects or a
+  retrieval ranking under `contexts` in the case. Both record their identity
+  like any judge and share its cache, limits and retries; a verdict list that
+  does not cover every claim or citation is unscorable, not guessed at.

@@ -241,8 +241,16 @@ class LLMJudge(Scorer):
             return await self._rubric(case, output)
         return await self._pairwise(case, output)
 
-    async def _call(self, prompt: str, schema: dict[str, Any]) -> Completion:
-        key = sha256_hex(canonical_json([self.fingerprint(), self.max_tokens, prompt, schema]))
+    async def _call(
+        self, prompt: str, schema: dict[str, Any], system: str | None = None
+    ) -> Completion:
+        """One judge call, from the verdict cache when it was made before. ``system``
+        replaces the judge's system prompt, for judges that ask more than one
+        kind of question; it is then part of the cache key."""
+        keyed: list[Any] = [self.fingerprint(), self.max_tokens, prompt, schema]
+        if system is not None:
+            keyed.append(system)
+        key = sha256_hex(canonical_json(keyed))
         if self.cache is not None:
             hit = await self.cache.get(key)
             if hit is not None:
@@ -252,7 +260,7 @@ class LLMJudge(Scorer):
             lambda: self.client.complete(
                 model=self.model,
                 prompt=prompt,
-                system=self.system,
+                system=self.system if system is None else system,
                 max_tokens=self.max_tokens,
                 effort=self.effort,
                 output_schema=schema,

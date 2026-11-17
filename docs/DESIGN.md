@@ -868,6 +868,8 @@ example, the case has no expected value), which is different from 0.
 | `forbidden_tools` | 0 if any tool call matches a forbidden pattern, else 1. |
 | `trajectory_judge` | Rubric 1-5 over the whole trajectory, mapped to (s-1)/4. |
 | `ranking` | `recall@k`, `precision@k`, `hit_rate@k`, `mrr`, `map@k` or `ndcg@k` of a retrieval target's ranking against graded labels. |
+| `faithfulness` | Supported claims / claims: the answer split into claims, each checked against the case's sources. |
+| `citation_accuracy` | Citations whose cited source supports the cited sentence / citations. |
 | `plugin` | Any `Scorer` subclass from an `evalkit.scorers` entry point. |
 
 A failed call scores 0 and an unscorable case is left out. If the target
@@ -943,6 +945,45 @@ by the placeholder and the ranking is not cached. Identical queries in flight
 at once share one request: the first caller sends it and the others await it.
 A waiter whose own case is cancelled leaves the request running; if the
 sender's case is cancelled, the waiters send their own.
+
+### Faithfulness and citations
+
+Faithfulness is checked claim by claim rather than graded as a whole (the
+approach of Ragas and of FActScore, Min et al., 2023): a single 1-5 grade
+hides which sentence is wrong and drifts with answer length. The judge first
+splits the answer into self-contained claims (at most 50 are checked; the
+detail says when more were made), then checks them against the sources in
+batches, one call per `batch_size` claims, all batches at once. Batching
+keeps a long answer to a few calls instead of one per claim while keeping each
+prompt short enough that claims late in the list are read as carefully as the
+first. Verdicts are three-way, because a contradicted claim and an
+unsupported one call for different fixes; both count against the score. The
+verdict list must give exactly one verdict per claim number. Anything else
+(a skipped claim, a repeat) leaves the case unscorable rather than letting a
+missing verdict count either way. An answer with no claims scores 1, as in
+DeepEval: it asserts nothing the sources could fail to support.
+
+Citations are parsed without a model. A bracket counts as a citation only when
+every comma- or semicolon-separated part is a source id, a number from 1 to
+999 or a range of fewer than 50; `[sic]`, `[2020]` and Markdown links are
+text. A number names the source with that id if there is one, else the source
+at that position, and otherwise nothing: a citation of a source that does not
+exist is kept and counted as wrong without a call. Markers at the start of a
+sentence belong to the sentence before (`... capital. [1] Its tower ...`).
+Each cited sentence is sent with only the sources it cites, and the judge
+answers per source (precision: does it support any of the sentence) and per
+sentence (do the cited sources together support all of it). The score is the
+precision, accurate citations / citations; the detail adds the sentence-level
+count and how many sentences cite nothing.
+
+Sources are clipped at 20,000 characters each and 200,000 together. Both
+judges are `LLMJudge`s, so the runner gives them the verdict cache, the
+provider's judge limiter and the retry policy, and records their identity
+under modes `faithfulness` and `citation_accuracy`. Their prompts and the
+settings that change verdicts (`batch_size`, `require_citations`) are the
+identity's rubric, so a prompt change in a new evalkit version, or a new batch
+size, is a different judge to the gate and misses the cache. Each call's cache
+key includes its system prompt, since one judge asks two kinds of question.
 
 ## The judge
 
