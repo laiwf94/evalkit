@@ -196,6 +196,39 @@ def test_a_case_without_a_relevant_label_cannot_be_scored() -> None:
 doc_ids = st.text(alphabet="abcdefgh", min_size=1, max_size=2)
 
 
+def test_a_repeated_document_counts_once_at_its_first_rank() -> None:
+    labels = {"d1": 3, "d2": 1}
+    repeated = ["d1", "d1", "x", "d2", "d1"]
+    distinct = ["d1", "x", "d2"]
+    assert precision_at_k(repeated, labels, 2) == 1 / 2
+    assert precision_at_k(repeated, labels, 3) == 2 / 3
+    assert recall_at_k(repeated, labels, 2) == 1 / 2
+    assert average_precision_at_k(repeated, labels, 3) == pytest.approx((1 + 2 / 3) / 2)
+    assert ndcg_at_k(["d1", "d1"], labels, 2) < 1.0
+    assert reciprocal_rank(["x", "x", "d2"], labels) == 1 / 2
+    for metric in METRICS:
+        scorer = RankingMetric("m", metric=metric, k=3)
+        assert scorer.compute(repeated, labels) == scorer.compute(distinct, labels)
+
+
+@given(
+    ranked=st.lists(doc_ids, max_size=12),
+    labels=st.dictionaries(doc_ids, st.integers(0, 4), min_size=1, max_size=12),
+    k=st.integers(1, 15),
+)
+def test_a_ranking_with_repeats_scores_as_its_distinct_documents_do(
+    ranked: list[str], labels: dict[str, int], k: int
+) -> None:
+    if not any(g >= 1 for g in labels.values()):
+        return
+    distinct = list(dict.fromkeys(ranked))
+    for metric in METRICS:
+        scorer = RankingMetric("m", metric=metric, k=k)
+        value = scorer.compute(ranked, labels)
+        assert 0.0 <= value <= 1.0 + 1e-12
+        assert value == scorer.compute(distinct, labels)
+
+
 @given(
     ranked=st.lists(doc_ids, unique=True, max_size=12),
     labels=st.dictionaries(doc_ids, st.integers(0, 4), min_size=1, max_size=12),
@@ -232,7 +265,7 @@ def test_the_scorer_reads_the_ranking_and_the_case_labels() -> None:
     assert result.value == 0.5
     assert result.detail == "2 of 4 relevant in the top 5; first at rank 2"
     mrr = score(RankingMetric("m", metric="mrr"), case, output(*RANKED))
-    assert (mrr.value, mrr.detail) == (0.5, "2 of 4 relevant in the all 5; first at rank 2")
+    assert (mrr.value, mrr.detail) == (0.5, "2 of 4 relevant in all 5; first at rank 2")
     miss = score(RankingMetric("n", metric="ndcg", k=1), case, output("d3"))
     assert (miss.value, miss.detail) == (0.0, "0 of 4 relevant in the top 1")
     bare = Case(id="q", input="x", expected=["d1"])

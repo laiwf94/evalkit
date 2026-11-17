@@ -16,6 +16,9 @@ when its grade is at least ``min_grade``; unlabelled documents are not. With
   (``linear``, as in trec_eval) or 2^grade - 1
   (``exponential``). Grades below ``min_grade`` gain nothing.
 
+A document that appears more than once counts once, at its first rank, as the
+retrieval target already reads it; a repeat does not take a rank.
+
 A case with no relevant document labelled cannot be scored by any of these
 and is reported as unscorable rather than as a zero.
 """
@@ -35,6 +38,11 @@ Gain = Literal["linear", "exponential"]
 METRICS: tuple[Metric, ...] = ("recall", "precision", "hit_rate", "mrr", "map", "ndcg")
 
 
+def _top(ranked: Sequence[str], k: int | None) -> list[str]:
+    """The first ``k`` distinct documents, in rank order."""
+    return list(dict.fromkeys(ranked))[:k]
+
+
 def _relevant(labels: Mapping[str, int], min_grade: int) -> set[str]:
     return {doc for doc, grade in labels.items() if grade >= min_grade}
 
@@ -45,7 +53,7 @@ def recall_at_k(
     relevant = _relevant(labels, min_grade)
     if not relevant:
         raise ValueError("no relevant document is labelled")
-    return len(relevant.intersection(ranked[:k])) / len(relevant)
+    return len(relevant.intersection(_top(ranked, k))) / len(relevant)
 
 
 def precision_at_k(
@@ -54,7 +62,7 @@ def precision_at_k(
     relevant = _relevant(labels, min_grade)
     if not relevant:
         raise ValueError("no relevant document is labelled")
-    return sum(1 for doc in ranked[:k] if doc in relevant) / k
+    return sum(1 for doc in _top(ranked, k) if doc in relevant) / k
 
 
 def hit_rate_at_k(
@@ -63,7 +71,7 @@ def hit_rate_at_k(
     relevant = _relevant(labels, min_grade)
     if not relevant:
         raise ValueError("no relevant document is labelled")
-    return 1.0 if relevant.intersection(ranked[:k]) else 0.0
+    return 1.0 if relevant.intersection(_top(ranked, k)) else 0.0
 
 
 def reciprocal_rank(
@@ -72,7 +80,7 @@ def reciprocal_rank(
     relevant = _relevant(labels, min_grade)
     if not relevant:
         raise ValueError("no relevant document is labelled")
-    for rank, doc in enumerate(ranked[:k], start=1):
+    for rank, doc in enumerate(_top(ranked, k), start=1):
         if doc in relevant:
             return 1.0 / rank
     return 0.0
@@ -86,7 +94,7 @@ def average_precision_at_k(
         raise ValueError("no relevant document is labelled")
     found = 0
     total = 0.0
-    for rank, doc in enumerate(ranked[:k], start=1):
+    for rank, doc in enumerate(_top(ranked, k), start=1):
         if doc in relevant:
             found += 1
             total += found / rank
@@ -112,7 +120,7 @@ def ndcg_at_k(
     ideal = sum(_gain(g, gain) / math.log2(i + 2) for i, g in enumerate(ideal_grades))
     if ideal == 0:
         raise ValueError("no relevant document is labelled")
-    dcg = sum(_gain(grade(d), gain) / math.log2(i + 2) for i, d in enumerate(ranked[:k]))
+    dcg = sum(_gain(grade(d), gain) / math.log2(i + 2) for i, d in enumerate(_top(ranked, k)))
     return dcg / ideal
 
 
@@ -187,8 +195,8 @@ class RankingMetric(Scorer):
 
     def _detail(self, ranked: Sequence[str], labels: Mapping[str, int]) -> str:
         relevant = _relevant(labels, self.min_grade)
-        window = ranked[: self.k]
+        window = _top(ranked, self.k)
         found = [i for i, doc in enumerate(window, start=1) if doc in relevant]
-        cut = f"top {self.k}" if self.k is not None else f"all {len(window)}"
+        cut = f"the top {self.k}" if self.k is not None else f"all {len(window)}"
         first = f"; first at rank {found[0]}" if found else ""
-        return f"{len(found)} of {len(relevant)} relevant in the {cut}{first}"
+        return f"{len(found)} of {len(relevant)} relevant in {cut}{first}"
