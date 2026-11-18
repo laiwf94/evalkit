@@ -66,6 +66,7 @@ from evalkit.prompts import (
 )
 from evalkit.providers.anthropic import ClaudeClient
 from evalkit.providers.registry import ANTHROPIC, ProviderRegistry
+from evalkit.rag_report import RagReport, format_rag, parse_thresholds, rag_report
 from evalkit.report import CompareReport, RunSummary, compare_runs, summarize
 from evalkit.runner import Runner
 from evalkit.runspec import RunConfig
@@ -275,6 +276,21 @@ async def cmd_report(args: argparse.Namespace, app: App) -> int:
             min_effect=args.min_effect,
         )
     _emit(app.out, report, args.json, _format_matrix)
+    return EXIT_OK
+
+
+async def cmd_report_rag(args: argparse.Namespace, app: App) -> int:
+    """``evalkit report rag RUN``: each failing case of a RAG run and its cause."""
+    default, per_metric = parse_thresholds(args.threshold or [])
+    with app.sessions() as session:
+        report = rag_report(
+            session,
+            resolve_run(session, args.run),
+            threshold=default,
+            thresholds=per_metric,
+            limit=args.limit,
+        )
+    _emit(app.out, report, args.json, _format_rag)
     return EXIT_OK
 
 
@@ -805,6 +821,19 @@ def _add_report_commands(sub: Any) -> None:
     )
     mat.set_defaults(handler=cmd_report)
     mat.add_argument("--json", action="store_true", help="print JSON instead of a table")
+    rag = report_sub.add_parser(
+        "rag", help="why each failing case of a RAG run failed: retrieval, grounding or answer"
+    )
+    rag.add_argument("run", help="run id or label:NAME")
+    rag.add_argument(
+        "--threshold",
+        action="append",
+        metavar="[NAME=]VALUE",
+        help="a case fails below this score (default 0.5); NAME=VALUE for one metric; repeatable",
+    )
+    rag.add_argument("--limit", type=int, default=20, help="failing cases to list (default 20)")
+    rag.add_argument("--json", action="store_true", help="print JSON instead of a table")
+    rag.set_defaults(handler=cmd_report_rag)
 
 
 def _add_prompt_commands(sub: Any) -> None:
@@ -1176,6 +1205,10 @@ def _format_matrix(r: MatrixReport) -> str:
             )
     lines += [f"note: {n}" for n in r.notes]
     return "\n".join(lines) + "\n"
+
+
+def _format_rag(r: RagReport) -> str:
+    return format_rag(r)
 
 
 def _format_sandbox(info: dict[str, Any]) -> str:

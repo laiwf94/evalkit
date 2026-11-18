@@ -506,6 +506,64 @@ source list unless a source has that id, and a citation of a source that does
 not exist counts as wrong. Both take the provider, model and effort options of
 `judge` and are cached and gated like it.
 
+Four more judges read the same sources, and the last three a reference answer
+in `expected.answer` (or a text `expected`):
+
+```toml
+[[scorers]]
+type = "context_relevance"     # relevant sources / sources
+contexts_from = "case"         # or "output": a retrieval target's ranking
+
+[[scorers]]
+type = "context_recall"        # reference claims the sources support / reference claims
+gate = false                   # evidence for the report, not a gate
+
+[[scorers]]
+type = "answer_completeness"   # reference claims the answer states / reference claims
+
+[[scorers]]
+type = "noise_sensitivity"     # 1 - wrong claims a source led to / claims
+```
+
+`evalkit report rag RUN` then says why each failing case failed. A case fails
+when a gated metric is below `--threshold` (0.5 by default, `NAME=VALUE` for
+one metric), and its cause is the first stage that failed: a retrieval metric
+(ranking recall, hit rate, MRR, MAP or nDCG, or `context_recall`) means a
+*retrieval miss*, a grounding metric (`faithfulness`, `citation_accuracy`,
+`noise_sensitivity`) an *unsupported answer*, and an answer that fails while
+retrieval and grounding passed (or that fails `answer_completeness` after good
+retrieval) *ignored context*. On the scripted judge of `tests/test_rag.py`:
+
+```console
+$ evalkit report rag label:rag-run
+rag report  run 8546273562de432db0aec28d6ca7db5c  rag-run  dataset rag v1  completed
+5 cases, 3 failing
+
+metric               role       gate      mean   below  threshold  unscorable
+context_recall       retrieval  no       80.0%       1       0.50           0
+faithfulness         grounding  no       80.0%       1       0.50           0
+answer_completeness  answer     yes      40.0%       3       0.50           0
+
+cause                cases    share
+retrieval miss           1    33.3%
+unsupported answer       1    33.3%
+ignored context          1    33.3%
+noisy retrieval          0     0.0%
+unattributed             0     0.0%
+target error             0     0.0%
+
+failing cases:
+  hallucinated  unsupported answer: the answer states what its sources do not  [faithfulness 0.00, answer_completeness 0.00]
+      faithfulness: 0/2 claims supported; unsupported: "out hallucinated 1" (not in the sources: r); ...
+  ignored  ignored context: the sources had it and the answer did not use it  [answer_completeness 0.00]
+      answer_completeness: 0/2 reference points in the answer; left out: "ref ignored 1"; "ref ignored 2"
+  miss  retrieval miss: the needed sources were not retrieved  [context_recall 0.00, answer_completeness 0.00]
+      context_recall: 0/2 reference claims in the sources; not retrieved: "ref miss 1"; "ref miss 2"
+```
+
+A run that lacks a retrieval or a grounding metric says so in a note, and the
+cases it cannot split are `unattributed` rather than guessed.
+
 ## Reading the verdict
 
 Each run reports means with bootstrap confidence intervals (normal intervals
@@ -627,6 +685,7 @@ different judge it would refuse (exit 3) unless `--allow-judge-change` is given.
 | `evalkit compare BASE CAND` | Paired comparison per metric. |
 | `evalkit gate BASE CAND [--allow-judge-change]` | Same, and exit 1 if any gated metric is worse; exit 3 if a metric's judge changed, unless allowed. |
 | `evalkit report matrix MATRIX [--metric M] [--latency p50\|p95]` | A matrix's variants, their cost/quality/latency frontier and paired steps along it. |
+| `evalkit report rag RUN [--threshold [NAME=]V]... [--limit N]` | Each failing case of a RAG run attributed to a retrieval miss, an unsupported answer or ignored context. |
 | `evalkit estimate CONFIG` | Cost estimate from token counts (per variant for a matrix). |
 | `evalkit calibrate --judge J LABELS` | Judge agreement with human labels. |
 | `evalkit dataset import/export/list` | Manage datasets. |
@@ -784,7 +843,8 @@ src/evalkit/simuser.py     simulated users: scripted, or played by a model in JS
 src/evalkit/conformance.py `evalkit agent conformance`: session protocol checks for agents
 src/evalkit/tools/         the tool sandbox: schemas, scripted and recorded answers, limits,
                            latency and failure injection; recording fixtures; the tool loop
-src/evalkit/scorers/       built-in, ranking, trajectory and faithfulness scorers, plugin registry, LLM judges, calibration
+src/evalkit/scorers/       built-in, ranking, trajectory, faithfulness and RAG scorers, plugin registry, LLM judges, calibration
+src/evalkit/rag_report.py  `evalkit report rag`: failing cases attributed to retrieval, grounding or the answer
 src/evalkit/providers/     the Provider protocol and error kinds; the Claude client (caching,
                            structured output, fallback, cost); raw HTTP OpenAI-compatible
                            and Gemini clients (JSON schema output, usage, safety blocks);

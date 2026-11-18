@@ -393,6 +393,17 @@ def parse_citations(answer: str, sources: Sequence[Source]) -> list[Statement]:
     return out
 
 
+def extract_prompt(question: str, answer: str) -> str:
+    """What the claim extraction call reads."""
+    return f"<question>\n{question}\n</question>\n\n<answer>\n{answer}\n</answer>"
+
+
+def verify_prompt(sources: Sequence[Source], claims: Sequence[str]) -> str:
+    """What one support check reads: the sources and a batch of numbered claims."""
+    numbered = "\n".join(f"[{i}] {claim}" for i, claim in enumerate(claims, start=1))
+    return f"<sources>\n{render_sources(sources)}\n</sources>\n\n<claims>\n{numbered}\n</claims>"
+
+
 # ---------------------------------------------------------------- judges
 
 
@@ -410,6 +421,14 @@ class _Spend:
 
 def _batches[T](items: Sequence[T], size: int) -> list[Sequence[T]]:
     return [items[i : i + size] for i in range(0, len(items), size)]
+
+
+@dataclass(frozen=True)
+class ClaimCheck:
+    claim: str
+    verdict: Verdict
+    sources: tuple[str, ...]
+    reasoning: str
 
 
 class _SourcesJudge(LLMJudge):
@@ -473,13 +492,52 @@ class _SourcesJudge(LLMJudge):
         spend.add(completion)
         return _parse(completion, model)
 
+    async def extract_claims(
+        self, question: str, answer: str, spend: _Spend
+    ) -> tuple[list[str], str] | str:
+        """The factual claims ``answer`` makes (at most ``MAX_CLAIMS``, each
+        clipped), with a note when some were left out; or why there are none."""
+        extracted = await self._ask(
+            extract_prompt(question, answer), EXTRACT_SCHEMA, EXTRACT_SYSTEM, _Claims, spend
+        )
+        if isinstance(extracted, str):
+            return extracted
+        claims = list(dict.fromkeys(c.strip() for c in extracted.claims if c.strip()))
+        note = ""
+        if len(claims) > MAX_CLAIMS:
+            note = f" (the first {MAX_CLAIMS} of {len(claims)} claims checked)"
+            claims = claims[:MAX_CLAIMS]
+        return [_clip(c, MAX_CLAIM_CHARS) for c in claims], note
 
-@dataclass(frozen=True)
-class ClaimCheck:
-    claim: str
-    verdict: Verdict
-    sources: tuple[str, ...]
-    reasoning: str
+    async def verify_claims(
+        self, sources: Sequence[Source], claims: Sequence[str], spend: _Spend
+    ) -> list[ClaimCheck] | str:
+        """A verdict for every claim against ``sources``, checked in batches of
+        ``batch_size`` all at once; or why there is none."""
+        batches = _batches(claims, self.batch_size)
+        answers = await asyncio.gather(
+            *(
+                self._ask(
+                    verify_prompt(sources, batch), VERIFY_SCHEMA, VERIFY_SYSTEM, _Verdicts, spend
+                )
+                for batch in batches
+            )
+        )
+        ids = {s.id for s in sources}
+        checks: list[ClaimCheck] = []
+        for batch, answer in zip(batches, answers, strict=True):
+            if isinstance(answer, str):
+                return answer
+            by_number = {v.claim: v for v in answer.verdicts}
+            if len(answer.verdicts) != len(batch) or set(by_number) != set(
+                range(1, len(batch) + 1)
+            ):
+                return "judge did not return exactly one verdict per claim"
+            for number, claim in enumerate(batch, start=1):
+                v = by_number[number]
+                named = tuple(dict.fromkeys(s for s in v.sources if s in ids))
+                checks.append(ClaimCheck(claim, v.verdict, named, v.reasoning))
+        return checks
 
 
 @dataclass
@@ -533,14 +591,10 @@ class FaithfulnessJudge(_SourcesJudge):
         self.system = VERIFY_SYSTEM
 
     def extract_prompt(self, case: Case, output: str) -> str:
-        question = question_of(case, self.contexts_key)
-        return f"<question>\n{question}\n</question>\n\n<answer>\n{output}\n</answer>"
+        return extract_prompt(question_of(case, self.contexts_key), output)
 
     def verify_prompt(self, sources: Sequence[Source], claims: Sequence[str]) -> str:
-        numbered = "\n".join(f"[{i}] {claim}" for i, claim in enumerate(claims, start=1))
-        return (
-            f"<sources>\n{render_sources(sources)}\n</sources>\n\n<claims>\n{numbered}\n</claims>"
-        )
+        return verify_prompt(sources, claims)
 
     def prompts(self, case: Case, output: str) -> list[str]:
         """One extraction and one support check, the fewest calls a case with
@@ -567,52 +621,20 @@ class FaithfulnessJudge(_SourcesJudge):
             return result
         if not output.strip():
             return result
-        extracted = await self._ask(
-            self.extract_prompt(case, output),
-            EXTRACT_SCHEMA,
-            EXTRACT_SYSTEM,
-            _Claims,
-            result.spend,
+        extracted = await self.extract_claims(
+            question_of(case, self.contexts_key), output, result.spend
         )
         if isinstance(extracted, str):
             result.error = extracted
             return result
-        claims = list(dict.fromkeys(c.strip() for c in extracted.claims if c.strip()))
-        if len(claims) > MAX_CLAIMS:
-            result.note = f" (the first {MAX_CLAIMS} of {len(claims)} claims checked)"
-            claims = claims[:MAX_CLAIMS]
-        claims = [_clip(c, MAX_CLAIM_CHARS) for c in claims]
+        claims, result.note = extracted
         if not claims:
             return result
-        batches = _batches(claims, self.batch_size)
-        answers = await asyncio.gather(
-            *(
-                self._ask(
-                    self.verify_prompt(sources, batch),
-                    VERIFY_SCHEMA,
-                    VERIFY_SYSTEM,
-                    _Verdicts,
-                    result.spend,
-                )
-                for batch in batches
-            )
-        )
-        ids = {s.id for s in sources}
-        for batch, answer in zip(batches, answers, strict=True):
-            if isinstance(answer, str):
-                result.error, result.claims = answer, []
-                return result
-            by_number = {v.claim: v for v in answer.verdicts}
-            if len(answer.verdicts) != len(batch) or set(by_number) != set(
-                range(1, len(batch) + 1)
-            ):
-                result.error = "judge did not return exactly one verdict per claim"
-                result.claims = []
-                return result
-            for number, claim in enumerate(batch, start=1):
-                v = by_number[number]
-                named = tuple(dict.fromkeys(s for s in v.sources if s in ids))
-                result.claims.append(ClaimCheck(claim, v.verdict, named, v.reasoning))
+        checks = await self.verify_claims(sources, claims, result.spend)
+        if isinstance(checks, str):
+            result.error = checks
+            return result
+        result.claims = checks
         return result
 
 

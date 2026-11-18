@@ -30,6 +30,12 @@ from evalkit.scorers.faithfulness import (
     FaithfulnessJudge,
 )
 from evalkit.scorers.judge import LLMJudge
+from evalkit.scorers.rag import (
+    AnswerCompletenessJudge,
+    ContextRecallJudge,
+    ContextRelevanceJudge,
+    NoiseSensitivityJudge,
+)
 from evalkit.scorers.ranking import METRICS as RANKING_METRICS
 from evalkit.scorers.ranking import Metric as RankingMetricName
 from evalkit.scorers.ranking import RankingMetric, default_name
@@ -192,6 +198,47 @@ class CitationAccuracySpec(_Spec):
     require_citations: bool = False
 
 
+class _RagSpec(_Spec):
+    """The options every RAG judge (``evalkit.scorers.rag``) takes."""
+
+    provider: str = Field(default=ANTHROPIC, pattern=PROVIDER_NAME)
+    model: str = Field(default="claude-opus-5-5", min_length=1, max_length=64)
+    effort: Literal["low", "medium", "high", "xhigh", "max"] = "medium"
+    max_tokens: int = Field(default=4096, ge=256, le=16_000)
+    contexts_key: str = Field(default="contexts", min_length=1, max_length=200)
+    batch_size: int = Field(default=DEFAULT_BATCH, ge=1, le=MAX_BATCH)
+
+
+class ContextRelevanceSpec(_RagSpec):
+    """Relevant sources / sources."""
+
+    type: Literal["context_relevance"]
+    # "output": the sources are the target's output (a retrieval target's ranking).
+    contexts_from: Literal["case", "output"] = "case"
+
+
+class ContextRecallSpec(_RagSpec):
+    """Reference claims the sources support / reference claims."""
+
+    type: Literal["context_recall"]
+    contexts_from: Literal["case", "output"] = "case"
+    reference_key: str | None = Field(default="answer", min_length=1, max_length=200)
+
+
+class AnswerCompletenessSpec(_RagSpec):
+    """Reference claims the answer states / reference claims."""
+
+    type: Literal["answer_completeness"]
+    reference_key: str | None = Field(default="answer", min_length=1, max_length=200)
+
+
+class NoiseSensitivitySpec(_RagSpec):
+    """1 - claims that are wrong and taken from a source / claims."""
+
+    type: Literal["noise_sensitivity"]
+    reference_key: str | None = Field(default="answer", min_length=1, max_length=200)
+
+
 class PluginSpec(_Spec):
     type: Literal["plugin"]
     entry: str = Field(min_length=1, max_length=200)
@@ -212,6 +259,10 @@ ScorerSpec = Annotated[
     | RankingSpec
     | FaithfulnessSpec
     | CitationAccuracySpec
+    | ContextRelevanceSpec
+    | ContextRecallSpec
+    | AnswerCompletenessSpec
+    | NoiseSensitivitySpec
     | PluginSpec,
     Field(discriminator="type"),
 ]
@@ -273,6 +324,13 @@ def _build(spec: ScorerSpec, *, allow_import_paths: bool, providers: ProviderReg
                 return TokenF1(name, expected_key=spec.expected_key)
             case JudgeSpec() | TrajectoryJudgeSpec() | FaithfulnessSpec() | CitationAccuracySpec():
                 return judge_from_spec(spec, providers, name)
+            case (
+                ContextRelevanceSpec()
+                | ContextRecallSpec()
+                | AnswerCompletenessSpec()
+                | NoiseSensitivitySpec()
+            ):
+                return rag_judge_from_spec(spec, providers, name)
             case ToolCallsSpec():
                 return ToolCallMatch(
                     name,
@@ -370,6 +428,42 @@ def judge_from_spec(
         effort=spec.effort,
         max_tokens=spec.max_tokens,
     )
+
+
+AnyRagSpec = (
+    ContextRelevanceSpec | ContextRecallSpec | AnswerCompletenessSpec | NoiseSensitivitySpec
+)
+
+
+def rag_judge_from_spec(spec: AnyRagSpec, providers: ProviderRegistry, name: str = "") -> LLMJudge:
+    name = name or spec.resolved_name()
+    try:
+        client = providers.get(spec.provider)
+        endpoint = providers.endpoint(spec.provider)
+    except InvalidInputError as exc:
+        raise InvalidInputError(f"scorer {name}: {exc.message}") from None
+    common: dict[str, Any] = {
+        "client": client,
+        "endpoint": endpoint,
+        "model": spec.model,
+        "effort": spec.effort,
+        "max_tokens": spec.max_tokens,
+        "contexts_key": spec.contexts_key,
+        "batch_size": spec.batch_size,
+    }
+    match spec:
+        case ContextRelevanceSpec():
+            return ContextRelevanceJudge(name, contexts_from=spec.contexts_from, **common)
+        case ContextRecallSpec():
+            return ContextRecallJudge(
+                name,
+                contexts_from=spec.contexts_from,
+                reference_key=spec.reference_key,
+                **common,
+            )
+        case AnswerCompletenessSpec():
+            return AnswerCompletenessJudge(name, reference_key=spec.reference_key, **common)
+    return NoiseSensitivityJudge(name, reference_key=spec.reference_key, **common)
 
 
 def _load_plugin(spec: PluginSpec, name: str, *, allow_import_paths: bool) -> Scorer:

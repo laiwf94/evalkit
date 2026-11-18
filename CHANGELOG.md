@@ -204,3 +204,26 @@ week 2 (#23), and agents and conversations from week 3 (#24).
   retrieval ranking under `contexts` in the case. Both record their identity
   like any judge and share its cache, limits and retries; a verdict list that
   does not cover every claim or citation is unscorable, not guessed at.
+- **Retrieval and answer metrics for RAG.** `context_relevance` judges each
+  retrieved source for whether it helps answer the question (relevant /
+  sources, the irrelevant ones named with their ranks). `context_recall` splits
+  the reference answer into claims and checks them against the sources, so a
+  low score is retrieval's fault whatever the generator did.
+  `answer_completeness` checks the same reference claims against the answer and
+  names what it leaves out or contradicts. `noise_sensitivity` checks the
+  answer's claims against the reference and the sources together and counts the
+  wrong claims a source led to; it stores 1 - sensitivity so that higher is
+  better, and its detail gives the sensitivity and the misleading sources. The
+  first two read their sources from the case or, with `contexts_from =
+  "output"`, from a retrieval target's ranking. All four reuse the faithfulness
+  judge's extraction and batched checks and record their own judge identity.
+- **`evalkit report rag RUN`.** Attributes each failing case of a run to a
+  retrieval miss, an unsupported answer or ignored context (or noisy
+  retrieval, a target error, or unattributed when the run does not measure
+  enough to tell), from the roles of the run's metrics: ranking recall-type
+  metrics and `context_recall` for retrieval, `faithfulness`,
+  `citation_accuracy` and `noise_sensitivity` for grounding, and every other
+  output metric for the answer. A case fails below `--threshold` (0.5, or per
+  metric with `NAME=VALUE`) on a gated metric; ungated metrics are evidence.
+  The report streams the results once and keeps only counts and the first
+  `--limit` failing cases.

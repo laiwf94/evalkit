@@ -870,6 +870,10 @@ example, the case has no expected value), which is different from 0.
 | `ranking` | `recall@k`, `precision@k`, `hit_rate@k`, `mrr`, `map@k` or `ndcg@k` of a retrieval target's ranking against graded labels. |
 | `faithfulness` | Supported claims / claims: the answer split into claims, each checked against the case's sources. |
 | `citation_accuracy` | Citations whose cited source supports the cited sentence / citations. |
+| `context_relevance` | Retrieved sources that help answer the question / sources. |
+| `context_recall` | Reference-answer claims the sources support / reference claims. |
+| `answer_completeness` | Reference-answer claims the answer states / reference claims. |
+| `noise_sensitivity` | 1 - claims that are wrong and taken from a source / claims. |
 | `plugin` | Any `Scorer` subclass from an `evalkit.scorers` entry point. |
 
 A failed call scores 0 and an unscorable case is left out. If the target
@@ -984,6 +988,45 @@ settings that change verdicts (`batch_size`, `require_citations`) are the
 identity's rubric, so a prompt change in a new evalkit version, or a new batch
 size, is a different judge to the gate and misses the cache. Each call's cache
 key includes its system prompt, since one judge asks two kinds of question.
+
+### RAG metrics and the RAG report
+
+The four RAG judges in `evalkit.scorers.rag` reuse faithfulness's two calls
+rather than grading with a rubric, so each verdict names a claim or a source.
+`context_recall` and `answer_completeness` both split the *reference* answer
+into claims (with the same extraction prompt as an answer) and check them, the
+first against the sources and the second against the answer as the only
+source; together they separate "the retriever did not find it" from "the
+answer did not say it". `context_relevance` asks per source, in batches, with
+each source's rank in the prompt so the detail can say where the noise sits.
+`noise_sensitivity` follows Ragas: the answer's claims are checked against the
+reference and against the sources in two concurrent sets of batches, and a
+claim the reference does not support but a source does counts as misled. Ragas
+reports that share with lower better; every metric the gate reads is higher
+better, so the stored score is 1 - sensitivity and the detail gives the
+sensitivity itself. Ragas's split of misleading sources into relevant and
+irrelevant ones would need the reference's claims checked as well, a third set
+of calls per case, and is left out. `context_relevance` and `context_recall`
+take `contexts_from = "output"` to read a retrieval target's ranking, since
+they judge retrieval alone; `contexts_from` is part of their rubric so the two
+settings never share verdicts.
+
+`evalkit report rag` (`evalkit.rag_report`) gives each metric a role from its
+scorer type (retrieval, precision, grounding, answer, or other for trajectory
+scorers) and attributes a failing case to the earliest stage that failed, in
+pipeline order: retrieval, then grounding, then the answer. Order matters
+because failures cascade: an answer written from sources that lack the fact
+is usually unfaithful and incomplete too, and the fix is in the retriever.
+Precision metrics only decide a cause when nothing else failed, since noise the
+answer survived is not a failure the user sees. "Ignored context" needs
+evidence that retrieval succeeded and, unless the failing metric is
+`answer_completeness` (which measures omission directly), that the answer was
+grounded; without it the case is `unattributed` and a note names the missing
+metric, rather than a guess that would send someone to fix the wrong stage.
+Only gated metrics make a case fail, so a run can gate on the answer and keep
+retrieval and grounding metrics as ungated evidence. The report reads the
+result rows once with `yield_per` and holds the counts and the first `--limit`
+failing cases by id, so its memory does not grow with the run.
 
 ## The judge
 
