@@ -30,7 +30,7 @@ from sqlalchemy.orm import Session, sessionmaker
 
 from evalkit import blobs, metrics
 from evalkit.datasets import canonical_json, sha256_hex
-from evalkit.db.models import CachedResponse, utcnow
+from evalkit.db.models import CachedEmbedding, CachedResponse, utcnow
 from evalkit.targets.base import Usage
 
 log = logging.getLogger(__name__)
@@ -233,6 +233,47 @@ def sweep(
     return report
 
 
+def sweep_embeddings(
+    session: Session,
+    *,
+    max_age: timedelta,
+    now: datetime | None = None,
+    dry_run: bool = False,
+    chunk: int = SWEEP_CHUNK,
+) -> SweepReport:
+    """Delete cached embeddings unused for longer than ``max_age``, in chunks as
+    ``sweep`` does. Vectors are a few KiB each and shared by every run of their
+    texts, so they are bounded by age alone."""
+    now = now or utcnow()
+    cutoff = now - max_age
+    report = SweepReport(dry_run=dry_run)
+    size = func.length(CachedEmbedding.vector)
+    while True:
+        rows = session.execute(
+            select(CachedEmbedding.key, size)
+            .where(CachedEmbedding.last_used_at < cutoff)
+            .order_by(CachedEmbedding.last_used_at, CachedEmbedding.key)
+            .offset(report.removed if dry_run else 0)
+            .limit(chunk)
+        ).all()
+        if not rows:
+            break
+        report.removed += len(rows)
+        report.removed_bytes += sum(int(n) for _, n in rows)
+        if not dry_run:
+            session.execute(
+                delete(CachedEmbedding).where(
+                    CachedEmbedding.key.in_([key for key, _ in rows]),
+                    CachedEmbedding.last_used_at < cutoff,
+                )
+            )
+            session.commit()
+    count, total = session.execute(select(func.count(), func.coalesce(func.sum(size), 0))).one()
+    report.kept = int(count) - (report.removed if dry_run else 0)
+    report.kept_bytes = int(total) - (report.removed_bytes if dry_run else 0)
+    return report
+
+
 def _sweep_size(
     session: Session, max_bytes: int, report: SweepReport, *, dry_run: bool, chunk: int
 ) -> None:
@@ -320,6 +361,7 @@ class Maintenance:
     sweep: SweepReport
     blobs: blobs.GarbageReport | None
     skipped: bool = False
+    embeddings: SweepReport | None = None
 
 
 def maintain(
@@ -332,7 +374,8 @@ def maintain(
     dry_run: bool = False,
     now: datetime | None = None,
 ) -> Maintenance:
-    """Sweep the cache, then collect unreferenced blobs. On PostgreSQL this
+    """Sweep the cache (and, given ``max_age``, the embedding cache), then
+    collect unreferenced blobs. On PostgreSQL this
     takes an advisory lock first and does nothing (``skipped``) if another
     process is already maintaining the cache."""
     engine = sessions.kw["bind"]
@@ -347,10 +390,13 @@ def maintain(
                 report = sweep(
                     session, max_age=max_age, max_bytes=max_bytes, now=now, dry_run=dry_run
                 )
+                vectors = None
+                if max_age is not None:
+                    vectors = sweep_embeddings(session, max_age=max_age, now=now, dry_run=dry_run)
                 collected = None
                 if store is not None:
                     collected = collect_blobs(session, store, grace=grace, now=now, dry_run=dry_run)
-            return Maintenance(report, collected)
+            return Maintenance(report, collected, embeddings=vectors)
         finally:
             if postgres:
                 lock.execute(text("SELECT pg_advisory_unlock(:id)"), {"id": SWEEP_LOCK_ID})

@@ -1,18 +1,21 @@
 """The bounded cache on PostgreSQL and the S3 blob backend on a real server
 (versitygw: see ``conftest.py``)."""
 
+import asyncio
 import os
 from collections.abc import Iterator
 from datetime import UTC, datetime, timedelta
 
+import numpy as np
 import pytest
-from sqlalchemy import create_engine, select, text
+from sqlalchemy import create_engine, select, text, update
 from sqlalchemy.orm import Session, sessionmaker
 
 from evalkit import blobs, cache
 from evalkit.blobs import BlobCorruptError, BlobError, S3BlobStore, open_store, scrub
 from evalkit.db import make_engine, make_session_factory
-from evalkit.db.models import CachedResponse, as_utc
+from evalkit.db.models import CachedEmbedding, CachedResponse, as_utc
+from evalkit.embeddings import EmbeddingStore
 from tests.e2e.conftest import ACCESS, SECRET
 
 pytestmark = pytest.mark.e2e
@@ -169,3 +172,31 @@ def test_one_maintainer_at_a_time_on_postgres(
         pg_sessions, None, max_age=timedelta(days=1), max_bytes=None, grace=timedelta(0)
     )
     assert not free.skipped
+
+
+def test_embedding_cache_on_postgres(pg_sessions: sessionmaker[Session]) -> None:
+    with pg_sessions() as session:
+        session.execute(text("DELETE FROM embedding_cache"))
+        session.commit()
+    vector = np.asarray([0.1, -2.5, 1e-30, 3.0], dtype=np.float32)
+    store = EmbeddingStore(pg_sessions)
+    asyncio.run(store.put("e" * 64, {"k1": vector, "k2": vector * 2}))
+    asyncio.run(store.put("e" * 64, {"k1": vector * 9}))  # a racing writer keeps the first row
+    found = asyncio.run(store.get(["k1", "k2", "missing"]))
+    assert sorted(found) == ["k1", "k2"]
+    assert found["k1"].tobytes() == vector.tobytes()
+    assert found["k2"].dtype == np.float32
+    old = datetime.now(UTC) - timedelta(days=40)
+    with pg_sessions() as session:
+        session.execute(
+            update(CachedEmbedding).where(CachedEmbedding.key == "k2").values(last_used_at=old)
+        )
+        session.commit()
+        report = cache.sweep_embeddings(session, max_age=timedelta(days=30))
+        assert (report.removed, report.removed_bytes, report.kept, report.kept_bytes) == (
+            1,
+            16,
+            1,
+            16,
+        )
+        assert list(session.scalars(select(CachedEmbedding.key))) == ["k1"]

@@ -94,6 +94,7 @@ class FakeOpenAI:
         answer: Answer | None = None,
         models: set[str] | None = None,
         output_limit_field: str = "max_completion_tokens",
+        embed: Callable[[str], list[float]] | None = None,
     ) -> None:
         url = httpx2.URL(base_url)
         self.host = url.host
@@ -102,6 +103,8 @@ class FakeOpenAI:
         self.answer: Answer = answer or (lambda body: "ok")
         self.models = models
         self.output_limit_field = output_limit_field
+        # The vector for one text; by default its length and position.
+        self.embed = embed
         self.requests: list[httpx2.Request] = []
         self.rejected: list[str] = []
 
@@ -148,7 +151,7 @@ class FakeOpenAI:
         if path == "/embeddings":
             check_embedding_body(body)
             self._check_model(body["model"])
-            return embedding_response(body["input"], model=body["model"])
+            return embedding_response(body["input"], model=body["model"], embed=self.embed)
         return error_response(404, f"Invalid URL (POST {request.url.path})")
 
     def _check_model(self, model: str) -> None:
@@ -309,14 +312,19 @@ def check_embedding_body(body: dict[str, Any]) -> None:
         raise BodyError("encoding_format must be float", "encoding_format")
 
 
-def embedding_response(texts: list[str], *, model: str) -> httpx2.Response:
+def embedding_response(
+    texts: list[str], *, model: str, embed: Callable[[str], list[float]] | None = None
+) -> httpx2.Response:
+    def vector(i: int, text: str) -> list[float]:
+        return embed(text) if embed is not None else [float(len(text)), float(i)]
+
     return httpx2.Response(
         200,
         json={
             "object": "list",
             "model": model,
             "data": [
-                {"object": "embedding", "index": i, "embedding": [float(len(t)), float(i)]}
+                {"object": "embedding", "index": i, "embedding": vector(i, t)}
                 for i, t in enumerate(texts)
             ],
             "usage": {"prompt_tokens": sum(len(t.split()) for t in texts)},

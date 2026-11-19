@@ -525,6 +525,39 @@ type = "answer_completeness"   # reference claims the answer states / reference 
 type = "noise_sensitivity"     # 1 - wrong claims a source led to / claims
 ```
 
+`semantic_similarity` needs no judge: it embeds the answer and the reference
+text and compares them by cosine, on any provider with an embeddings endpoint
+(Claude has none; the default is OpenAI's `text-embedding-3-small`):
+
+```toml
+[[scorers]]
+type = "semantic_similarity"
+provider = "openai"            # or "gemini", or a server in EVALKIT_PROVIDERS_FILE
+model = "text-embedding-3-small"
+threshold = 0.82               # pass at this cosine or above; without it, the cosine itself
+expected_key = "answer"        # optional: one key of a structured expected value
+```
+
+Texts from all cases share requests (up to `batch_size`, 64 by default), and
+vectors are cached as float32 in the database, so a rerun makes no requests.
+Raw cosines of unrelated texts are often well above zero, so gate on a
+threshold, and pick it from labels: each line of the labels file is an output,
+its reference in `expected` and a `label` of 1 (says what the reference says)
+or 0. On the bag-of-words stand-in embeddings of `tests/test_similarity.py`:
+
+```console
+$ evalkit calibrate --scorer similarity.toml labels.jsonl
+labelled 24  scored 24  labelled 1: 12  cosines 0.0000 to 1.0000
+best threshold 0.7898: Cohen's kappa 1.000  agreement 100.0%  precision 100.0%  recall 100.0%
+cross-validated (5 folds): kappa 1.000  agreement 100.0%
+...
+set threshold = 0.7898 in the scorer to gate on it
+```
+
+The cross-validated kappa scores each fold at the threshold chosen on the
+others, so it is the one to trust; on few labels the in-sample kappa flatters
+the fitted threshold.
+
 `evalkit report rag RUN` then says why each failing case failed. A case fails
 when a gated metric is below `--threshold` (0.5 by default, `NAME=VALUE` for
 one metric), and its cause is the first stage that failed: a retrieval metric
@@ -688,6 +721,7 @@ different judge it would refuse (exit 3) unless `--allow-judge-change` is given.
 | `evalkit report rag RUN [--threshold [NAME=]V]... [--limit N]` | Each failing case of a RAG run attributed to a retrieval miss, an unsupported answer or ignored context. |
 | `evalkit estimate CONFIG` | Cost estimate from token counts (per variant for a matrix). |
 | `evalkit calibrate --judge J LABELS` | Judge agreement with human labels. |
+| `evalkit calibrate --scorer S LABELS [--folds 5]` | The `semantic_similarity` threshold that agrees best with 0/1 labels, with a cross-validated kappa. |
 | `evalkit dataset import/export/list` | Manage datasets. |
 | `evalkit prompt push NAME FILE [--system FILE] [--note N]` | Store a prompt file (TOML with `system` and `template`, or a template file) as a new version; unchanged content is a no-op. |
 | `evalkit prompt show REF`, `evalkit prompt list` | A version's content and labels; every prompt with its newest version and labels. |
@@ -696,7 +730,7 @@ different judge it would refuse (exit 3) unless `--allow-judge-change` is given.
 | `evalkit tools check SANDBOX` | Validate a tool sandbox and its fixtures; print its identity. |
 | `evalkit tools record SANDBOX CALLS [-o FILE] [--refresh]` | Record the tools' real answers to a JSONL list of calls as fixtures; exit 3 if any call failed. |
 | `evalkit agent conformance ENDPOINT --sandbox FILE [--task T]... [--max-steps N] [--strict]` | Probe an agent on the session protocol; exit 1 if a check fails (or warns, with `--strict`). |
-| `evalkit cache sweep [--max-age 30d] [--max-size 20GiB] [--dry-run]` | Delete old and least recently used cache entries, then unreferenced blobs. |
+| `evalkit cache sweep [--max-age 30d] [--max-size 20GiB] [--dry-run]` | Delete old and least recently used cache entries (and, by age, cached embeddings), then unreferenced blobs. |
 | `evalkit cache scrub` | Read every blob and check it against its digest; exit 3 if any is corrupt. |
 | `evalkit serve`, `evalkit db upgrade` | Run the API; migrate PostgreSQL. |
 
@@ -843,7 +877,7 @@ src/evalkit/simuser.py     simulated users: scripted, or played by a model in JS
 src/evalkit/conformance.py `evalkit agent conformance`: session protocol checks for agents
 src/evalkit/tools/         the tool sandbox: schemas, scripted and recorded answers, limits,
                            latency and failure injection; recording fixtures; the tool loop
-src/evalkit/scorers/       built-in, ranking, trajectory, faithfulness and RAG scorers, plugin registry, LLM judges, calibration
+src/evalkit/scorers/       built-in, ranking, trajectory, faithfulness, RAG and similarity scorers, plugin registry, LLM judges, calibration
 src/evalkit/rag_report.py  `evalkit report rag`: failing cases attributed to retrieval, grounding or the answer
 src/evalkit/providers/     the Provider protocol and error kinds; the Claude client (caching,
                            structured output, fallback, cost); raw HTTP OpenAI-compatible
@@ -855,6 +889,7 @@ src/evalkit/matrix.py      [matrix] configs expanded into grouped child runs
 src/evalkit/frontier.py    cost/quality/latency Pareto frontier and paired steps along it
 src/evalkit/prompts.py     prompt registry: content-hashed versions, compare-and-set labels
 src/evalkit/cache.py       response cache: keys, last use, sweep by age and size, blob offload
+src/evalkit/embeddings.py  embeddings: cross-case batching, in-flight sharing, float32 cache table
 src/evalkit/blobs.py       content-addressed blobs: filesystem and S3 backends, signing, GC
 src/evalkit/leases.py      case leases: SKIP LOCKED claims and fenced result writes
 src/evalkit/runqueue.py    the run queue: states, priorities, worker slots and caps, cancel

@@ -17,6 +17,9 @@ import regex
 from jsonschema.exceptions import SchemaError
 from pydantic import BaseModel, ConfigDict, Field, JsonValue, model_validator
 
+from evalkit.embeddings import DEFAULT_BATCH as DEFAULT_EMBED_BATCH
+from evalkit.embeddings import MAX_BATCH as MAX_EMBED_BATCH
+from evalkit.embeddings import Embedder
 from evalkit.errors import InvalidInputError
 from evalkit.pricing import PriceBook
 from evalkit.providers.anthropic import ClaudeClient
@@ -39,6 +42,7 @@ from evalkit.scorers.rag import (
 from evalkit.scorers.ranking import METRICS as RANKING_METRICS
 from evalkit.scorers.ranking import Metric as RankingMetricName
 from evalkit.scorers.ranking import RankingMetric, default_name
+from evalkit.scorers.similarity import SemanticSimilarity
 from evalkit.scorers.trajectory import (
     MAX_EXPECTED_CALLS,
     ForbiddenTools,
@@ -239,6 +243,20 @@ class NoiseSensitivitySpec(_RagSpec):
     reference_key: str | None = Field(default="answer", min_length=1, max_length=200)
 
 
+class SemanticSimilaritySpec(_Spec):
+    """Cosine similarity of the answer and the reference under an embedding model
+    (``evalkit.scorers.similarity``); pass/fail at ``threshold`` when one is set."""
+
+    type: Literal["semantic_similarity"]
+    # Claude has no embeddings endpoint, so the default is OpenAI's.
+    provider: str = Field(default="openai", pattern=PROVIDER_NAME)
+    model: str = Field(default="text-embedding-3-small", min_length=1, max_length=64)
+    threshold: float | None = Field(default=None, ge=-1, le=1)
+    expected_key: str | None = Field(default=None, min_length=1, max_length=200)
+    # Texts per embeddings request, shared across the run's cases.
+    batch_size: int = Field(default=DEFAULT_EMBED_BATCH, ge=1, le=MAX_EMBED_BATCH)
+
+
 class PluginSpec(_Spec):
     type: Literal["plugin"]
     entry: str = Field(min_length=1, max_length=200)
@@ -263,6 +281,7 @@ ScorerSpec = Annotated[
     | ContextRecallSpec
     | AnswerCompletenessSpec
     | NoiseSensitivitySpec
+    | SemanticSimilaritySpec
     | PluginSpec,
     Field(discriminator="type"),
 ]
@@ -360,6 +379,8 @@ def _build(spec: ScorerSpec, *, allow_import_paths: bool, providers: ProviderReg
                     min_grade=spec.min_grade,
                     gain=spec.gain,
                 )
+            case SemanticSimilaritySpec():
+                return similarity_from_spec(spec, providers, name)
             case PluginSpec():
                 return _load_plugin(spec, name, allow_import_paths=allow_import_paths)
     except SchemaError as exc:
@@ -464,6 +485,21 @@ def rag_judge_from_spec(spec: AnyRagSpec, providers: ProviderRegistry, name: str
         case AnswerCompletenessSpec():
             return AnswerCompletenessJudge(name, reference_key=spec.reference_key, **common)
     return NoiseSensitivityJudge(name, reference_key=spec.reference_key, **common)
+
+
+def similarity_from_spec(
+    spec: SemanticSimilaritySpec, providers: ProviderRegistry, name: str = ""
+) -> SemanticSimilarity:
+    name = name or spec.resolved_name()
+    try:
+        client = providers.get(spec.provider)
+        endpoint = providers.endpoint(spec.provider)
+    except InvalidInputError as exc:
+        raise InvalidInputError(f"scorer {name}: {exc.message}") from None
+    embedder = Embedder(client, spec.model, endpoint=endpoint, batch_size=spec.batch_size)
+    return SemanticSimilarity(
+        name, embedder=embedder, threshold=spec.threshold, expected_key=spec.expected_key
+    )
 
 
 def _load_plugin(spec: PluginSpec, name: str, *, allow_import_paths: bool) -> Scorer:

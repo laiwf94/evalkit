@@ -48,6 +48,7 @@ from evalkit.datasets import (
 )
 from evalkit.db import make_engine, make_session_factory, upgrade
 from evalkit.db.models import Matrix, Run, utcnow
+from evalkit.embeddings import EmbeddingStore
 from evalkit.errors import ConflictError, EvalkitError, NotFoundError, PreconditionError
 from evalkit.estimate import MatrixEstimate, estimate, estimate_matrix
 from evalkit.frontier import MatrixReport, matrix_report
@@ -70,8 +71,22 @@ from evalkit.rag_report import RagReport, format_rag, parse_thresholds, rag_repo
 from evalkit.report import CompareReport, RunSummary, compare_runs, summarize
 from evalkit.runner import Runner
 from evalkit.runspec import RunConfig
-from evalkit.scorers.calibration import calibrate, parse_labels, save_calibration
-from evalkit.scorers.registry import AnyJudgeSpec, judge_from_spec
+from evalkit.scorers.calibration import (
+    DEFAULT_FOLDS,
+    ThresholdReport,
+    calibrate,
+    calibrate_threshold,
+    parse_labels,
+    save_calibration,
+    save_threshold,
+)
+from evalkit.scorers.registry import (
+    AnyJudgeSpec,
+    SemanticSimilaritySpec,
+    judge_from_spec,
+    similarity_from_spec,
+)
+from evalkit.targets.base import TargetError
 from evalkit.targets.http import HttpTarget
 from evalkit.targets.specs import HttpTargetSpec
 from evalkit.tools.sandbox import (
@@ -89,6 +104,7 @@ VERIFY = "verify"
 EXIT_OK, EXIT_REGRESSION, EXIT_INPUT, EXIT_UNUSABLE, EXIT_INTERRUPTED = 0, 1, 2, 3, 130
 MAX_CONFIG_BYTES = 1024 * 1024
 JUDGE_SPEC: TypeAdapter[AnyJudgeSpec] = TypeAdapter(AnyJudgeSpec)
+SIMILARITY_SPEC: TypeAdapter[SemanticSimilaritySpec] = TypeAdapter(SemanticSimilaritySpec)
 
 
 class CliError(Exception):
@@ -406,6 +422,12 @@ def _format_maintenance(done: cache.Maintenance) -> str:
         f"cache: {verb} {s.removed:,} entries ({_bytes(s.removed_bytes)}), "
         f"{s.kept:,} left ({_bytes(s.kept_bytes)})"
     ]
+    if done.embeddings is not None and (done.embeddings.removed or done.embeddings.kept):
+        e = done.embeddings
+        lines.append(
+            f"embeddings: {verb} {e.removed:,} ({_bytes(e.removed_bytes)}), "
+            f"{e.kept:,} left ({_bytes(e.kept_bytes)})"
+        )
     if done.blobs is not None:
         b = done.blobs
         lines.append(
@@ -488,6 +510,8 @@ async def cmd_estimate(args: argparse.Namespace, app: App) -> int:
 
 
 async def cmd_calibrate(args: argparse.Namespace, app: App) -> int:
+    if args.scorer is not None:
+        return await _calibrate_threshold(args, app)
     raw = _read_toml(Path(args.judge))
     table = raw.get("judge")
     if not isinstance(table, dict):
@@ -502,6 +526,31 @@ async def cmd_calibrate(args: argparse.Namespace, app: App) -> int:
     with app.sessions() as session:
         save_calibration(session, judge, report)
     _emit(app.out, report, args.json, _format_calibration)
+    return EXIT_OK
+
+
+async def _calibrate_threshold(args: argparse.Namespace, app: App) -> int:
+    """``evalkit calibrate --scorer``: the semantic_similarity threshold that agrees
+    best with 0/1 labels. Vectors go through the embedding cache, so a rerun on
+    the same file is free."""
+    raw = _read_toml(Path(args.scorer))
+    table = raw.get("scorer")
+    if not isinstance(table, dict):
+        raise CliError(f"{args.scorer} has no [scorer] table", EXIT_INPUT)
+    try:
+        spec = SIMILARITY_SPEC.validate_python({"type": "semantic_similarity", **table})
+    except ValidationError as exc:
+        raise CliError(f"{args.scorer}: {_describe(exc)}", EXIT_INPUT) from None
+    scorer = similarity_from_spec(spec, app.providers())
+    scorer.embedder.store = EmbeddingStore(app.sessions)
+    items = parse_labels(_read_bytes(Path(args.labels)), "binary")
+    try:
+        report = await calibrate_threshold(scorer, items, folds=args.folds)
+    except TargetError as exc:
+        raise CliError(f"embedding call failed: {exc.message}", EXIT_UNUSABLE) from None
+    with app.sessions() as session:
+        save_threshold(session, scorer, report)
+    _emit(app.out, report, args.json, _format_threshold)
     return EXIT_OK
 
 
@@ -793,9 +842,20 @@ def build_parser() -> argparse.ArgumentParser:
     est.set_defaults(handler=cmd_estimate)
 
     cal = with_json(sub.add_parser("calibrate", help="measure judge agreement with human labels"))
-    cal.add_argument("--judge", required=True, help="TOML file with a [judge] table")
+    what = cal.add_mutually_exclusive_group(required=True)
+    what.add_argument("--judge", help="TOML file with a [judge] table")
+    what.add_argument(
+        "--scorer",
+        help="TOML file with a [scorer] table (semantic_similarity): sweep its threshold",
+    )
     cal.add_argument("labels", help="JSONL file of labelled outputs")
     cal.add_argument("--concurrency", type=int, default=8)
+    cal.add_argument(
+        "--folds",
+        type=int,
+        default=DEFAULT_FOLDS,
+        help="cross-validation folds for a threshold sweep (0 for none)",
+    )
     cal.set_defaults(handler=cmd_calibrate)
 
     _add_prompt_commands(sub)
@@ -1083,7 +1143,12 @@ def _format_summary(s: RunSummary) -> str:
         )
     for name, j in s.judges.items():
         where = j["provider"] if j.get("endpoint") is None else f"{j['provider']} ({j['endpoint']})"
-        lines.append(f"judge {name}: {j['model']} on {where}, {j['mode']}, effort {j['effort']}")
+        if j["mode"] == "semantic_similarity":
+            lines.append(f"embeddings {name}: {j['model']} on {where}")
+        else:
+            lines.append(
+                f"judge {name}: {j['model']} on {where}, {j['mode']}, effort {j['effort']}"
+            )
     for provider, entry in sorted((s.prices or {}).items()):
         models = "; ".join(
             f"{m} in {p['input']:g} out {p['output']:g}" for m, p in sorted(entry["models"].items())
@@ -1278,6 +1343,39 @@ def _format_calibration(r: Any) -> str:
     if r.disagreements:
         lines.append(f"\ndisagreements: {', '.join(r.disagreements)}")
     lines.append(f"cost ${r.cost_usd:.4f}")
+    return "\n".join(lines) + "\n"
+
+
+def _format_threshold(r: ThresholdReport) -> str:
+    best = r.best
+    lines = [
+        f"labelled {r.n}  scored {r.scored}  labelled 1: {r.positives}  "
+        f"cosines {r.min_cosine:.4f} to {r.max_cosine:.4f}",
+        f"best threshold {best.threshold:.4f}: Cohen's kappa {best.kappa:.3f}  "
+        f"agreement {_pct(best.agreement)}  precision {_pct(best.precision)}  "
+        f"recall {_pct(best.recall)}",
+    ]
+    if r.cv_kappa is not None:
+        lines.append(
+            f"cross-validated ({r.folds} folds): kappa {r.cv_kappa:.3f}  "
+            f"agreement {_pct(r.cv_agreement)}"
+        )
+    else:
+        lines.append("cross-validated: too few items (two per fold needed)")
+    lines += ["", f"{'threshold':>9}{'kappa':>8}{'agree':>8}{'precision':>11}{'recall':>8}"]
+    for p in r.sweep:
+        lines.append(
+            f"{p.threshold:>9.2f}{p.kappa:>8.3f}{_pct(p.agreement):>8}"
+            f"{_pct(p.precision):>11}{_pct(p.recall):>8}"
+        )
+    (tn, fp), (fn, tp) = best.confusion
+    lines.append(
+        f"\nat {best.threshold:.4f}: label 0 -> fail {tn} pass {fp}; label 1 -> fail {fn} pass {tp}"
+    )
+    if r.disagreements:
+        lines.append(f"disagreements: {', '.join(r.disagreements)}")
+    lines.append(f"cost ${r.cost_usd:.4f}")
+    lines.append(f"set threshold = {best.threshold:.4f} in the scorer to gate on it")
     return "\n".join(lines) + "\n"
 
 

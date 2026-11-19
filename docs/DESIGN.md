@@ -874,6 +874,7 @@ example, the case has no expected value), which is different from 0.
 | `context_recall` | Reference-answer claims the sources support / reference claims. |
 | `answer_completeness` | Reference-answer claims the answer states / reference claims. |
 | `noise_sensitivity` | 1 - claims that are wrong and taken from a source / claims. |
+| `semantic_similarity` | Cosine of the answer's and the reference's embeddings, clipped to [0, 1]; or 1 at or above `threshold`, else 0. |
 | `plugin` | Any `Scorer` subclass from an `evalkit.scorers` entry point. |
 
 A failed call scores 0 and an unscorable case is left out. If the target
@@ -1027,6 +1028,61 @@ Only gated metrics make a case fail, so a run can gate on the answer and keep
 retrieval and grounding metrics as ungated evidence. The report reads the
 result rows once with `yield_per` and holds the counts and the first `--limit`
 failing cases by id, so its memory does not grow with the run.
+
+### Embeddings and semantic similarity
+
+`evalkit.embeddings.Embedder` is one embedding model on one provider, shared
+by every case of a run. A case's texts first claim their keys in an in-flight
+table, then are looked up in the cache; texts that miss join a queue that is
+sent when it holds `batch_size` texts or 5 ms after its first text arrived, at
+most four requests at once, under the provider's `embed` limiter and the
+run's retry policy. Claiming before the lookup matters: cases that end
+together often share a reference answer, and a case that arrives while
+another is still reading the cache must wait for that one rather than pay for
+the same text. A waiter whose request was cancelled with another case sends
+its own, as retrieval does. A batch's tokens are split among its texts in
+proportion to their length by largest remainder, so the shares are whole and
+add up to what the provider billed; a text served from the cache or from
+another case's request costs nothing.
+
+Vectors are stored in `embedding_cache` as little-endian float32 bytes with
+their dimension count, keyed by SHA-256 over the embedder's identity
+(provider, endpoint, model) and the text, cut at 20,000 characters. Float32 is
+what the providers compute in; it is 6 KiB for a 1,536-dimension vector,
+against about 30 KiB as JSON, and reads back without parsing. A fresh vector
+is rounded to float32 before it is used, so a rerun from the cache scores bit
+for bit like the run that paid for it; cosines are then computed in float64.
+A row whose bytes do not match its dimensions is deleted and fetched again,
+and a cache that cannot be read or written only costs a request. Vectors are
+small and shared across runs, so the sweep bounds them by age alone
+(`--max-age`), not by the response cache's size budget.
+
+`semantic_similarity` records an identity like a judge's: mode
+`semantic_similarity`, the embedder's provider, endpoint and model, and as its
+rubric the threshold and the reference key. The gate therefore refuses to pair
+runs scored by different models or thresholds, and the run's price record
+includes the embedding model. `evalkit estimate` does not count embedding
+tokens; at $0.02 per million they are a rounding error next to a judge.
+
+A raw cosine is a poor gate: most models put unrelated texts at 0.6 or more,
+so a mean of cosines barely moves when answers go wrong, and what counts as
+close enough differs by model. `evalkit calibrate --scorer` therefore fits the
+threshold to 0/1 labels (`calibrate_threshold`). Only thresholds between two
+neighbouring distinct cosines change a verdict, so it sorts the cosines once
+and walks them with running true and false positive counts: one candidate
+above the highest cosine and one per distinct value, each placed at the
+midpoint down to the next value so that new texts near the boundary are not
+decided by a hair. That is O(n log n), 8 ms for the 5,000-item limit, and a
+property test checks it against brute force over every threshold. The best
+candidate has the highest Cohen's kappa (not accuracy: with 90% positives,
+passing everything is 90% accurate and has kappa 0), then the highest
+agreement, then the strictest threshold. Fitting a threshold to the labels it
+is measured on flatters it, so the report adds a k-fold cross-validated kappa
+(5 folds by default; folds from a hash of each id, so the file's order does
+not matter): every fold is judged at the threshold chosen on the others, and
+the pooled verdicts give the kappa. The stored calibration is keyed by the
+embedder's fingerprint and keeps the threshold, the confusion matrix and the
+cross-validated kappa.
 
 ## The judge
 

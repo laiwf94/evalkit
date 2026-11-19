@@ -420,3 +420,22 @@ class PromptLabel(Base):
     label: Mapped[str] = mapped_column(String(64), primary_key=True)
     version: Mapped[int] = mapped_column(Integer)
     updated_at: Mapped[datetime] = mapped_column(default=utcnow)
+
+
+class CachedEmbedding(Base):
+    """One cached embedding: the vector as little-endian float32, ``dims`` values.
+
+    The key is SHA-256 over the embedder's fingerprint (provider, endpoint,
+    model) and the text, so two models never share a vector. Float32 is what
+    the providers compute in and halves the bytes of a float64 array (a
+    1,536-dimension vector is 6 KiB; as JSON it is about 30 KiB)."""
+
+    __tablename__ = "embedding_cache"
+    __table_args__ = (Index("ix_embedding_cache_last_used", "last_used_at", "key"),)
+
+    key: Mapped[str] = mapped_column(String(64), primary_key=True)
+    embedder_hash: Mapped[str] = mapped_column(String(64), index=True)
+    dims: Mapped[int] = mapped_column(Integer)
+    vector: Mapped[bytes] = mapped_column(LargeBinary)
+    created_at: Mapped[datetime] = mapped_column(default=utcnow)
+    last_used_at: Mapped[datetime] = mapped_column(default=utcnow)

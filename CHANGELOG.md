@@ -227,3 +227,22 @@ week 2 (#23), and agents and conversations from week 3 (#24).
   metric with `NAME=VALUE`) on a gated metric; ungated metrics are evidence.
   The report streams the results once and keeps only counts and the first
   `--limit` failing cases.
+- **Embeddings and semantic similarity.** `evalkit.embeddings` embeds texts on
+  any provider with an embeddings endpoint (OpenAI-compatible servers and
+  Gemini): texts from every case of a run share requests of up to `batch_size`
+  (64 by default), a text already on its way is awaited rather than sent
+  again, and vectors are kept as little-endian float32 in a new
+  `embedding_cache` table keyed by the provider, endpoint, model and text, so
+  a rerun pays nothing and scores bit for bit the same. Each case is charged
+  its share of a batch's tokens and cost, by text length. `evalkit cache sweep
+  --max-age` (and workers with `EVALKIT_CACHE_MAX_AGE`) also removes vectors
+  unused for longer. The `semantic_similarity` scorer compares the answer
+  with the reference text: the cosine clipped to [0, 1], or 1/0 at a
+  `threshold`. Its provider, endpoint, model and threshold are recorded with
+  the run like a judge's identity, so the gate refuses to compare runs scored
+  differently. `evalkit calibrate --scorer FILE LABELS` sweeps every threshold
+  that changes a verdict against 0/1 labels in one pass over the sorted
+  cosines (8 ms for 5,000 labelled items), reports the one with the highest
+  Cohen's kappa with its agreement, precision and recall, a 5-fold
+  cross-validated kappa (each fold judged at the threshold chosen on the
+  others) and a table of thresholds, and stores the result as a calibration.

@@ -62,6 +62,7 @@ from evalkit.db.models import (
     as_utc,
     utcnow,
 )
+from evalkit.embeddings import EmbeddingStore
 from evalkit.errors import (
     ConflictError,
     EvalkitError,
@@ -87,6 +88,7 @@ from evalkit.redaction import Redactor
 from evalkit.runspec import CaseFilter, RunConfig, RunOptions
 from evalkit.scorers import Scorer, ScoreResult, ScorerSpec, build_scorers
 from evalkit.scorers.judge import LLMJudge, identity_changes
+from evalkit.scorers.similarity import SemanticSimilarity
 from evalkit.scorers.trajectory import TrajectoryJudge
 from evalkit.simuser import LLMSimulator
 from evalkit.targets import Generation, Step, Target, TargetError, TargetSpec, Turn, Usage
@@ -104,6 +106,9 @@ from evalkit.targets.specs import (
     PromptTargetSpec,
     RetrievalTargetSpec,
 )
+
+# Scorers that record an identity with the run and are priced like a judge.
+Identified = (LLMJudge, SemanticSimilarity)
 
 log = logging.getLogger(__name__)
 
@@ -438,10 +443,12 @@ class Runner:
         )
         # What each judge is, frozen with the run: the gate refuses to pair runs whose
         # judges differ, and a later change to a provider's config cannot rewrite this.
-        judges = {s.name: s.identity() for s in scorers if isinstance(s, LLMJudge)}
+        judges = {s.name: s.identity() for s in scorers if isinstance(s, Identified)}
         target = config.target
         target_id = identity(target, self.settings.http_endpoints, self.providers.configs)
-        uses = [(s.provider, s.client.prices, s.model) for s in scorers if isinstance(s, LLMJudge)]
+        uses = [
+            (s.provider, s.client.prices, s.model) for s in scorers if isinstance(s, Identified)
+        ]
         if isinstance(target, PromptTargetSpec | AgentTargetSpec):
             # An unknown model would run with no cost accounting: refuse it before
             # recording the run, with the prices the target's provider will use.
@@ -786,9 +793,13 @@ class Runner:
             for scorer in scorers:
                 if isinstance(scorer, LLMJudge):
                     scorer.cache = cache.VerdictStore(self.sessions)
+                if isinstance(scorer, SemanticSimilarity):
+                    scorer.embedder.store = EmbeddingStore(self.sessions)
         for scorer in scorers:
             if isinstance(scorer, LLMJudge):
                 scorer.limiter = self._limiter(f"{scorer.provider}:judge", RateLimit())
+            if isinstance(scorer, SemanticSimilarity):
+                scorer.embedder.limiter = self._limiter(f"{scorer.provider}:embed", RateLimit())
             if isinstance(scorer, TrajectoryJudge):
                 # Tool arguments and results are not redacted in the trajectory;
                 # the judge's prompt is, before it leaves the process.
@@ -1450,7 +1461,7 @@ def _check_judges(run: Run, scorers: Sequence[Scorer]) -> None:
     if run.judges is None:
         return  # created before judge identities were recorded
     for scorer in scorers:
-        if not isinstance(scorer, LLMJudge):
+        if not isinstance(scorer, Identified):
             continue
         changes = identity_changes(run.judges.get(scorer.name), scorer.identity())
         if changes:
@@ -1465,7 +1476,7 @@ def _check_prices(run: Run, target: Target, scorers: Sequence[Scorer]) -> None:
     worker with another price list would cost part of the run differently."""
     if run.prices is None:
         return  # created before prices were recorded
-    uses = [(s.provider, s.client.prices, s.model) for s in scorers if isinstance(s, LLMJudge)]
+    uses = [(s.provider, s.client.prices, s.model) for s in scorers if isinstance(s, Identified)]
     if isinstance(target, PromptTarget):
         uses.append((target.provider, target.client.prices, target.spec.model))
     if isinstance(target, AgentTarget):
