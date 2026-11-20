@@ -45,7 +45,7 @@ from evalkit.redaction import Redactor
 from evalkit.targets.base import Generation, Target, TargetError, Usage
 from evalkit.targets.conversation import TurnStore, call_limited
 from evalkit.targets.http import HttpEndpoint, HttpTarget, Resolver, system_resolver
-from evalkit.targets.specs import HttpTargetSpec, RetrievalTargetSpec
+from evalkit.targets.specs import HttpTargetSpec, RetrieverSpec
 
 MAX_GRADE = 10
 MAX_LABELS = 10_000
@@ -142,7 +142,7 @@ class RetrievalTarget(Target):
 
     def __init__(
         self,
-        spec: RetrievalTargetSpec,
+        spec: RetrieverSpec,
         endpoint: HttpEndpoint,
         *,
         resolver: Resolver = system_resolver,
@@ -160,7 +160,7 @@ class RetrievalTarget(Target):
         self.retriever_hash = sha256_hex(
             canonical_json(
                 {
-                    "retriever": spec.model_dump(mode="json", exclude={"type"}),
+                    "retriever": spec.retriever_part(),
                     "endpoint": endpoint.fingerprint(),
                 }
             )

@@ -170,6 +170,7 @@ class _RagJudge(_SourcesJudge):
             raise ValueError("contexts_from must be case or output")
         super().__init__(name, **kwargs)
         self.contexts_from = contexts_from
+        self.reads_ranking = contexts_from == "output"
         self.reference_key = reference_key
 
     def spec(self) -> dict[str, Any]:

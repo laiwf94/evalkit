@@ -23,6 +23,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import hmac
+import json
 import logging
 import re
 import time
@@ -56,7 +57,16 @@ from evalkit.datasets import (
     validate_name,
 )
 from evalkit.db import make_engine, make_session_factory, upgrade
-from evalkit.db.models import Dataset, Result, ResultStep, ResultTurn, Run, as_utc, utcnow
+from evalkit.db.models import (
+    Dataset,
+    Result,
+    ResultStage,
+    ResultStep,
+    ResultTurn,
+    Run,
+    as_utc,
+    utcnow,
+)
 from evalkit.errors import EvalkitError, InvalidInputError, NotFoundError
 from evalkit.frontier import matrix_report
 from evalkit.logs import configure_logging, log_context, scrubber
@@ -473,7 +483,8 @@ async def get_results(
 @router.get("/runs/{run_id}/results/{case_id:path}/trajectory")
 async def get_trajectory(run_id: str, case_id: str, svc: Svc) -> dict[str, Any]:
     """One case's whole trajectory: an agent's model replies and tool calls
-    (``steps``), or a conversation's generated turns (``turns``), in order."""
+    (``steps``), a conversation's generated turns (``turns``), or a pipeline's
+    retrieval and generation (``stages``), in order."""
 
     def load(session: Session) -> dict[str, Any]:
         if session.get(Run, run_id) is None:
@@ -493,11 +504,17 @@ async def get_trajectory(run_id: str, case_id: str, svc: Svc) -> dict[str, Any]:
             .where(ResultTurn.run_id == run_id, ResultTurn.case_id == case_id)
             .order_by(ResultTurn.turn)
         )
+        stages = session.scalars(
+            select(ResultStage)
+            .where(ResultStage.run_id == run_id, ResultStage.case_id == case_id)
+            .order_by(ResultStage.position)
+        )
         return {
             "run_id": run_id,
             **_result_json(result),
             "steps": [_step_json(s) for s in steps],
             "turns": [_turn_json(t) for t in turns],
+            "stages": [_stage_json(s) for s in stages],
         }
 
     return await _in_session(svc, load)
@@ -603,7 +620,7 @@ def _result_json(r: Result) -> dict[str, Any]:
     }
 
 
-def _usage_json(row: ResultStep | ResultTurn) -> dict[str, Any]:
+def _usage_json(row: ResultStep | ResultTurn | ResultStage) -> dict[str, Any]:
     return {
         "input_tokens": row.input_tokens,
         "output_tokens": row.output_tokens,
@@ -627,6 +644,16 @@ def _step_json(s: ResultStep) -> dict[str, Any]:
             "error": s.error,
             "source": s.source,
         }
+    return {**out, "cached": s.cached, "latency_ms": s.latency_ms, **_usage_json(s)}
+
+
+def _stage_json(s: ResultStage) -> dict[str, Any]:
+    out: dict[str, Any] = {"stage": s.stage}
+    if s.stage == "retrieval":
+        # The ranking is stored as JSON; return it as JSON, not as a string.
+        out["ranking"] = json.loads(s.output)
+    else:
+        out |= {"output": s.output, "stop_reason": s.stop_reason}
     return {**out, "cached": s.cached, "latency_ms": s.latency_ms, **_usage_json(s)}
 
 

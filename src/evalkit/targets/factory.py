@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from evalkit.errors import InvalidInputError
 from evalkit.simuser import Simulator, build_simulator
@@ -13,6 +13,7 @@ from evalkit.targets.conversation import ConversationTarget
 from evalkit.targets.fake import FakeTarget
 from evalkit.targets.http import HttpEndpoint, HttpTarget
 from evalkit.targets.http_agent import HttpAgentTarget
+from evalkit.targets.pipeline import PipelineTarget
 from evalkit.targets.prompt import PromptTarget
 from evalkit.targets.retrieval import RetrievalTarget
 from evalkit.targets.specs import (
@@ -24,8 +25,10 @@ from evalkit.targets.specs import (
     HttpAgentTargetSpec,
     HttpTargetSpec,
     LLMSimulatorSpec,
+    PipelineTargetSpec,
     PromptTargetSpec,
     RetrievalTargetSpec,
+    RetrieverSpec,
     SimulatorSpec,
     target_hash,
 )
@@ -37,7 +40,7 @@ AnySpec = AnyTargetSpec
 
 
 def resolve_endpoint(
-    spec: HttpTargetSpec | HttpAgentTargetSpec | RetrievalTargetSpec,
+    spec: HttpTargetSpec | HttpAgentTargetSpec | RetrieverSpec,
     endpoints: Mapping[str, HttpEndpoint],
 ) -> HttpEndpoint:
     endpoint = endpoints.get(spec.endpoint)
@@ -55,7 +58,7 @@ def identity(
     """The target hash, including the resolved endpoint for HTTP targets and,
     for a prompt or agent target on a provider other than Claude, where that
     provider is. An HTTP agent's includes its endpoint and where its simulated
-    user is."""
+    user is, and a pipeline's its retriever's endpoint and its model's provider."""
     if isinstance(spec, HttpTargetSpec | RetrievalTargetSpec):
         return target_hash(spec, resolve_endpoint(spec, endpoints).fingerprint())
     if isinstance(spec, HttpAgentTargetSpec):
@@ -66,6 +69,8 @@ def identity(
                 "simulator": simulator_endpoint(spec.simulator, providers),
             },
         )
+    if isinstance(spec, PipelineTargetSpec):
+        return target_hash(spec, pipeline_endpoints(spec, endpoints, providers))
     if isinstance(spec, PromptTargetSpec | AgentTargetSpec) and spec.provider != ANTHROPIC:
         return target_hash(spec, provider_endpoint(spec.provider, providers))
     if isinstance(spec, ConversationTargetSpec):
@@ -82,6 +87,18 @@ def provider_endpoint(name: str, providers: Mapping[str, ProviderConfig] | None)
         known = ", ".join(sorted([ANTHROPIC, *(providers or {})]))
         raise InvalidInputError(f"unknown provider {name!r}; configured: {known}")
     return config.endpoint
+
+
+def pipeline_endpoints(
+    spec: PipelineTargetSpec,
+    endpoints: Mapping[str, HttpEndpoint],
+    providers: Mapping[str, ProviderConfig] | None,
+) -> dict[str, Any]:
+    """Where a pipeline's retriever and its model send their requests."""
+    return {
+        "retrieval": resolve_endpoint(spec.retrieval, endpoints).fingerprint(),
+        "generation": provider_endpoint(spec.generation.provider, providers),
+    }
 
 
 def conversation_endpoints(
@@ -121,6 +138,14 @@ def build_target(
             return HttpTarget(spec, resolve_endpoint(spec, endpoints))
         case RetrievalTargetSpec():
             return RetrievalTarget(spec, resolve_endpoint(spec, endpoints))
+        case PipelineTargetSpec():
+            generation = spec.generation.provider
+            return PipelineTarget(
+                spec,
+                resolve_endpoint(spec.retrieval, endpoints),
+                providers.get(generation),
+                provider_endpoint=provider_endpoint(generation, providers.configs),
+            )
         case FakeTargetSpec():
             return FakeTarget(spec)
         case AgentTargetSpec():

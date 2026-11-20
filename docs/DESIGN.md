@@ -42,6 +42,9 @@ result_steps    (run_id, case_id, step) key; one step of an agent case's traject
                 a model reply (redacted text, stop reason) or a tool call (tool,
                 call id, arguments, sandbox status, result or error, source),
                 cached, latency, tokens and cost
+result_stages   (run_id, case_id, position) key; one stage of a pipeline case:
+                the retrieval (its ranking as JSON) or the generation (the redacted
+                answer, stop reason), cached, latency, tokens and cost
 run_aggregates  (run_id, shard) key; counts, token and cost sums of the results
                 written by one process (the shard)
 run_metric_aggregates  (run_id, shard, metric) key; n, sum, sum of squares, unscorable
@@ -950,6 +953,49 @@ by the placeholder and the ranking is not cached. Identical queries in flight
 at once share one request: the first caller sends it and the others await it.
 A waiter whose own case is cancelled leaves the request running; if the
 sender's case is cancelled, the waiters send their own.
+
+### Retrieval then generation
+
+A pipeline target (`evalkit.targets.pipeline`) is a retrieval target and a
+prompt joined in one case, so a RAG application can be evaluated end to end
+without standing up its own service. The retrieval stage is a
+`RetrievalTarget` built from the pipeline's `retrieval` table, which is the
+same `RetrieverSpec` a retrieval target uses: the same protections, the same
+in-flight sharing and the same cache entries, so a retrieval run and a
+pipeline over the same retriever pay for each query once between them. The
+top `contexts` documents (all `k` by default) fill the template's
+`{{ contexts }}` as numbered blocks (`[1] kb-2` and the text), the numbering
+`citation_accuracy` reads; the template may also name `{{ query }}` and
+`{{ filters }}`, and must name `{{ contexts }}`, since a generator that never
+sees the documents is not a RAG pipeline.
+
+The generation stage is cached on its own, under a key of the generator
+(provider, model, system, template and the other settings, and where the
+provider is) and the prompt it was sent. The prompt holds the documents, so a
+retriever change re-pays only for the queries whose top documents moved; in
+`tests/test_pipeline.py` a regressed retriever that changes the top two
+documents of 20 queries in 30 costs 20 answers, not 30. The case-level response
+cache is not used (`caches_cases = False`): a cached case would come back
+without its stages, and the stages are what the scorers read. Each stage waits
+on its own limiter (the retriever's endpoint, the model's provider) and only
+when the cache cannot answer it, so a fully cached rerun is not paced at all.
+
+Both stages are written as `result_stages` rows in the result's transaction,
+and the trajectory endpoint returns them as `stages`, the ranking as JSON. A
+case whose generation fails is an error with no stages, like an agent case
+whose loop fails. Scoring reads both: a scorer with `reads_ranking` set (the
+ranking metrics, and RAG judges with `contexts_from = "output"`) is given the
+retrieval stage, and every other scorer is given the answer with the case's
+input replaced by the query and the documents the model was given, under
+`contexts`. The grounding judges therefore check the answer against exactly
+the documents it was written from, not the whole ranking, and a gate between
+two pipelines reads retrieval and answer metrics from the same run.
+
+Unlike a prompt target on another provider, a pipeline is not re-identified
+when a worker executes it: its identity mixes the retriever's endpoint, which
+workers may tag with their own headers (and which is not checked for HTTP
+targets either), with the model's provider, so a mismatch could not be
+blamed on either. The model's price is checked as for every target.
 
 ### Faithfulness and citations
 

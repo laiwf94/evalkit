@@ -38,6 +38,11 @@ class Scorer(ABC):
     config as ``options``.
     """
 
+    #: Whether the output this scorer grades is a retriever's ranking. On a
+    #: pipeline target such a scorer is given the retrieval stage rather than
+    #: the answer (``evalkit.targets.pipeline``).
+    reads_ranking: bool = False
+
     def __init__(self, name: str, options: dict[str, Any] | None = None) -> None:
         self.name = name
         self.options = options or {}

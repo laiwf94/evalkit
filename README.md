@@ -477,6 +477,49 @@ request, and a gate between two retrievers works like any other: in
 queries in three fails on `recall_at_5` and `ndcg_at_5`, while `mrr` holds
 because another relevant document still comes first.
 
+### Retrieval then generation
+
+A `pipeline` target runs the retriever and then a model as one target, and
+stores both stages with each case: the ranking and the answer, each with its
+latency, cost and whether it came from the cache. The cases are retrieval
+cases, with a reference answer as well if the scorers need one:
+
+```json
+{"id": "q1", "input": "When was the tower built?", "expected": {"relevance": {"kb-2": 3}, "answer": "It was completed in 1889."}}
+```
+
+```toml
+[target]
+type = "pipeline"
+contexts = 3                # documents the model reads; all k by default
+
+[target.retrieval]          # as a retrieval target, without its type
+endpoint = "search"
+k = 10
+
+[target.generation]         # as a prompt target, without its type
+model = "claude-opus-5-5"
+system = "Answer from the numbered sources and cite them as [n]."
+template = "{{ contexts }}\n\nQuestion: {{ query }}"
+```
+
+`{{ contexts }}` is the top documents, numbered from 1 with their ids:
+
+```text
+[1] kb-2
+The Eiffel Tower was completed in 1889.
+```
+
+Ranking metrics (and RAG judges with `contexts_from = "output"`) grade the
+retrieval stage; every other scorer grades the answer, and the grounding
+judges read the documents the model was given as the case's `contexts`. So
+`ranking`, `faithfulness`, `citation_accuracy` and `answer_completeness` all
+go in one run, and a gate between two pipelines catches a retriever
+regression and a generator regression alike. The retrieval stage shares the
+retrieval cache with retrieval targets, and answers are cached by the prompt
+they were sent, so a new retriever only pays for answers whose documents
+changed. `GET /v1/runs/RUN/results/CASE/trajectory` returns both stages.
+
 ### Grounded answers
 
 Generation cases carry the sources the answer was written from under
@@ -871,7 +914,8 @@ and what would change at larger scale is in [docs/DESIGN.md](docs/DESIGN.md).
 
 ```text
 src/evalkit/datasets.py    JSONL parsing, content hashing, versioned storage
-src/evalkit/targets/       prompt, HTTP (SSRF-safe), retrieval, conversation, agent, HTTP agent
+src/evalkit/targets/       prompt, HTTP (SSRF-safe), retrieval, retrieval-then-generation pipeline,
+                           conversation, agent, HTTP agent
                            (session protocol, docs/agent-protocol.md) and fake targets; templates
 src/evalkit/simuser.py     simulated users: scripted, or played by a model in JSON
 src/evalkit/conformance.py `evalkit agent conformance`: session protocol checks for agents

@@ -141,6 +141,8 @@ class RankingMetric(Scorer):
     """One ranking metric per case. ``k`` defaults to 10, except for MRR, which
     looks at the whole ranking unless given one."""
 
+    reads_ranking = True
+
     def __init__(
         self,
         name: str,

@@ -69,7 +69,25 @@ class HttpTargetSpec(_Spec):
     response_field: str = Field(default="output", pattern=r"^[A-Za-z0-9_]+(\.[A-Za-z0-9_]+)*$")
 
 
-class RetrievalTargetSpec(_Spec):
+class RetrieverSpec(_Spec):
+    """A retriever behind an endpoint named in operator config: what to ask it
+    for and where its answer keeps the ranked documents. A retrieval target is
+    one of these on its own; a pipeline's ``retrieval`` stage is another, and
+    the two share retrieval cache entries when their settings match."""
+
+    endpoint: str = Field(pattern=r"^[a-z0-9][a-z0-9_-]{0,63}$")
+    k: int = Field(default=10, ge=1, le=1000)
+    results_field: str = Field(default="results", pattern=r"^[A-Za-z0-9_]+(\.[A-Za-z0-9_]+)*$")
+    id_field: str = Field(default="id", pattern=r"^[A-Za-z0-9_]{1,64}$")
+    score_field: str = Field(default="score", pattern=r"^[A-Za-z0-9_]{1,64}$")
+    text_field: str = Field(default="text", pattern=r"^[A-Za-z0-9_]{1,64}$")
+
+    def retriever_part(self) -> dict[str, Any]:
+        """The settings that decide the ranking for a query."""
+        return self.model_dump(mode="json", include=set(RetrieverSpec.model_fields))
+
+
+class RetrievalTargetSpec(RetrieverSpec):
     """A retriever behind an endpoint named in operator config.
 
     Each case's input is a query (a string, or ``{"query": ..., "filters": {...}}``);
@@ -80,12 +98,68 @@ class RetrievalTargetSpec(_Spec):
     against the case's graded relevance labels."""
 
     type: Literal["retrieval"]
-    endpoint: str = Field(pattern=r"^[a-z0-9][a-z0-9_-]{0,63}$")
-    k: int = Field(default=10, ge=1, le=1000)
-    results_field: str = Field(default="results", pattern=r"^[A-Za-z0-9_]+(\.[A-Za-z0-9_]+)*$")
-    id_field: str = Field(default="id", pattern=r"^[A-Za-z0-9_]{1,64}$")
-    score_field: str = Field(default="score", pattern=r"^[A-Za-z0-9_]{1,64}$")
-    text_field: str = Field(default="text", pattern=r"^[A-Za-z0-9_]{1,64}$")
+
+
+# What a pipeline's generation template may name: the case's query and filters,
+# and the retrieved documents.
+PIPELINE_FIELDS = ("query", "filters", "contexts")
+
+
+class GeneratorSpec(_Spec):
+    """The generation stage of a pipeline: a prompt on a model, as in a prompt
+    target, whose template reads the retrieved documents as ``{{ contexts }}``."""
+
+    provider: str = Field(default=ANTHROPIC, pattern=PROVIDER_NAME)
+    model: str = Field(default="claude-opus-5-5", min_length=1, max_length=64)
+    system: str = Field(default="", max_length=200_000)
+    template: str = Field(min_length=1, max_length=200_000)
+    max_tokens: int = Field(default=4096, ge=1, le=128_000)
+    effort: Effort = "medium"
+    fallbacks: bool = True
+
+    @field_validator("template")
+    @classmethod
+    def _valid_template(cls, value: str) -> str:
+        try:
+            fields = placeholders(value)
+        except InvalidInputError as exc:
+            raise ValueError(exc.message) from None
+        unknown = sorted({f for f in fields if f.split(".", 1)[0] not in PIPELINE_FIELDS})
+        if unknown:
+            raise ValueError(
+                f"a pipeline template can name {', '.join(PIPELINE_FIELDS)}; not {unknown[0]}"
+            )
+        if "contexts" not in fields:
+            raise ValueError("a pipeline template must give the model {{ contexts }}")
+        return value
+
+
+class PipelineTargetSpec(_Spec):
+    """Retrieval then generation as one target (``evalkit.targets.pipeline``).
+
+    Each case's input is a retrieval query. The retriever ranks documents for
+    it, the top ``contexts`` of them (all ``k`` by default) fill the generation
+    template, and the model's answer is the case's output. Both stages are
+    stored with the result, so ranking metrics grade the retrieval and the
+    grounding judges read the documents the answer was written from."""
+
+    type: Literal["pipeline"]
+    retrieval: RetrieverSpec
+    generation: GeneratorSpec
+    contexts: int | None = Field(default=None, ge=1, le=1000)
+
+    @model_validator(mode="after")
+    def _contexts_within_k(self) -> PipelineTargetSpec:
+        if self.contexts is not None and self.contexts > self.retrieval.k:
+            raise ValueError(
+                f"contexts ({self.contexts}) is more than the retriever returns (k = "
+                f"{self.retrieval.k})"
+            )
+        return self
+
+    @property
+    def context_count(self) -> int:
+        return self.contexts if self.contexts is not None else self.retrieval.k
 
 
 class FakeTargetSpec(_Spec):
@@ -257,6 +331,7 @@ AnyTargetSpec = (
     PromptTargetSpec
     | HttpTargetSpec
     | RetrievalTargetSpec
+    | PipelineTargetSpec
     | FakeTargetSpec
     | ConversationTargetSpec
     | AgentTargetSpec

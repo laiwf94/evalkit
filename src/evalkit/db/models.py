@@ -229,6 +229,29 @@ class ResultStep(Base):
     cost_usd: Mapped[float] = mapped_column(Float, default=0.0)
 
 
+class ResultStage(Base):
+    """One stage of a pipeline case, written with its result: the retrieval
+    (``stage = "retrieval"``, its ranking as JSON) and then the generation
+    (``stage = "generation"``, the answer). Costs are what this run paid: zero
+    for a stage served from the cache."""
+
+    __tablename__ = "result_stages"
+
+    run_id: Mapped[str] = mapped_column(ForeignKey("runs.id", ondelete="CASCADE"), primary_key=True)
+    case_id: Mapped[str] = mapped_column(String(256), primary_key=True)
+    position: Mapped[int] = mapped_column(Integer, primary_key=True)
+    stage: Mapped[str] = mapped_column(String(16))
+    output: Mapped[str] = mapped_column(Text, default="")
+    stop_reason: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    cached: Mapped[bool] = mapped_column(Boolean, default=False)
+    latency_ms: Mapped[float] = mapped_column(Float, default=0.0)
+    input_tokens: Mapped[int] = mapped_column(Integer, default=0)
+    output_tokens: Mapped[int] = mapped_column(Integer, default=0)
+    cache_read_tokens: Mapped[int] = mapped_column(Integer, default=0)
+    cache_write_tokens: Mapped[int] = mapped_column(Integer, default=0)
+    cost_usd: Mapped[float] = mapped_column(Float, default=0.0)
+
+
 class RunAggregate(Base):
     """Running totals of one run's results, kept in the transaction that writes them.
     Each writing process has its own ``shard`` row, so processes never wait on each

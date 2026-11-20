@@ -75,6 +75,23 @@ class Step:
 
 
 @dataclass(frozen=True)
+class Stage:
+    """One stage of a pipeline case, stored as a ``result_stages`` row.
+
+    ``name`` is ``retrieval`` (``output`` is the ranking as JSON) or
+    ``generation`` (``output`` is the answer, ``stop_reason`` the provider's).
+    ``cached`` says this run paid nothing for it; ``usage`` is what it paid."""
+
+    index: int
+    name: str
+    output: str
+    stop_reason: str | None = None
+    cached: bool = False
+    latency_ms: float = 0.0
+    usage: Usage = field(default_factory=Usage)
+
+
+@dataclass(frozen=True)
 class Generation:
     text: str
     stop_reason: str | None = None
@@ -83,6 +100,8 @@ class Generation:
     turns: tuple[Turn, ...] = ()
     # The trajectory, for an agent target: model replies and the tool calls they made.
     steps: tuple[Step, ...] = ()
+    # The stages, for a pipeline target: the retrieval, then the generation.
+    stages: tuple[Stage, ...] = ()
     # Whether this run paid nothing for the output: a target that caches its own
     # calls (a retriever) says so here; turns and steps say it for themselves.
     cached: bool = False

@@ -1,12 +1,13 @@
 """Targets: the systems a run evaluates."""
 
-from evalkit.targets.base import Generation, Step, Target, TargetError, Turn, Usage
+from evalkit.targets.base import Generation, Stage, Step, Target, TargetError, Turn, Usage
 from evalkit.targets.specs import (
     AgentTargetSpec,
     ConversationTargetSpec,
     FakeTargetSpec,
     HttpAgentTargetSpec,
     HttpTargetSpec,
+    PipelineTargetSpec,
     PromptTargetSpec,
     RetrievalTargetSpec,
     TargetSpec,
@@ -20,8 +21,10 @@ __all__ = [
     "Generation",
     "HttpAgentTargetSpec",
     "HttpTargetSpec",
+    "PipelineTargetSpec",
     "PromptTargetSpec",
     "RetrievalTargetSpec",
+    "Stage",
     "Step",
     "Target",
     "TargetError",

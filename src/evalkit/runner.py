@@ -56,6 +56,7 @@ from evalkit.db.models import (
     Dataset,
     Matrix,
     Result,
+    ResultStage,
     ResultStep,
     ResultTurn,
     Run,
@@ -91,11 +92,21 @@ from evalkit.scorers.judge import LLMJudge, identity_changes
 from evalkit.scorers.similarity import SemanticSimilarity
 from evalkit.scorers.trajectory import TrajectoryJudge
 from evalkit.simuser import LLMSimulator
-from evalkit.targets import Generation, Step, Target, TargetError, TargetSpec, Turn, Usage
+from evalkit.targets import (
+    Generation,
+    Stage,
+    Step,
+    Target,
+    TargetError,
+    TargetSpec,
+    Turn,
+    Usage,
+)
 from evalkit.targets.agent import AgentTarget
 from evalkit.targets.conversation import ConversationTarget
 from evalkit.targets.factory import build_target, identity
 from evalkit.targets.http_agent import HttpAgentTarget
+from evalkit.targets.pipeline import PipelineTarget
 from evalkit.targets.prompt import PromptTarget
 from evalkit.targets.retrieval import RetrievalTarget, query_of
 from evalkit.targets.specs import (
@@ -103,6 +114,7 @@ from evalkit.targets.specs import (
     ConversationTargetSpec,
     HttpAgentTargetSpec,
     LLMSimulatorSpec,
+    PipelineTargetSpec,
     PromptTargetSpec,
     RetrievalTargetSpec,
 )
@@ -193,6 +205,8 @@ class CaseResult:
     turns: tuple[Turn, ...] = ()
     # An agent's trajectory, written as ``result_steps`` rows.
     steps: tuple[Step, ...] = ()
+    # A pipeline's retrieval and generation, written as ``result_stages`` rows.
+    stages: tuple[Stage, ...] = ()
 
     def row(self, run_id: str) -> dict[str, Any]:
         values = {f: getattr(self, f) for f in _RESULT_FIELDS}
@@ -239,11 +253,27 @@ class CaseResult:
             for s in self.steps
         ]
 
+    def stage_rows(self, run_id: str) -> list[dict[str, Any]]:
+        return [
+            {
+                "run_id": run_id,
+                "case_id": self.case_id,
+                "position": s.index,
+                "stage": s.name,
+                "output": s.output,
+                "stop_reason": _clip(s.stop_reason, 32),
+                "cached": s.cached,
+                "latency_ms": s.latency_ms,
+                **_usage_fields(s.usage),
+            }
+            for s in self.stages
+        ]
+
 
 _RESULT_FIELDS = tuple(
     f
     for f in CaseResult.__dataclass_fields__
-    if f not in ("cache_entry", "fence", "turns", "steps")
+    if f not in ("cache_entry", "fence", "turns", "steps", "stages")
 )
 
 
@@ -457,6 +487,11 @@ class Runner:
             uses.insert(0, (target.provider, prices, target.model))
         if isinstance(target, ConversationTargetSpec):
             uses[:0] = self._conversation_prices(target)
+        if isinstance(target, PipelineTargetSpec):
+            generation = target.generation
+            prices = self._price_table(generation.provider)
+            prices.require(generation.model)
+            uses.insert(0, (generation.provider, prices, generation.model))
         if isinstance(target, HttpAgentTargetSpec) and isinstance(
             target.simulator, LLMSimulatorSpec
         ):
@@ -502,7 +537,7 @@ class Runner:
             # Say which case is malformed now, not as an error on every bad case.
             for case in cases:
                 conversation_of(case)
-        if isinstance(config.target, RetrievalTargetSpec):
+        if isinstance(config.target, RetrievalTargetSpec | PipelineTargetSpec):
             for case in cases:
                 query_of(case)
         return cases
@@ -869,6 +904,17 @@ class Runner:
                 limiter=self._limiter(target.provider, options.rate_limit),
                 max_retry_after=options.retry.max_retry_after,
             )
+        if isinstance(target, PipelineTarget):
+            # Each stage waits on its own limiter, and only when the cache cannot
+            # answer it; cases are not paced.
+            limit = RateLimit()
+            target.attach(
+                store=cache.TurnStore(self.sessions) if options.use_cache else None,
+                redactor=self.redactor,
+                retrieval_limiter=self._limiter(target.retriever.provider, options.rate_limit),
+                generation_limiter=self._limiter(target.client.name, options.rate_limit),
+                max_retry_after=options.retry.max_retry_after,
+            )
         fingerprint = self.settings.redaction.fingerprint()
         keys = {
             c.id: cache.cache_key(run.target_hash, c.input, fingerprint) for c in pending.values()
@@ -1045,6 +1091,7 @@ class Runner:
             attempts=attempts,
             turns=generation.turns,
             steps=generation.steps,
+            stages=generation.stages,
             **_usage_fields(generation.usage),
         )
         if generation.turns:
@@ -1065,7 +1112,11 @@ class Runner:
                 "stop_reason": generation.stop_reason,
                 "usage": asdict(generation.usage),
             }
-        await self._score(case, result, ctx.scorers)
+        if isinstance(ctx.target, PipelineTarget):
+            view, ranking = ctx.target.scoring_view(case, result.stages)
+            await self._score(view, result, ctx.scorers, ranking=ranking)
+        else:
+            await self._score(case, result, ctx.scorers)
         return result
 
     def _error(self, case: Case, message: str, stats: RetryStats, start: float) -> CaseResult:
@@ -1090,11 +1141,24 @@ class Runner:
         await self._score(case, result, scorers)
         return result
 
-    async def _score(self, case: Case, result: CaseResult, scorers: Sequence[Scorer]) -> None:
+    async def _score(
+        self,
+        case: Case,
+        result: CaseResult,
+        scorers: Sequence[Scorer],
+        *,
+        ranking: str | None = None,
+    ) -> None:
+        """Score ``result`` with every scorer. ``ranking`` is a pipeline's
+        retrieval stage, which scorers that grade a ranking read instead of the
+        output."""
         output = result.output or ""
         for scorer in scorers:
             try:
-                outcome = await scorer.score_steps(case, output, result.steps)
+                if ranking is not None and scorer.reads_ranking:
+                    outcome = await scorer.score(case, ranking)
+                else:
+                    outcome = await scorer.score_steps(case, output, result.steps)
             except Exception as exc:  # a plugin bug must not take the run down
                 log.warning(
                     "scorer raised",
@@ -1388,6 +1452,7 @@ class Runner:
                 session.add_all(Result(**r.row(run_id)) for r in saved)
                 session.add_all(ResultTurn(**t) for r in saved for t in r.turn_rows(run_id))
                 session.add_all(ResultStep(**t) for r in saved for t in r.step_rows(run_id))
+                session.add_all(ResultStage(**t) for r in saved for t in r.stage_rows(run_id))
                 aggregates.add(session, run_id, self.owner, aggregates.fold(saved, names))
                 cache.store(session, entries)
                 session.commit()
@@ -1425,6 +1490,7 @@ class Runner:
             session.add(Result(**result.row(run_id)))
             session.add_all(ResultTurn(**t) for t in result.turn_rows(run_id))
             session.add_all(ResultStep(**t) for t in result.step_rows(run_id))
+            session.add_all(ResultStage(**t) for t in result.stage_rows(run_id))
             session.flush()
             aggregates.add(session, run_id, self.owner, aggregates.fold([result], names))
             session.commit()
@@ -1481,6 +1547,8 @@ def _check_prices(run: Run, target: Target, scorers: Sequence[Scorer]) -> None:
         uses.append((target.provider, target.client.prices, target.spec.model))
     if isinstance(target, AgentTarget):
         uses.append((target.client.name, target.client.prices, target.spec.model))
+    if isinstance(target, PipelineTarget):
+        uses.append((target.client.name, target.client.prices, target.spec.generation.model))
     if isinstance(target, ConversationTarget):
         spec = target.spec
         uses.append((target.assistant.name, target.assistant.prices, spec.model))
