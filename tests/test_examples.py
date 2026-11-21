@@ -17,6 +17,7 @@ CONFIGS = (
     + sorted((EXAMPLES / "live").glob("*.toml"))
     + [EXAMPLES / "providers" / name for name in ("matrix.toml", "promoted.toml")]
     + [EXAMPLES / "agents" / name for name in ("booking-run.toml", "booking-blind.toml")]
+    + [EXAMPLES / "rag" / name for name in ("pipeline.toml", "pipeline-next.toml")]
 )
 
 

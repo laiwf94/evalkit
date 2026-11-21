@@ -246,3 +246,18 @@ week 2 (#23), and agents and conversations from week 3 (#24).
   Cohen's kappa with its agreement, precision and recall, a 5-fold
   cross-validated kappa (each fold judged at the threshold chosen on the
   others) and a table of thresholds, and stores the result as a calibration.
+- **Labelled RAG sets.** `examples/rag` holds an 18-document help-centre
+  corpus, 12 retrieval cases with graded relevance labels and reference
+  answers, the rankings of a baseline and a regressed retriever, and 16
+  answers labelled faithful or unfaithful. `evalkit calibrate --judge` takes a
+  faithfulness judge and measures its kappa against those labels.
+- **The RAG demo.** `examples/rag/demo.sh` runs a two-stage pipeline
+  (`examples/rag/pipeline.toml`) on the current retriever and on a change
+  under review (`pipeline-next.toml`), prints `evalkit report rag` for both
+  and gates the change: recall@3, nDCG@5 and answer completeness fail it, and
+  the report puts all eight failing questions down to retrieval misses.
+  `examples/rag/server.py` (standard library only) stands in for both
+  retrievers, the generator and the grader over HTTP, reached through
+  ordinary operator config, so no key or network is needed. CI runs the demo
+  on every push, and `tests/test_rag_demo.py` checks every case's stages,
+  scores and cause.

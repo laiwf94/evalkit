@@ -1,0 +1,7 @@
+# EVALKIT_PROVIDERS_FILE for the RAG demo: the generator and the grader are the
+# fake model server in server.py. demo.sh writes the same table with the port
+# it picked; this file is for running server.py on its default port by hand.
+[providers.rag-fake]
+kind = "openai_compat"
+base_url = "http://127.0.0.1:8766/v1"
+output_limit_field = "max_tokens"

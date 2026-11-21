@@ -26,11 +26,14 @@ $ echo $?
 ```console
 $ uv sync
 $ ./examples/demo.sh                 # no API key needed: fake targets, throwaway SQLite
+$ ./examples/rag/demo.sh             # a RAG pipeline against local fakes
 ```
 
 The demo runs a baseline and two candidates on a bundled 120-case dataset. The
 candidate of similar quality passes the gate; the broken one fails it with exit
-code 1.
+code 1. The RAG demo runs a retrieval-then-generation pipeline on two
+retrievers, prints the RAG report for each and fails the second at the gate
+([A RAG pipeline end to end](#a-rag-pipeline-end-to-end)).
 
 With a key, the same comparison on Claude, scored by a judge:
 
@@ -650,6 +653,59 @@ failing cases:
 A run that lacks a retrieval or a grounding metric says so in a note, and the
 cases it cannot split are `unattributed` rather than guessed.
 
+### A RAG pipeline end to end
+
+[examples/rag/demo.sh](examples/rag/demo.sh) puts the stages together on the
+labelled help-centre set. [pipeline.toml](examples/rag/pipeline.toml) is a
+`pipeline` target: the retriever behind `kb-search` ranks 5 documents, the top
+3 fill the prompt and a model answers from them. It is graded on the ranking
+(recall@3 and nDCG@5 gate, MRR does not), on `context_recall` and
+`faithfulness` as evidence, and on `answer_completeness`, which gates.
+[pipeline-next.toml](examples/rag/pipeline-next.toml) is the same pipeline on
+`kb-search-next`, the retriever change under review. Nothing leaves the
+machine: [server.py](examples/rag/server.py), standard library only, serves
+both retrievers (replaying `rankings.jsonl`), an extractive reader as the model
+and a word-overlap grader that answers evalkit's claim extraction and support
+checks, all as an OpenAI-compatible server named in `EVALKIT_PROVIDERS_FILE`.
+
+```console
+$ ./examples/rag/demo.sh
+== The pipeline on the current retriever: 12 questions, retrieval and answer stored per case
+metric                   mean              95% CI      n  unscorable
+recall_at_3            100.0%    [100.0%, 100.0%]     12           0
+ndcg_at_5               93.5%     [84.6%, 100.0%]     12           0
+mrr                     91.7%     [79.2%, 100.0%]     12           0  (not gated)
+context_recall         100.0%    [100.0%, 100.0%]     12           0  (not gated)
+faithfulness           100.0%    [100.0%, 100.0%]     12           0  (not gated)
+answer_completeness    100.0%    [100.0%, 100.0%]     12           0
+...
+== The same pipeline on the retriever change under review
+12 cases, 8 failing
+...
+cause                cases    share
+retrieval miss           8   100.0%
+unsupported answer       0     0.0%
+ignored context          0     0.0%
+...
+  q09  retrieval miss: the needed sources were not retrieved  [recall_at_3 0.00, ndcg_at_5 0.39, mrr 0.20, context_recall 0.00, answer_completeness 0.00]
+      recall_at_3: 0 of 1 relevant in the top 3; ndcg_at_5: 1 of 1 relevant in the top 5; first at rank 5; ...
+...
+== Gate the change against the current retriever
+metric              base    cand     diff                95% CI   p (adj)    d_z  verdict
+recall_at_3       100.0%   55.6%   -44.4%        [-62.5, -26.4]    0.0078  -1.32  worse
+ndcg_at_5          93.5%   55.3%   -38.2%        [-50.2, -26.6]    0.0029  -1.74  worse
+answer_completeness  100.0%   33.3%   -66.7%        [-91.7, -41.7]    0.0078  -1.35  worse
+
+FAIL: recall_at_3, ndcg_at_5, answer_completeness
+```
+
+The answers to the eight lost questions are still faithful (the reader copies
+a document it was given, or says it cannot answer), so a gate on the answer
+alone would say only that answers got worse; the report says the fix is in the
+retriever. CI runs this script on every push, and
+`tests/test_rag_demo.py` drives the same configs through the CLI and checks
+each case's stages, scores and cause.
+
 ## Reading the verdict
 
 Each run reports means with bootstrap confidence intervals (normal intervals
@@ -888,6 +944,7 @@ tests compare the bodies they received with the exact bodies expected.
 | Cache and blobs | A Hypothesis test sweeps random caches by age and size and checks the dry run reports exactly what the real sweep removes, that what is left fits the limit and is always the most recently used. An entry used between the sweep's read and its delete survives. Both blob backends round-trip random bytes; tampered blobs are refused; garbage collection never removes a referenced or recent blob (Hypothesis) and spares one written again mid-scan. Requests are signed in our own code and checked by an in-memory S3 server that recomputes every signature, and on a real S3-compatible server (versitygw in Testcontainers) together with a sweep and collection on PostgreSQL. |
 | Three providers end to end | `tests/test_providers_end_to_end.py` serves strict fake Claude, OpenAI, Gemini and grader APIs on local sockets and drives the CLI (the matrix run as a child process) through `examples/providers` unchanged: each provider gets exactly its 120 requests with the registry prompt, token counts and costs match each provider's price list, the judge is called once per distinct answer and only on the grader, the frontier and both paired steps match the known accuracies, and a promoted prompt version runs, leaves the matrix runs on version 1 and passes the gate as better. |
 | A booking agent end to end | `tests/test_booking_end_to_end.py` serves the reference agent and its `--skip-lookup` twin on local sockets and drives the CLI through `examples/agents` unchanged. 50 dialogues with a scripted user end on goal reached, give-up or the turn limit. A run SIGKILLed mid-dialogue in a child process resumes with every outcome, step and turn equal to an uninterrupted run, the agent answers each step once over both processes, and at least one dialogue is finished from where the kill left it. The blind agent confirms as many bookings and fails the gate on `tool_calls` (-54%). |
+| A RAG pipeline end to end | `tests/test_rag_demo.py` serves `examples/rag/server.py` on a local socket and drives the CLI through `examples/rag` unchanged. Every case stores the recorded ranking and an answer copied from an answering document among its top 3; on the regressed retriever the eight questions that lose that document score 0 on `answer_completeness` and `context_recall`, mean recall@3 is exactly 5/9, the RAG report attributes all eight to a retrieval miss, and the gate fails on recall@3, nDCG@5 and answer completeness. A rerun sends nothing to the fakes. |
 | API and CLI | Every endpoint, error code and exit code, over ASGI and over the wire. |
 
 ```console
@@ -960,7 +1017,7 @@ src/evalkit/redaction.py   PII redaction
 src/evalkit/api.py         HTTP API
 src/evalkit/cli.py         command line
 src/evalkit/db/            SQLAlchemy models and Alembic migrations
-examples/                  demo, bundled dataset, live and three-provider configs, CI workflow
+examples/                  demos, bundled datasets, live, three-provider, agent and RAG configs, CI workflow
 benchmarks/                harness benchmarks
 ```
 

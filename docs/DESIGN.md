@@ -1075,6 +1075,20 @@ retrieval and grounding metrics as ungated evidence. The report reads the
 result rows once with `yield_per` and holds the counts and the first `--limit`
 failing cases by id, so its memory does not grow with the run.
 
+The RAG demo (`examples/rag/demo.sh`) runs against `examples/rag/server.py`, a
+fake that stands in for the retrievers, the generator and the grader at once,
+with the standard library only so it starts in milliseconds and needs nothing
+installed. It is reached the way real ones are: the retrievers as HTTP
+endpoints in `EVALKIT_HTTP_TARGETS_FILE`, the model and the grader as an
+`openai_compat` provider in `EVALKIT_PROVIDERS_FILE`, so the demo exercises the
+SSRF-safe client, the provider client, the retrieval and stage caches and the
+judges' real prompts and schemas rather than in-process doubles. The grader
+recognises evalkit's judge prompts by their first sentence (a test pins those)
+and decides support by word overlap with all numbers required, which is enough
+for an extractive reader whose answers are copies of its sources; it is not a
+substitute for a calibrated judge, and `examples/rag/faithfulness.toml` is what
+the human labels calibrate.
+
 ### Embeddings and semantic similarity
 
 `evalkit.embeddings.Embedder` is one embedding model on one provider, shared

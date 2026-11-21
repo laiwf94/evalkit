@@ -1,0 +1,76 @@
+# Retrieval then generation as one target, on the 12 labelled queries: the
+# retriever behind "kb-search" ranks 5 documents, the top 3 fill the prompt,
+# and the reader on "rag-fake" answers from them. Both stages are stored per
+# case. pipeline-next.toml is the same pipeline on the retriever change under
+# review; demo.sh runs both and gates the second against the first.
+#
+#   python examples/rag/server.py &
+#   export EVALKIT_HTTP_TARGETS_FILE=examples/rag/endpoints.toml
+#   export EVALKIT_PROVIDERS_FILE=examples/rag/providers.toml
+#   export EVALKIT_PRICES_FILE=examples/rag/prices.toml
+#   evalkit run examples/rag/pipeline.toml
+label = "rag"
+
+[dataset]
+name = "kb-questions"
+path = "retrieval.jsonl"
+
+[target]
+type = "pipeline"
+contexts = 3
+
+[target.retrieval]
+endpoint = "kb-search"
+k = 5
+
+[target.generation]
+provider = "rag-fake"
+model = "reader-1"
+system = "Answer the question from the documents only."
+template = """<question>
+{{ query }}
+</question>
+
+<documents>
+{{ contexts }}
+</documents>"""
+max_tokens = 512
+
+# Retrieval, against the graded labels: these gate.
+[[scorers]]
+type = "ranking"
+metric = "recall"
+k = 3
+
+[[scorers]]
+type = "ranking"
+metric = "ndcg"
+k = 5
+
+[[scorers]]
+type = "ranking"
+metric = "mrr"
+gate = false
+
+# The reference answer's claims in the 3 documents the reader was given.
+[[scorers]]
+type = "context_recall"
+provider = "rag-fake"
+model = "grader-1"
+gate = false
+
+# The answer's claims against those documents: evidence for the report.
+[[scorers]]
+type = "faithfulness"
+provider = "rag-fake"
+model = "grader-1"
+gate = false
+
+# The reference answer's claims in the answer: this gates.
+[[scorers]]
+type = "answer_completeness"
+provider = "rag-fake"
+model = "grader-1"
+
+[options]
+concurrency = 4

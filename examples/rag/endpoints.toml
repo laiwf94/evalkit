@@ -1,0 +1,11 @@
+# EVALKIT_HTTP_TARGETS_FILE for the RAG demo: the two retrievers in server.py on
+# its default port. demo.sh writes the same table with the port it picked.
+[endpoints.kb-search]
+url = "http://127.0.0.1:8766/search/baseline"
+allow_private = true
+timeout_seconds = 10
+
+[endpoints.kb-search-next]
+url = "http://127.0.0.1:8766/search/regressed"
+allow_private = true
+timeout_seconds = 10

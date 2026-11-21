@@ -2,7 +2,8 @@
 
 A small help-centre corpus for an invoicing app, labelled by hand for retrieval
 and for grounding. The files are the inputs of the RAG tests
-(`tests/test_rag_examples.py`) and of the RAG demo.
+(`tests/test_rag_examples.py`, `tests/test_rag_demo.py`) and of the RAG demo,
+`./examples/rag/demo.sh`.
 
 | File | What it holds |
 |---|---|
@@ -11,6 +12,10 @@ and for grounding. The files are the inputs of the RAG tests
 | `rankings.jsonl` | the top 5 documents two retrievers return per query: `baseline` and `regressed` |
 | `faithfulness-labels.jsonl` | 16 answers written from the baseline's top 3, labelled `faithful` or `unfaithful` |
 | `faithfulness.toml` | the faithfulness judge to calibrate against those labels |
+| `pipeline.toml`, `pipeline-next.toml` | the RAG demo's pipeline on the current retriever and on the change under review |
+| `server.py` | the demo's fakes: both retrievers, the reader and the grader (standard library only) |
+| `endpoints.toml`, `providers.toml`, `prices.toml` | operator config for the fakes on port 8766 |
+| `demo.sh` | the demo: both pipelines, the RAG report for each, and the gate |
 
 ## Relevance labels
 
