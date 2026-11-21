@@ -1,0 +1,12 @@
+{"id": "q01", "input": "How do I reset my password?", "expected": {"relevance": {"kb-01": 3, "kb-03": 1, "kb-02": 0}, "answer": "Open Settings, choose Security and select Reset password. The emailed link expires after 30 minutes."}}
+{"id": "q02", "input": "Can I get my money back on an annual plan?", "expected": {"relevance": {"kb-05": 3, "kb-06": 1, "kb-07": 0}, "answer": "Yes. Annual plans are refunded in full within 14 days of purchase."}}
+{"id": "q03", "input": "Where do I download an invoice as a PDF?", "expected": {"relevance": {"kb-04": 3}, "answer": "Open Billing > Invoices, select the invoice and choose Download."}}
+{"id": "q04", "input": "What happens to my workspace when I cancel?", "expected": {"relevance": {"kb-06": 3, "kb-05": 1, "kb-17": 1}, "answer": "The workspace stays active until the end of the paid period."}}
+{"id": "q05", "input": "How do I export all my data?", "expected": {"relevance": {"kb-09": 3, "kb-10": 0}, "answer": "Owners export all workspace data as CSV from Settings > Data > Export. Exports over 1 GB are split and emailed as links."}}
+{"id": "q06", "input": "Can two-factor codes be sent by SMS?", "expected": {"relevance": {"kb-02": 3, "kb-01": 0}, "answer": "No. Authenticator apps and hardware keys are supported, not SMS."}}
+{"id": "q07", "input": "How many people can I invite on the free plan?", "expected": {"relevance": {"kb-13": 3, "kb-14": 1}, "answer": "The Free plan allows 3 members."}}
+{"id": "q08", "input": "Who can change billing details?", "expected": {"relevance": {"kb-14": 3, "kb-13": 1, "kb-08": 0}, "answer": "Only owners can change billing."}}
+{"id": "q09", "input": "Can I charge a late fee on overdue invoices?", "expected": {"relevance": {"kb-12": 3, "kb-11": 0}, "answer": "Yes. A late fee is a fixed amount or a percentage, applied once when the invoice becomes overdue."}}
+{"id": "q10", "input": "I was locked out after failed logins. How long until I can try again?", "expected": {"relevance": {"kb-03": 3, "kb-01": 2}, "answer": "The account is locked for 15 minutes. An owner can unlock it sooner from Members."}}
+{"id": "q11", "input": "Which cards do you accept?", "expected": {"relevance": {"kb-08": 3, "kb-07": 0}, "answer": "Visa, Mastercard and American Express."}}
+{"id": "q12", "input": "When does a downgrade take effect, and are upgrades prorated?", "expected": {"relevance": {"kb-07": 3, "kb-06": 1}, "answer": "Downgrades take effect at the next renewal. Upgrades take effect immediately and are prorated."}}

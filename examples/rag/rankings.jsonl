@@ -1,0 +1,12 @@
+{"id": "q01", "baseline": ["kb-01", "kb-03", "kb-02", "kb-14", "kb-09"], "regressed": ["kb-02", "kb-03", "kb-14", "kb-01", "kb-09"]}
+{"id": "q02", "baseline": ["kb-05", "kb-06", "kb-07", "kb-08", "kb-04"], "regressed": ["kb-07", "kb-06", "kb-08", "kb-04", "kb-11"]}
+{"id": "q03", "baseline": ["kb-04", "kb-11", "kb-12", "kb-05", "kb-18"], "regressed": ["kb-04", "kb-11", "kb-12", "kb-05", "kb-18"]}
+{"id": "q04", "baseline": ["kb-06", "kb-17", "kb-05", "kb-07", "kb-13"], "regressed": ["kb-05", "kb-07", "kb-06", "kb-13", "kb-17"]}
+{"id": "q05", "baseline": ["kb-10", "kb-09", "kb-17", "kb-04", "kb-15"], "regressed": ["kb-10", "kb-15", "kb-09", "kb-04", "kb-17"]}
+{"id": "q06", "baseline": ["kb-02", "kb-01", "kb-03", "kb-14", "kb-13"], "regressed": ["kb-01", "kb-03", "kb-02", "kb-14", "kb-13"]}
+{"id": "q07", "baseline": ["kb-13", "kb-14", "kb-08", "kb-07", "kb-03"], "regressed": ["kb-14", "kb-03", "kb-08", "kb-13", "kb-07"]}
+{"id": "q08", "baseline": ["kb-14", "kb-08", "kb-13", "kb-06", "kb-05"], "regressed": ["kb-08", "kb-13", "kb-06", "kb-05", "kb-14"]}
+{"id": "q09", "baseline": ["kb-12", "kb-11", "kb-04", "kb-15", "kb-18"], "regressed": ["kb-11", "kb-15", "kb-18", "kb-04", "kb-12"]}
+{"id": "q10", "baseline": ["kb-03", "kb-01", "kb-02", "kb-13", "kb-14"], "regressed": ["kb-01", "kb-02", "kb-14", "kb-13", "kb-03"]}
+{"id": "q11", "baseline": ["kb-07", "kb-08", "kb-05", "kb-06", "kb-04"], "regressed": ["kb-07", "kb-05", "kb-06", "kb-04", "kb-08"]}
+{"id": "q12", "baseline": ["kb-07", "kb-06", "kb-05", "kb-08", "kb-14"], "regressed": ["kb-06", "kb-05", "kb-08", "kb-14", "kb-07"]}

@@ -76,6 +76,7 @@ from evalkit.scorers.calibration import (
     ThresholdReport,
     calibrate,
     calibrate_threshold,
+    label_mode,
     parse_labels,
     save_calibration,
     save_threshold,
@@ -521,7 +522,7 @@ async def cmd_calibrate(args: argparse.Namespace, app: App) -> int:
     except ValidationError as exc:
         raise CliError(f"{args.judge}: {_describe(exc)}", EXIT_INPUT) from None
     judge = judge_from_spec(spec, app.providers())
-    items = parse_labels(_read_bytes(Path(args.labels)), judge.mode)
+    items = parse_labels(_read_bytes(Path(args.labels)), label_mode(judge))
     report = await calibrate(judge, items, concurrency=args.concurrency)
     with app.sessions() as session:
         save_calibration(session, judge, report)

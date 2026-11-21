@@ -549,6 +549,16 @@ source list unless a source has that id, and a citation of a source that does
 not exist counts as wrong. Both take the provider, model and effort options of
 `judge` and are cached and gated like it.
 
+`evalkit calibrate` measures `faithfulness` against people's labels too: give
+the `[judge]` table `type = "faithfulness"` and label each answer `faithful`
+(every claim supported) or `unfaithful`. [examples/rag](examples/rag) has a
+labelled help-centre set: 18 documents, 12 queries with graded relevance labels
+and two retrievers' rankings, and 16 answers labelled for faithfulness:
+
+```
+$ evalkit calibrate --judge examples/rag/faithfulness.toml examples/rag/faithfulness-labels.jsonl
+```
+
 Four more judges read the same sources, and the last three a reference answer
 in `expected.answer` (or a text `expected`):
 
@@ -763,7 +773,7 @@ different judge it would refuse (exit 3) unless `--allow-judge-change` is given.
 | `evalkit report matrix MATRIX [--metric M] [--latency p50\|p95]` | A matrix's variants, their cost/quality/latency frontier and paired steps along it. |
 | `evalkit report rag RUN [--threshold [NAME=]V]... [--limit N]` | Each failing case of a RAG run attributed to a retrieval miss, an unsupported answer or ignored context. |
 | `evalkit estimate CONFIG` | Cost estimate from token counts (per variant for a matrix). |
-| `evalkit calibrate --judge J LABELS` | Judge agreement with human labels. |
+| `evalkit calibrate --judge J LABELS` | Judge agreement with human labels (rubric, pairwise, trajectory or faithfulness judges). |
 | `evalkit calibrate --scorer S LABELS [--folds 5]` | The `semantic_similarity` threshold that agrees best with 0/1 labels, with a cross-validated kappa. |
 | `evalkit dataset import/export/list` | Manage datasets. |
 | `evalkit prompt push NAME FILE [--system FILE] [--note N]` | Store a prompt file (TOML with `system` and `template`, or a template file) as a new version; unchanged content is a no-op. |

@@ -1,0 +1,7 @@
+# The faithfulness judge, for:
+#   evalkit calibrate --judge examples/rag/faithfulness.toml examples/rag/faithfulness-labels.jsonl
+# Agreement is measured on whole answers: faithful when every claim is supported.
+[judge]
+type = "faithfulness"
+name = "faithfulness"
+effort = "low"

@@ -285,8 +285,11 @@ ScorerSpec = Annotated[
     | PluginSpec,
     Field(discriminator="type"),
 ]
-# What ``evalkit calibrate`` accepts in its [judge] table.
-AnyJudgeSpec = Annotated[JudgeSpec | TrajectoryJudgeSpec, Field(discriminator="type")]
+# What ``evalkit calibrate`` accepts in its [judge] table: a rubric, pairwise or
+# trajectory judge, or (with ``type = "faithfulness"``) a faithfulness judge.
+AnyJudgeSpec = Annotated[
+    JudgeSpec | TrajectoryJudgeSpec | FaithfulnessSpec, Field(discriminator="type")
+]
 
 
 def build_scorers(

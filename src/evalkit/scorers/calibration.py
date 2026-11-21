@@ -12,8 +12,13 @@ Labelled file, one JSON object per line:
 
     {"id": "c1", "input": ..., "expected": ..., "output": "...", "label": 4}
 
-``label`` is 1-5 for rubric judges and "win", "tie" or "loss" (the output
-against the reference) for pairwise judges. A trajectory judge also reads each
+``label`` is 1-5 for rubric judges, "win", "tie" or "loss" (the output
+against the reference) for pairwise judges, and "faithful" or "unfaithful" for
+a ``faithfulness`` judge: faithful when every claim of the output is supported
+by the item's sources (``input.contexts``, as the scorer reads them), which is
+when the scorer gives 1. Agreement is then measured on whole answers, the
+decision a gate on faithfulness makes; ``expected`` may carry the claims the
+labeller marked, which the judge does not read. A trajectory judge also reads each
 item's ``trajectory``: its steps as the trajectory endpoint serves them
 (``GET /v1/runs/{id}/results/{case}/trajectory``, the ``steps`` list).
 
@@ -52,6 +57,7 @@ from evalkit.datasets import Case, sha256_hex
 from evalkit.db.models import Calibration
 from evalkit.embeddings import cosine
 from evalkit.errors import InvalidInputError
+from evalkit.scorers.faithfulness import FaithfulnessJudge
 from evalkit.scorers.judge import Judgement, LLMJudge
 from evalkit.scorers.similarity import SemanticSimilarity
 from evalkit.scorers.trajectory import LabelledStep, TrajectoryJudge
@@ -59,6 +65,7 @@ from evalkit.scorers.trajectory import LabelledStep, TrajectoryJudge
 RUBRIC_LABELS: tuple[int, ...] = (1, 2, 3, 4, 5)
 PAIR_LABELS: tuple[str, ...] = ("loss", "tie", "win")
 BINARY_LABELS: tuple[int, ...] = (0, 1)
+FAITHFULNESS_LABELS: tuple[str, ...] = ("unfaithful", "faithful")
 DEFAULT_FOLDS = 5
 MAX_ITEMS = 5_000
 
@@ -126,11 +133,28 @@ def cohens_kappa(
     return 1.0 - disagreement / expected
 
 
+def label_mode(judge: LLMJudge) -> str:
+    """Which labels a judge is calibrated against: ``rubric``, ``pairwise`` or
+    ``faithfulness``."""
+    return "faithfulness" if isinstance(judge, FaithfulnessJudge) else judge.mode
+
+
+def categories_of(mode: str) -> tuple[Any, ...]:
+    """The labels of a mode, in order (the confusion matrix's rows and columns)."""
+    match mode:
+        case "binary":
+            return BINARY_LABELS
+        case "rubric":
+            return RUBRIC_LABELS
+        case "faithfulness":
+            return FAITHFULNESS_LABELS
+        case _:
+            return PAIR_LABELS
+
+
 def parse_labels(data: bytes | str, mode: str) -> list[LabelledItem]:
     text = data.decode() if isinstance(data, bytes) else data
-    allowed: tuple[Any, ...] = (
-        BINARY_LABELS if mode == "binary" else RUBRIC_LABELS if mode == "rubric" else PAIR_LABELS
-    )
+    allowed = categories_of(mode)
     items: list[LabelledItem] = []
     for number, line in enumerate(text.splitlines(), start=1):
         if not line.strip():
@@ -187,7 +211,8 @@ async def calibrate(
             disagreements.append(item.id)
     if not human:
         raise InvalidInputError("the judge could not grade any labelled item")
-    categories: tuple[Any, ...] = RUBRIC_LABELS if judge.mode == "rubric" else PAIR_LABELS
+    mode = label_mode(judge)
+    categories = categories_of(mode)
     index = {c: i for i, c in enumerate(categories)}
     confusion = [[0] * len(categories) for _ in categories]
     for h, m in zip(human, machine, strict=True):
@@ -198,9 +223,7 @@ async def calibrate(
         agreement=sum(h == m for h, m in zip(human, machine, strict=True)) / len(human),
         kappa=cohens_kappa(human, machine, categories),
         weighted_kappa=(
-            cohens_kappa(human, machine, categories, quadratic=True)
-            if judge.mode == "rubric"
-            else None
+            cohens_kappa(human, machine, categories, quadratic=True) if mode == "rubric" else None
         ),
         labels=[str(c) for c in categories],
         confusion=confusion,

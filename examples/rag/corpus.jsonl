@@ -1,0 +1,18 @@
+{"id": "kb-01", "text": "To reset your password, open Settings, choose Security and select Reset password. A reset link is emailed to you and expires after 30 minutes."}
+{"id": "kb-02", "text": "Two-factor authentication is turned on under Settings > Security > Two-factor. Authenticator apps and hardware keys are supported, not SMS."}
+{"id": "kb-03", "text": "After five failed sign-in attempts an account is locked for 15 minutes. An owner can unlock it sooner from Members."}
+{"id": "kb-04", "text": "Invoices are under Billing > Invoices. Select an invoice and choose Download to get a PDF."}
+{"id": "kb-05", "text": "Annual plans can be refunded in full within 14 days of purchase. Monthly plans are not refunded, but cancelling stops the next charge."}
+{"id": "kb-06", "text": "To cancel, open Billing > Plan and choose Cancel plan. The workspace stays active until the end of the paid period."}
+{"id": "kb-07", "text": "Upgrades take effect immediately and are prorated. Downgrades take effect at the next renewal."}
+{"id": "kb-08", "text": "Visa, Mastercard and American Express cards are accepted, and bank transfer on annual plans."}
+{"id": "kb-09", "text": "Owners can export all workspace data as CSV from Settings > Data > Export. Exports over 1 GB are split into parts and emailed as links valid for 7 days."}
+{"id": "kb-10", "text": "Clients and items can be imported from a CSV file with a header row, up to 10,000 rows per import."}
+{"id": "kb-11", "text": "A recurring invoice is sent automatically on its schedule: weekly, monthly or yearly. Pause or stop it from the invoice's menu."}
+{"id": "kb-12", "text": "A late fee can be added as a fixed amount or a percentage. It is applied once, when an invoice becomes overdue."}
+{"id": "kb-13", "text": "Owners and admins invite members from Members > Invite. The Free plan allows 3 members; paid plans have no limit."}
+{"id": "kb-14", "text": "There are three roles: owner, admin and member. Only owners can delete the workspace or change billing."}
+{"id": "kb-15", "text": "Tax rates are set per item or per invoice under Settings > Taxes. Several rates can apply to one line."}
+{"id": "kb-16", "text": "The mobile app can create invoices offline; they are sent once the device reconnects."}
+{"id": "kb-17", "text": "A deleted workspace can be restored by an owner for 30 days. After that grace period the deletion is permanent."}
+{"id": "kb-18", "text": "Each invoice has its own currency. Reports convert totals to the workspace's base currency at the daily rate."}

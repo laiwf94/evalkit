@@ -1162,6 +1162,14 @@ Categorical Data*). Results are stored per judge configuration hash (mode,
 model, effort, rubric, and for judges not on Claude the provider and its
 endpoint), so a rubric edit is visibly uncalibrated.
 
+A faithfulness judge is calibrated on whole answers, labelled `faithful` or
+`unfaithful`, because that is the decision a gate on it makes: a case is
+faithful when every claim is supported, the score of 1. Its claim-level score
+would need people to agree on the same claim split first, which the judge's
+extraction step does not guarantee; the labelled sets in `examples/rag` record
+the sentence each labeller marked (`expected.unsupported`) so a disagreement can
+be read back to the claim.
+
 ### Judges on any provider
 
 A judge names its provider: `anthropic` (the default), the built-in `openai`
