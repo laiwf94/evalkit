@@ -286,3 +286,11 @@ week 2 (#23), and agents and conversations from week 3 (#24).
   change to a dataset made its runs incomparable.
 - Migration 0016 adds the lineage columns and a per-case hash, and fills both
   in for existing datasets, chaining each name's versions in order.
+- **Slices.** `evalkit compare` and `evalkit gate` take `--by tag`, `--by split`
+  or `--by metadata.KEY` and compare every metric inside each slice, with
+  Holm's correction across all slice tests and a minimum slice size
+  (`--min-slice-size`, default 20) below which a slice is listed but not
+  tested. `--require-slice NAME`, `--any-slice` and a `[gate]` table given with
+  `--rules` make the gate fail when a named slice regresses or is too small to
+  test. `POST /v1/compare` takes the same rules as `slices` and returns
+  `failures`.

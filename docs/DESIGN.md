@@ -1336,6 +1336,59 @@ The property tests check the methods, not one lucky draw: 1,000 simulated
 datasets with a known answer per test, checked against a binomial tolerance
 band.
 
+### Slices
+
+A regression confined to one category is diluted by every other case: in the
+test suite 40 billing cases lose 25 answers while the other 360 win and lose
+about evenly, so the whole-dataset difference is -1.0% with p = 0.80. Slicing
+runs the same paired test inside each group of cases (`evalkit.slices`).
+
+What a slice is. A tag, a split, or a value of one metadata key. Tags overlap
+(a case with two tags is in two slices) and that is kept: a slice is a question
+about the cases that carry a label, not a partition. A metadata list behaves
+like tags; a number or boolean is named by its canonical JSON so `3` and `"3"`
+do not silently merge; objects and nulls put a case in no slice, and the report
+counts those cases. More than 500 slices is refused: by then the key is an id,
+not a category, and each slice costs a bootstrap and a permutation test.
+
+Multiple testing. Every (slice, metric) test with enough cases joins one Holm
+family. Without it, ten tags and two metrics would give twenty chances at a
+false regression, about a 64% chance of at least one at alpha 0.05. The
+family is kept apart from the whole-dataset metrics so that adding `--by` never
+changes the verdicts a gate gave before; the slice verdicts answer a separate
+question, and a team that gates on slices opts into it with rules. One family
+over every slice, even when the rules require only some, keeps the verdict
+printed next to a slice the same whether or not it is required; the price is
+some power when there are many slices, and `--min-slice-size` (default 20) and
+fewer metrics are the levers.
+
+Minimum size. A slice with fewer paired cases than the minimum is listed as too
+small and left out of the family. On 0/1 scores a 10-case slice can only
+reach p < 0.05 when almost every case flips one way, and each such test would
+raise every other slice's adjusted p-value. The count is of cases scored in
+both runs, so unscorable cases do not make a slice look testable.
+
+Rules. Required slices that regress fail the gate. A required slice that is too
+small also fails it: a gate that says "billing must not regress" and passes
+because billing had eight cases would be the averaging problem again. A
+required name that is not among the compared cases, or a metric that was not
+compared, is an input error rather than a failure, because it is a mistake in
+the rules (usually a typo) and should be fixed rather than retried. Rules come
+from a `[gate]` table (`evalkit.config.GateRules`) or the API request; flags
+go over the file.
+
+Versions. Slice membership is read from the candidate's dataset version for
+the cases being compared. On two versions those are the cases both have
+unchanged, and an unchanged case has the same tags, split and metadata in both
+(they are in its hash), so either version gives the same answer.
+
+Cost. Each slice test is the same bootstrap and permutation test as a
+whole-dataset metric, on fewer cases, so disjoint slices cost about one more
+whole-dataset comparison. Measured on a 4-core Linux container with 10,000
+resamples: 100,000 cases in 50 disjoint slices took 10.0 s against 9.5 s for
+the whole-dataset test, and in 500 slices 12.0 s; 10,000 cases in 20 slices,
+1.4 s against 1.3 s. Overlapping tags multiply the work by the tags per case.
+
 ## Interrupted and failed runs
 
 | Failure | What happens |

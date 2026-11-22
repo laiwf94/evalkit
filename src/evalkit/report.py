@@ -18,10 +18,12 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from evalkit import aggregates, runqueue
+from evalkit.config import GateRules
 from evalkit.dataset_edits import VersionPairing, pair_versions
 from evalkit.db.models import Dataset, Result, Run, as_utc, utcnow
 from evalkit.errors import InvalidInputError, NotFoundError, PreconditionError
 from evalkit.scorers.judge import identity_changes, judge_identity
+from evalkit.slices import SliceReport, slice_compare
 from evalkit.stats import (
     DEFAULT_RESAMPLES,
     Comparison,
@@ -110,10 +112,17 @@ class CompareReport:
     # Set when the runs used different versions of one dataset: the comparison is
     # over the cases both versions have unchanged, and this says how many those are.
     dataset_change: VersionPairing | None = None
+    # Set when the comparison was asked to slice the cases (``evalkit.slices``).
+    slices: SliceReport | None = None
+
+    @property
+    def failures(self) -> list[str]:
+        """Every reason the gate fails: whole-dataset regressions, then slice rules."""
+        return list(self.regressions) + (self.slices.failures if self.slices else [])
 
     @property
     def passed(self) -> bool:
-        return not self.regressions
+        return not self.failures
 
 
 def get_run(session: Session, run_id: str) -> Run:
@@ -297,9 +306,14 @@ def compare_runs(
     metrics: list[str] | None = None,
     resamples: int = DEFAULT_RESAMPLES,
     allow_judge_change: bool = False,
+    slices: GateRules | None = None,
 ) -> CompareReport:
     """Paired comparison of two completed runs over the same dataset content, or
     over the cases that two versions of one dataset have unchanged.
+
+    With ``slices`` (and ``slices.by``), every metric is also compared inside each
+    slice of the compared cases, and the slice rules decide whether the gate fails
+    on a slice (``evalkit.slices``).
 
     A metric whose judge differs between the runs (provider, endpoint, model,
     mode, effort or rubric) measures the judge as much as the system under test,
@@ -340,6 +354,7 @@ def compare_runs(
         )
     base_scores = aggregates.load_scores(session, base, selected)
     cand_scores = aggregates.load_scores(session, cand, selected)
+    cand_index = None
     if paired is not None:
         # Different versions of one dataset: keep the cases both have unchanged.
         _, base_index, cand_index = paired
@@ -356,6 +371,21 @@ def compare_runs(
     comparisons = compare_aligned(
         usable, alpha=alpha, min_effect=min_effect, resamples=resamples, seed=cand.seed
     )
+    sliced = None
+    if slices is not None and slices.by is not None:
+        # Unchanged cases are the same in both versions, tags and metadata included,
+        # so the candidate's version says which slices the compared cases are in.
+        sliced = slice_compare(
+            session,
+            cand_ds.id,
+            cand_index,
+            usable,
+            slices,
+            alpha=alpha,
+            min_effect=min_effect,
+            resamples=resamples,
+            seed=cand.seed,
+        )
     return CompareReport(
         baseline=base.id,
         candidate=cand.id,
@@ -365,4 +395,5 @@ def compare_runs(
         regressions=[c.metric for c in comparisons if c.verdict == "worse"],
         judge_changes=changed,
         dataset_change=None if paired is None else paired[0],
+        slices=sliced,
     )

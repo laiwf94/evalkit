@@ -34,6 +34,10 @@ a silent precedence rule.
     ANTHROPIC_API_KEY           Claude API key (secret)
     OPENAI_API_KEY              key for the built-in ``openai`` provider (secret)
     GEMINI_API_KEY              key for the built-in ``gemini`` provider (secret)
+
+Gate rules (``GateRules``) are not process configuration: they come from the
+``[gate]`` table of the file given to ``evalkit gate --rules``, or from the API's
+compare request, and say which slices of a dataset must not regress.
 """
 
 from __future__ import annotations
@@ -45,9 +49,17 @@ import re
 import tomllib
 from collections.abc import Mapping
 from pathlib import Path
-from typing import Literal
+from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, SecretStr, ValidationError
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    SecretStr,
+    ValidationError,
+    field_validator,
+    model_validator,
+)
 
 from evalkit.blobs import BlobStore, open_store
 from evalkit.pricing import ModelPrice, PriceBook
@@ -346,3 +358,73 @@ def _token_digests(raw: str) -> tuple[bytes, ...]:
         if len(token) < MIN_TOKEN_LENGTH:
             raise ConfigError(f"every API token must be at least {MIN_TOKEN_LENGTH} characters")
     return tuple(hashlib.sha256(t.encode()).digest() for t in tokens)
+
+
+# Gate rules -----------------------------------------------------------------
+
+# How cases are grouped into slices: by each of their tags, by their split, or by
+# the value of one metadata key (``metadata.region``). See ``evalkit.slices``.
+SLICE_BY = r"^(tag|split|metadata\.[^\x00-\x1f\x7f]{1,128})$"
+# Below this many paired cases a slice is reported but not tested: a test on a
+# handful of cases can only show an effect far larger than any gate cares about,
+# and each test it adds to the Holm family costs every other slice power.
+DEFAULT_MIN_SLICE_SIZE = 20
+MAX_SLICE_RULES = 256
+
+
+class SliceRule(BaseModel):
+    """A slice that must not regress: on every metric compared, or on ``metrics``."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    slice: str = Field(min_length=1, max_length=256, pattern=r"^[^\x00-\x1f\x7f]+$")
+    metrics: tuple[str, ...] = Field(default=(), max_length=32)
+
+
+class GateRules(BaseModel):
+    """Per-slice gating: how to slice the cases, the smallest slice that is tested,
+    and which slices fail the gate when they regress. A named slice that is missing
+    from the compared cases is an error; one too small to test fails the gate, since
+    it cannot show that it did not regress. ``any_slice`` fails the gate on a
+    regression in any tested slice."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    by: str | None = Field(default=None, pattern=SLICE_BY)
+    min_slice_size: int = Field(default=DEFAULT_MIN_SLICE_SIZE, ge=2, le=100_000)
+    require: tuple[SliceRule, ...] = Field(default=(), max_length=MAX_SLICE_RULES)
+    any_slice: bool = False
+
+    @field_validator("require", mode="before")
+    @classmethod
+    def _names(cls, value: Any) -> Any:
+        # ``require = ["billing", {slice = "refunds", metrics = ["exact"]}]``
+        if isinstance(value, list | tuple):
+            return [{"slice": v} if isinstance(v, str) else v for v in value]
+        return value
+
+    @model_validator(mode="after")
+    def _consistent(self) -> GateRules:
+        if (self.require or self.any_slice) and self.by is None:
+            raise ValueError('slice rules need by = "tag", "split" or "metadata.KEY"')
+        names = [r.slice for r in self.require]
+        repeated = sorted({n for n in names if names.count(n) > 1})
+        if repeated:
+            raise ValueError(f"slice(s) required more than once: {', '.join(repeated)}")
+        return self
+
+    @property
+    def gating(self) -> bool:
+        return bool(self.require) or self.any_slice
+
+
+def load_gate_rules(path: str) -> GateRules:
+    """The ``[gate]`` table of a TOML file. Raises ConfigError naming the file."""
+    table = load_toml_table(path, "gate")
+    try:
+        return GateRules.model_validate(table)
+    except ValidationError as exc:
+        problems = "; ".join(
+            f"{'.'.join(str(p) for p in e['loc']) or 'gate'}: {e['msg']}" for e in exc.errors()
+        )
+        raise ConfigError(f"{path}: [gate] {problems}") from None

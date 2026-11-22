@@ -37,7 +37,14 @@ from sqlalchemy.orm import Session, sessionmaker
 
 from evalkit import __version__, aggregates, blobs, cache, runqueue
 from evalkit.api import serve
-from evalkit.config import ConfigError, Settings, parse_duration, parse_size
+from evalkit.config import (
+    ConfigError,
+    GateRules,
+    Settings,
+    load_gate_rules,
+    parse_duration,
+    parse_size,
+)
 from evalkit.conformance import AgentConformance, ConformanceReport
 from evalkit.dataset_edits import (
     DatasetEdit,
@@ -95,6 +102,7 @@ from evalkit.scorers.registry import (
     judge_from_spec,
     similarity_from_spec,
 )
+from evalkit.slices import SliceReport
 from evalkit.targets.base import TargetError
 from evalkit.targets.http import HttpTarget
 from evalkit.targets.specs import HttpTargetSpec
@@ -485,12 +493,16 @@ async def cmd_gate(args: argparse.Namespace, app: App) -> int:
     report = _compare(args, app)
     _emit(app.out, report, args.json, _format_compare)
     if not report.passed:
-        _err(f"regression in: {', '.join(report.regressions)}")
+        if report.regressions:
+            _err(f"regression in: {', '.join(report.regressions)}")
+        for failure in report.slices.failures if report.slices else []:
+            _err(failure)
         return EXIT_REGRESSION
     return EXIT_OK
 
 
 def _compare(args: argparse.Namespace, app: App) -> CompareReport:
+    rules = _gate_rules(args)
     with app.sessions() as session:
         return compare_runs(
             session,
@@ -500,7 +512,30 @@ def _compare(args: argparse.Namespace, app: App) -> CompareReport:
             min_effect=args.min_effect,
             metrics=args.metric or None,
             allow_judge_change=args.allow_judge_change,
+            slices=rules,
         )
+
+
+def _gate_rules(args: argparse.Namespace) -> GateRules | None:
+    """Slice rules from ``--rules FILE``, with the slice flags over them."""
+    try:
+        rules = load_gate_rules(args.rules) if args.rules else GateRules()
+    except ConfigError as exc:
+        raise CliError(str(exc), EXIT_INPUT) from None
+    fields = rules.model_dump()
+    if args.by is not None:
+        fields["by"] = args.by
+    if args.min_slice_size is not None:
+        fields["min_slice_size"] = args.min_slice_size
+    if args.require_slice:
+        fields["require"] = [*fields["require"], *args.require_slice]
+    if args.any_slice:
+        fields["any_slice"] = True
+    try:
+        rules = GateRules.model_validate(fields)
+    except ValidationError as exc:
+        raise CliError(_describe(exc), EXIT_INPUT) from None
+    return None if rules.by is None else rules
 
 
 async def cmd_estimate(args: argparse.Namespace, app: App) -> int:
@@ -930,24 +965,7 @@ def build_parser() -> argparse.ArgumentParser:
     show.add_argument("run", help="run id or label:NAME")
     show.set_defaults(handler=cmd_show)
 
-    for name, handler, text in (
-        ("compare", cmd_compare, "compare two runs"),
-        ("gate", cmd_gate, "exit 1 if the candidate is worse than the baseline"),
-    ):
-        p = with_json(sub.add_parser(name, help=text))
-        p.add_argument("baseline", help="run id or label:NAME")
-        p.add_argument("candidate", help="run id or label:NAME")
-        p.add_argument("--alpha", type=float, default=0.05, help="significance level")
-        p.add_argument(
-            "--min-effect", type=float, default=0.0, help="ignore differences smaller than this"
-        )
-        p.add_argument("--metric", action="append", help="metric to compare (repeatable)")
-        p.add_argument(
-            "--allow-judge-change",
-            action="store_true",
-            help="compare even if a metric's judge (provider, model, effort, rubric) changed",
-        )
-        p.set_defaults(handler=handler)
+    _add_compare_commands(sub, with_json)
 
     _add_report_commands(sub)
 
@@ -978,6 +996,48 @@ def build_parser() -> argparse.ArgumentParser:
     _add_agent_commands(sub)
     sub.add_parser("serve", help="run the HTTP API (EVALKIT_HOST, EVALKIT_PORT)")
     return parser
+
+
+def _add_compare_commands(
+    sub: Any, with_json: Callable[[argparse.ArgumentParser], argparse.ArgumentParser]
+) -> None:
+    for name, handler, text in (
+        ("compare", cmd_compare, "compare two runs"),
+        ("gate", cmd_gate, "exit 1 if the candidate is worse than the baseline"),
+    ):
+        p = with_json(sub.add_parser(name, help=text))
+        p.add_argument("baseline", help="run id or label:NAME")
+        p.add_argument("candidate", help="run id or label:NAME")
+        p.add_argument("--alpha", type=float, default=0.05, help="significance level")
+        p.add_argument(
+            "--min-effect", type=float, default=0.0, help="ignore differences smaller than this"
+        )
+        p.add_argument("--metric", action="append", help="metric to compare (repeatable)")
+        p.add_argument(
+            "--allow-judge-change",
+            action="store_true",
+            help="compare even if a metric's judge (provider, model, effort, rubric) changed",
+        )
+        p.add_argument(
+            "--by",
+            help="also compare inside each slice: tag, split or metadata.KEY",
+        )
+        p.add_argument(
+            "--min-slice-size",
+            type=int,
+            help="test a slice only with this many paired cases (default 20)",
+        )
+        p.add_argument(
+            "--require-slice",
+            action="append",
+            metavar="NAME",
+            help="fail if this slice regresses or is too small to test (repeatable)",
+        )
+        p.add_argument(
+            "--any-slice", action="store_true", help="fail if any tested slice regresses"
+        )
+        p.add_argument("--rules", metavar="FILE", help="TOML file with a [gate] table")
+        p.set_defaults(handler=handler)
 
 
 def _add_report_commands(sub: Any) -> None:
@@ -1229,7 +1289,7 @@ def _jsonable(value: Any) -> Any:
 
 def _extra(value: Any) -> dict[str, Any]:
     if isinstance(value, CompareReport):
-        return {"passed": value.passed}
+        return {"passed": value.passed, "failures": value.failures}
     if isinstance(value, MatrixReport):
         return {"complete": value.complete, "frontier": value.frontier}
     if hasattr(value, "max_total_cost_usd"):
@@ -1331,8 +1391,37 @@ def _format_compare(r: CompareReport) -> str:
             f"changed, {d.only_baseline} only in the baseline, {d.only_candidate} only in "
             "the candidate)"
         )
-    lines += ["", "PASS: no regression" if r.passed else f"FAIL: {', '.join(r.regressions)}"]
+    if r.slices is not None:
+        lines += _format_slices(r.slices)
+    if r.passed:
+        lines += ["", "PASS: no regression"]
+    else:
+        lines += ["", f"FAIL: {', '.join(r.regressions) or 'slice rules'}"]
+        lines += [f"  {f}" for f in (r.slices.failures if r.slices else [])]
     return "\n".join(lines) + "\n"
+
+
+def _format_slices(r: SliceReport) -> list[str]:
+    lines = [
+        "",
+        f"slices by {r.by}: {len(r.slices)} slice(s), {r.tests} test(s), p adjusted by Holm "
+        f"across them; tested from {r.min_size} paired cases"
+        + (f"; {r.unsliced} case(s) in no slice" if r.unsliced else ""),
+        f"{'slice':<20}{'metric':<16}{'n':>6}{'base':>8}{'cand':>8}{'diff':>9}"
+        f"{'p (adj)':>10}  verdict",
+    ]
+    for s in r.slices:
+        rows = [
+            f"{c.metric:<16}{c.n_pairs:>6}{_pct(c.baseline_mean):>8}{_pct(c.candidate_mean):>8}"
+            f"{c.difference * 100:>+8.1f}%{c.p_adjusted:>10.4f}  {c.verdict}"
+            for c in s.comparisons
+        ] + [
+            f"{metric:<16}{n:>6}{'-':>8}{'-':>8}{'-':>9}{'-':>10}  too small to test"
+            for metric, n in s.too_small.items()
+        ]
+        name = s.name if len(s.name) < 20 else s.name[:18] + "…"
+        lines += [f"{name if i == 0 else '':<20}{row}" for i, row in enumerate(rows)]
+    return lines
 
 
 def _format_estimate(e: Any) -> str:

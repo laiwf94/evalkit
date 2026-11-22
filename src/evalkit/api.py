@@ -46,7 +46,7 @@ from starlette.exceptions import HTTPException as StarletteHTTPException
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from evalkit import metrics, runqueue
-from evalkit.config import ConfigError, Settings
+from evalkit.config import ConfigError, GateRules, Settings
 from evalkit.dataset_edits import (
     DatasetEdit,
     VersionInfo,
@@ -185,6 +185,8 @@ class CompareRequest(BaseModel):
     metrics: list[str] | None = Field(default=None, max_length=32)
     # Compare even when a metric's judge differs between the runs.
     allow_judge_change: bool = False
+    # Also compare inside each slice, and gate on the slice rules (``evalkit.slices``).
+    slices: GateRules | None = None
 
 
 def _iso(value: datetime | None) -> str | None:
@@ -669,8 +671,9 @@ async def compare(body: CompareRequest, svc: Svc) -> dict[str, Any]:
             min_effect=body.min_effect,
             metrics=body.metrics,
             allow_judge_change=body.allow_judge_change,
+            slices=body.slices,
         )
-        return {**asdict(report), "passed": report.passed}
+        return {**asdict(report), "passed": report.passed, "failures": report.failures}
 
     return await _in_session(svc, run)
 

@@ -149,6 +149,54 @@ $ evalkit gate label:before-edit label:after-edit
 note: support v3 vs v4: compared on the 118 cases both have unchanged; 3 left out (1 changed, 1 only in the baseline, 1 only in the candidate)
 ```
 
+### Slices
+
+An average over the whole dataset can hide a regression in one category. With
+`--by`, `evalkit compare` and `evalkit gate` also compare every metric inside
+each slice of the cases: each tag (`--by tag`), each split (`--by split`) or
+each value of a metadata key (`--by metadata.region`). The slice tests are one
+family under Holm's correction, so looking at many slices does not make a
+chance regression more likely, and a slice is only tested from 20 cases scored
+in both runs (`--min-slice-size`):
+
+```console
+$ evalkit gate label:baseline label:candidate --by tag --require-slice billing
+metric              base    cand     diff                95% CI   p (adj)    d_z  verdict
+exact              78.0%   77.0%    -1.0%          [-6.8, +5.0]    0.8008  -0.02  no detectable change
+
+slices by tag: 4 slice(s), 3 test(s), p adjusted by Holm across them; tested from 20 paired cases
+slice               metric               n    base    cand     diff   p (adj)  verdict
+account             exact              178   75.3%   78.1%    +2.8%    0.6140  no detectable change
+billing             exact               40  100.0%   37.5%   -62.5%    0.0003  worse
+rare                exact                6       -       -        -         -  too small to test
+shipping            exact              182   75.8%   84.6%    +8.8%    0.0848  no detectable change
+
+FAIL: slice rules
+  slice billing: exact regressed
+```
+
+Without slice rules the slices are information only. `--require-slice NAME`
+(repeatable) fails the gate when that slice regresses, or when it is too small
+to test, since then it cannot show that it did not; a name that is not among
+the compared cases is an error (exit 2), so a typo never passes. `--any-slice`
+fails on a regression in any tested slice. The same rules can live in a file
+for `--rules`, with flags over them:
+
+```toml
+# gate.toml
+[gate]
+by = "tag"
+min_slice_size = 20
+require = ["billing", { slice = "refunds", metrics = ["exact"] }]
+any_slice = false
+```
+
+`POST /v1/compare` takes the same table as `"slices": {"by": "tag", "require":
+["billing"]}` and returns `slices` and `failures`. A case with several tags is
+in several slices; a list in metadata works the same way; numbers and booleans
+are named by their JSON (`3`, `true`). On two versions of a dataset, slices are
+taken over the cases both versions have unchanged.
+
 ## Model matrices
 
 A `[matrix]` table runs the same dataset and scorers over several models,
@@ -875,8 +923,8 @@ different judge it would refuse (exit 3) unless `--allow-judge-change` is given.
 | `evalkit cancel RUN_ID` | Cancel a queued or running run. |
 | `evalkit show RUN` | Summary of a run. |
 | `evalkit run verify RUN_ID [--repair]` | Recompute a run's aggregates and score arrays from its results; exit 3 on any difference, or rewrite them with `--repair`. |
-| `evalkit compare BASE CAND` | Paired comparison per metric. |
-| `evalkit gate BASE CAND [--allow-judge-change]` | Same, and exit 1 if any gated metric is worse; exit 3 if a metric's judge changed, unless allowed. |
+| `evalkit compare BASE CAND [--by tag\|split\|metadata.KEY]` | Paired comparison per metric, and per slice with `--by`. |
+| `evalkit gate BASE CAND [--allow-judge-change] [--by KEY] [--require-slice NAME]... [--any-slice] [--rules FILE]` | Same, and exit 1 if any gated metric is worse or a slice rule fails; exit 3 if a metric's judge changed, unless allowed. |
 | `evalkit report matrix MATRIX [--metric M] [--latency p50\|p95]` | A matrix's variants, their cost/quality/latency frontier and paired steps along it. |
 | `evalkit report rag RUN [--threshold [NAME=]V]... [--limit N]` | Each failing case of a RAG run attributed to a retrieval miss, an unsupported answer or ignored context. |
 | `evalkit estimate CONFIG` | Cost estimate from token counts (per variant for a matrix). |
@@ -967,7 +1015,7 @@ Every `/v1` route takes `Authorization: Bearer <token>`.
 | `POST /v1/runs/{id}/cancel` | Cancel a run: `cancelled` at once if nobody is executing it, else `cancelling` until every worker has stopped. 409 for a completed run. |
 | `POST /v1/matrices` | Queue every run of a config with a `matrix`. 202 with the matrix id and run summaries. |
 | `GET /v1/matrices/{id}[?metric=&latency=p95]` | The matrix report: variants, frontier, paired steps. |
-| `POST /v1/compare` | Paired comparison of two runs (on two versions of a dataset: over the cases both have unchanged, reported in `dataset_change`). |
+| `POST /v1/compare` | Paired comparison of two runs (on two versions of a dataset: over the cases both have unchanged, reported in `dataset_change`), and per slice with `slices` (`by`, `min_slice_size`, `require`, `any_slice`); `passed` and `failures` say whether the gate passes. |
 | `GET /healthz`, `GET /metrics` | Health (no auth, checks the database) and Prometheus metrics. |
 
 Errors look like `{"error":{"code":"invalid_argument","message":"...","request_id":"..."}}`
@@ -1002,6 +1050,7 @@ tests compare the bodies they received with the exact bodies expected.
 | Three providers end to end | `tests/test_providers_end_to_end.py` serves strict fake Claude, OpenAI, Gemini and grader APIs on local sockets and drives the CLI (the matrix run as a child process) through `examples/providers` unchanged: each provider gets exactly its 120 requests with the registry prompt, token counts and costs match each provider's price list, the judge is called once per distinct answer and only on the grader, the frontier and both paired steps match the known accuracies, and a promoted prompt version runs, leaves the matrix runs on version 1 and passes the gate as better. |
 | A booking agent end to end | `tests/test_booking_end_to_end.py` serves the reference agent and its `--skip-lookup` twin on local sockets and drives the CLI through `examples/agents` unchanged. 50 dialogues with a scripted user end on goal reached, give-up or the turn limit. A run SIGKILLed mid-dialogue in a child process resumes with every outcome, step and turn equal to an uninterrupted run, the agent answers each step once over both processes, and at least one dialogue is finished from where the kill left it. The blind agent confirms as many bookings and fails the gate on `tool_calls` (-54%). |
 | A RAG pipeline end to end | `tests/test_rag_demo.py` serves `examples/rag/server.py` on a local socket and drives the CLI through `examples/rag` unchanged. Every case stores the recorded ranking and an answer copied from an answering document among its top 3; on the regressed retriever the eight questions that lose that document score 0 on `answer_completeness` and `context_recall`, mean recall@3 is exactly 5/9, the RAG report attributes all eight to a retrieval miss, and the gate fails on recall@3, nDCG@5 and answer completeness. A rerun sends nothing to the fakes. |
+| Slices | `tests/test_slices.py` plants a regression in one tag: two fake runs at 80% accuracy whose differences cancel over 400 cases (-1.0%, no detectable change), while the 40 `billing` cases lose 25 and win none. `--by tag` finds billing worse and `--require-slice billing` fails the gate; splits and regions, which dilute it, pass. Holm-adjusted p-values equal Holm over the tested pairs (Hypothesis), 40 null slices report a false regression in at most 2 of 20 trials, too-small slices are left out of the family and fail a rule that requires them, and on two dataset versions the slices cover only the unchanged cases. |
 | API and CLI | Every endpoint, error code and exit code, over ASGI and over the wire. |
 
 ```console
@@ -1065,6 +1114,7 @@ src/evalkit/worker.py      the worker daemon: LISTEN/NOTIFY wake-up, heartbeats,
 src/evalkit/stats.py       bootstrap, permutation test, effect size, Holm
 src/evalkit/aggregates.py  per-run aggregates, latency histograms, score arrays, run verify
 src/evalkit/report.py      run summaries and comparisons
+src/evalkit/slices.py      per-slice comparisons (tag, split, metadata), Holm over slices, slice gate rules
 src/evalkit/pricing.py     versioned per-provider price lists, overrides, run price records,
                            token estimates for providers that cannot count
 src/evalkit/estimate.py    cost estimates from token counts
