@@ -535,13 +535,22 @@ def test_compare_preconditions(sessions: sessionmaker[Session], dataset: str) ->
         with pytest.raises(InvalidInputError, match="not in both runs"):
             compare_runs(s, done.id, done.id, metrics=["nope"])
         import_dataset(s, "qa", make_cases(10))
+        # Same content under another name is comparable; other content is not.
+        import_dataset(s, "other", make_cases(39))
     other = r.create_run(config())
     asyncio.run(r.execute(other.id))
+    elsewhere = r.create_run(config("other"))
+    asyncio.run(r.execute(elsewhere.id))
     ungated = r.create_run(config(scorers=[{"type": "exact", "gate": False}]))
     asyncio.run(r.execute(ungated.id))
     with sessions() as s:
-        with pytest.raises(PreconditionError, match="different dataset contents"):
-            compare_runs(s, done.id, other.id)
+        # Another version of the same dataset: paired on the cases it kept unchanged.
+        across = compare_runs(s, done.id, other.id)
+        assert across.dataset_change is not None
+        assert (across.dataset_change.shared, across.dataset_change.only_baseline) == (10, 30)
+        assert across.comparisons[0].n_pairs == 10
+        with pytest.raises(PreconditionError, match="different datasets"):
+            compare_runs(s, done.id, elsewhere.id)
         with pytest.raises(PreconditionError, match="no gated metric"):
             compare_runs(s, other.id, ungated.id)
         with pytest.raises(NotFoundError):

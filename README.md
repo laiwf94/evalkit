@@ -77,8 +77,10 @@ rubric = "5: names the same menu path as the reference ..."
 
 The dataset is a JSONL file of test cases with ids, inputs, expected values,
 tags and splits. Each import is versioned and identified by a SHA-256 of its
-content, so re-importing the same file is a no-op, and two runs can only be
-compared if they used exactly the same cases.
+content, so re-importing the same file is a no-op. Cases can also be edited
+in place, which makes a new version (see [Editing a dataset](#editing-a-dataset)).
+Two runs are compared on the same cases: all of them when the runs used the
+same content, or the cases that two versions of one dataset have unchanged.
 
 The target is the thing under test: a prompt template on a model (Claude by
 default, or `provider = "openai"`, `"gemini"` or a server named in
@@ -97,6 +99,55 @@ OpenAI-compatible server (`provider = "openai"`, keys in `OPENAI_API_KEY` and
 need not grade its own family. Each run records which judge graded it, and the
 gate refuses to compare runs whose judges differ unless given
 `--allow-judge-change`. Your own scorers plug in through an entry point.
+
+### Editing a dataset
+
+An edit names the version it was made against by content hash and becomes the
+next version, with that version as its parent:
+
+```console
+$ cat fix.json
+{"update": [{"id": "q017", "expected": "Settings > Plan", "tags": ["billing"]}],
+ "upsert": [{"id": "q121", "input": {"question": "How do I export invoices?"},
+             "expected": "Billing > Invoices > Export"}],
+ "delete": ["q033"], "note": "billing menu was renamed"}
+$ evalkit dataset edit support fix.json --base 3
+support edited: version 4 (9c0d41e7a2b8), +1 added, ~1 changed, -1 removed
+$ evalkit dataset diff support 3
+support v3 (5b1f07c9d3e2) -> v4 (9c0d41e7a2b8): 1 added, 1 changed, 1 removed, 118 unchanged
++ q121
+- q033
+~ q017
+    expected: "Settings > Billing" -> "Settings > Plan"
+    tags: +billing
+$ evalkit dataset log support
+v4  9c0d41e7a2b8  edit    from v3  120 cases  +1 added, ~1 changed, -1 removed  ...  billing menu was renamed
+v3  5b1f07c9d3e2  import  from v2  120 cases  +0 added, ~4 changed, -0 removed  ...
+```
+
+`upsert` adds cases or replaces them whole, `update` sets some fields of a
+case (`input`, `expected`, `tags`, `split`, `metadata`; the rest are kept),
+and `delete` removes cases; a case id may appear in one of them only. Cases
+keep their positions and new ones are appended. `--base` takes a version
+number or a content hash (or put `"base"` in the file); the API takes the same
+JSON as `PATCH /v1/datasets/{name}`.
+
+Edits are checked against the newest version, so two people cannot silently
+overwrite each other: if the dataset moved on since the version you edited,
+the edit is refused (exit 3, or 409) and the message names the newest version
+to apply it to. Sending an edit that was already applied returns the version
+it made, so a client can retry safely. An import of a new file is recorded the
+same way, as a child of the newest version, so the log says what each file
+changed.
+
+A gate between runs on two versions of one dataset compares the cases both
+versions have unchanged, and says how many it left out:
+
+```console
+$ evalkit gate label:before-edit label:after-edit
+...
+note: support v3 vs v4: compared on the 118 cases both have unchanged; 3 left out (1 changed, 1 only in the baseline, 1 only in the candidate)
+```
 
 ## Model matrices
 
@@ -832,6 +883,9 @@ different judge it would refuse (exit 3) unless `--allow-judge-change` is given.
 | `evalkit calibrate --judge J LABELS` | Judge agreement with human labels (rubric, pairwise, trajectory or faithfulness judges). |
 | `evalkit calibrate --scorer S LABELS [--folds 5]` | The `semantic_similarity` threshold that agrees best with 0/1 labels, with a cross-validated kappa. |
 | `evalkit dataset import/export/list` | Manage datasets. |
+| `evalkit dataset edit NAME FILE [--base V\|HASH]` | Apply a JSON edit (`upsert`, `update`, `delete`, `note`) as the next version; exit 3 if the dataset moved on since the base. |
+| `evalkit dataset diff NAME FROM [TO] [--limit N]` | Added, removed and changed cases between two versions, field by field (`TO` defaults to the newest). |
+| `evalkit dataset log NAME [--version V]` | Every version with its parent, origin, note and changes; with `--version`, that version's lineage. |
 | `evalkit prompt push NAME FILE [--system FILE] [--note N]` | Store a prompt file (TOML with `system` and `template`, or a template file) as a new version; unchanged content is a no-op. |
 | `evalkit prompt show REF`, `evalkit prompt list` | A version's content and labels; every prompt with its newest version and labels. |
 | `evalkit prompt diff REF [REF]` | Unified diff of two versions (the second defaults to the newest). |
@@ -895,7 +949,10 @@ Every `/v1` route takes `Authorization: Bearer <token>`.
 |---|---|
 | `POST /v1/datasets/{name}` | Import JSONL (body). 201 for a new version, 200 if the content already exists. |
 | `GET /v1/datasets` | All datasets and versions. |
-| `GET /v1/datasets/{name}/versions/{v}[/export]` | Metadata, or the cases as JSONL. |
+| `GET /v1/datasets/{name}/versions/{v}[/export]` | Metadata (with parent version, origin, note and changes), or the cases as JSONL. |
+| `PATCH /v1/datasets/{name}` | Edit cases: `{"base": HASH, "upsert": [...], "update": [...], "delete": [...], "note": ""}`. 201 for a new version; 200 if it changes nothing or the content is already a version (`existing`); 409 naming the newest version if `base` is not the newest. |
+| `GET /v1/datasets/{name}/log`, `GET /v1/datasets/{name}/versions/{v}/lineage` | Every version, newest first; one version and its ancestors. |
+| `GET /v1/datasets/{name}/diff?from=&to=` | Added, removed and changed cases with field-level changes (`to` defaults to the newest). |
 | `POST /v1/prompts/{name}/versions` | Push `{"template", "system", "note", "description"}`. 201 for a new version, 200 if the content already exists. |
 | `GET /v1/prompts`, `GET /v1/prompts/{name}` | All prompts with their labels; one prompt's labels and versions. |
 | `GET /v1/prompts/{name}/versions/{version\|label\|latest}` | A version and its content. |
@@ -910,7 +967,7 @@ Every `/v1` route takes `Authorization: Bearer <token>`.
 | `POST /v1/runs/{id}/cancel` | Cancel a run: `cancelled` at once if nobody is executing it, else `cancelling` until every worker has stopped. 409 for a completed run. |
 | `POST /v1/matrices` | Queue every run of a config with a `matrix`. 202 with the matrix id and run summaries. |
 | `GET /v1/matrices/{id}[?metric=&latency=p95]` | The matrix report: variants, frontier, paired steps. |
-| `POST /v1/compare` | Paired comparison of two runs. |
+| `POST /v1/compare` | Paired comparison of two runs (on two versions of a dataset: over the cases both have unchanged, reported in `dataset_change`). |
 | `GET /healthz`, `GET /metrics` | Health (no auth, checks the database) and Prometheus metrics. |
 
 Errors look like `{"error":{"code":"invalid_argument","message":"...","request_id":"..."}}`

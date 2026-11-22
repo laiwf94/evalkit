@@ -24,7 +24,7 @@ from pydantic import (
     field_validator,
     model_validator,
 )
-from sqlalchemy import func, select
+from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
@@ -212,32 +212,38 @@ def import_dataset(
     if len(description) > 2000:
         raise InvalidInputError("description is longer than 2000 characters")
     digest = content_hash(cases)
+    hashes = [case_hash(c) for c in cases]
     for _ in range(3):
         existing = session.scalar(
             select(Dataset).where(Dataset.name == name, Dataset.content_hash == digest)
         )
         if existing is not None:
             return existing, False
-        latest = session.scalar(select(func.max(Dataset.version)).where(Dataset.name == name))
+        latest = session.scalar(
+            select(Dataset).where(Dataset.name == name).order_by(Dataset.version.desc()).limit(1)
+        )
         dataset = Dataset(
             name=name,
-            version=(latest or 0) + 1,
+            version=1 if latest is None else latest.version + 1,
             content_hash=digest,
             case_count=len(cases),
             description=description,
+            origin="import",
         )
-        dataset.cases = [
-            DatasetCase(
-                position=i,
-                case_id=c.id,
-                input=c.input,
-                expected=c.expected,
-                tags=list(c.tags),
-                split=c.split,
-                meta=c.metadata,
+        if latest is not None:
+            # An import is recorded as derived from the newest version, so the log
+            # says what the new file changed.
+            added, changed, removed = change_counts(
+                case_hashes(session, latest.id),
+                dict(zip((c.id for c in cases), hashes, strict=True)),
             )
-            for i, c in enumerate(cases)
-        ]
+            dataset.parent_id = latest.id
+            dataset.cases_added, dataset.cases_changed, dataset.cases_removed = (
+                added,
+                changed,
+                removed,
+            )
+        dataset.cases = new_rows(cases, hashes)
         session.add(dataset)
         try:
             session.commit()
@@ -247,6 +253,45 @@ def import_dataset(
             continue
         return dataset, True
     raise InvalidInputError(f"could not allocate a version for dataset {name!r}; retry")
+
+
+def case_hash(case: Case) -> str:
+    """SHA-256 of one case in canonical JSON, stored with its row."""
+    return sha256_hex(case.canonical())
+
+
+def new_rows(cases: Sequence[Case], hashes: Sequence[str]) -> list[DatasetCase]:
+    return [
+        DatasetCase(
+            position=i,
+            case_id=c.id,
+            input=c.input,
+            expected=c.expected,
+            tags=list(c.tags),
+            split=c.split,
+            meta=c.metadata,
+            case_hash=h,
+        )
+        for i, (c, h) in enumerate(zip(cases, hashes, strict=True))
+    ]
+
+
+def case_hashes(session: Session, dataset_id: int) -> dict[str, str]:
+    """Case id to case hash for one version, without reading the cases."""
+    rows = session.execute(
+        select(DatasetCase.case_id, DatasetCase.case_hash).where(
+            DatasetCase.dataset_id == dataset_id
+        )
+    )
+    return {str(case_id): str(digest) for case_id, digest in rows.all()}
+
+
+def change_counts(before: dict[str, str], after: dict[str, str]) -> tuple[int, int, int]:
+    """(added, changed, removed) going from ``before`` to ``after`` (id to hash)."""
+    added = sum(1 for k in after if k not in before)
+    changed = sum(1 for k, h in after.items() if k in before and before[k] != h)
+    removed = sum(1 for k in before if k not in after)
+    return added, changed, removed
 
 
 def get_dataset(session: Session, name: str, version: int | None = None) -> Dataset:

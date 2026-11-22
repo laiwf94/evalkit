@@ -55,6 +55,18 @@ class Dataset(Base):
     case_count: Mapped[int] = mapped_column(Integer)
     description: Mapped[str] = mapped_column(Text, default="")
     created_at: Mapped[datetime] = mapped_column(default=utcnow)
+    # Lineage (``evalkit.dataset_edits``): the version this one was made from (the
+    # newest version when it was imported, the edited version for an edit), how it
+    # was made ("import" or "edit"), the edit's note, and how many cases it added,
+    # changed and removed relative to the parent. A first version has no parent and
+    # no counts.
+    # No foreign key: versions are never deleted (see migration 0016).
+    parent_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    origin: Mapped[str] = mapped_column(String(16), default="import")
+    note: Mapped[str] = mapped_column(Text, default="")
+    cases_added: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    cases_changed: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    cases_removed: Mapped[int | None] = mapped_column(Integer, nullable=True)
 
     cases: Mapped[list[DatasetCase]] = relationship(
         back_populates="dataset", order_by="DatasetCase.position", cascade="all, delete-orphan"
@@ -77,6 +89,9 @@ class DatasetCase(Base):
     tags: Mapped[list[Any]] = mapped_column(default=list)
     split: Mapped[str | None] = mapped_column(String(64), nullable=True)
     meta: Mapped[dict[str, Any]] = mapped_column("metadata", default=dict)
+    # SHA-256 of the case in canonical JSON (``Case.canonical``): two versions'
+    # rows with the same case id and hash are the same case, unchanged.
+    case_hash: Mapped[str] = mapped_column(String(64))
 
     dataset: Mapped[Dataset] = relationship(back_populates="cases")
 

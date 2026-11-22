@@ -47,6 +47,14 @@ from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from evalkit import metrics, runqueue
 from evalkit.config import ConfigError, Settings
+from evalkit.dataset_edits import (
+    DatasetEdit,
+    VersionInfo,
+    apply_edit,
+    dataset_log,
+    diff_versions,
+    lineage,
+)
 from evalkit.datasets import (
     get_dataset,
     import_dataset,
@@ -183,7 +191,11 @@ def _iso(value: datetime | None) -> str | None:
     return as_utc(value).isoformat() if value else None
 
 
-def _dataset_json(ds: Dataset) -> dict[str, Any]:
+def _dataset_json(ds: Dataset, session: Session | None = None) -> dict[str, Any]:
+    parent = None
+    if ds.parent_id is not None and session is not None:
+        found = session.get(Dataset, ds.parent_id)
+        parent = None if found is None else found.version
     return {
         "name": ds.name,
         "version": ds.version,
@@ -191,7 +203,19 @@ def _dataset_json(ds: Dataset) -> dict[str, Any]:
         "case_count": ds.case_count,
         "description": ds.description,
         "created_at": _iso(ds.created_at),
+        "origin": ds.origin,
+        "parent_version": parent,
+        "note": ds.note,
+        "changes": None
+        if ds.cases_added is None
+        else {"added": ds.cases_added, "changed": ds.cases_changed, "removed": ds.cases_removed},
     }
+
+
+def _version_info_json(v: VersionInfo) -> dict[str, Any]:
+    body = asdict(v)
+    body["created_at"] = _iso(v.created_at)
+    return body
 
 
 def _summary_json(session: Session, run_id: str) -> dict[str, Any]:
@@ -260,7 +284,29 @@ async def put_dataset(
 
     def store(session: Session) -> tuple[dict[str, Any], bool]:
         ds, created = import_dataset(session, name, cases, description)
-        return _dataset_json(ds), created
+        return _dataset_json(ds, session), created
+
+    body, created = await _in_session(svc, store)
+    if not created:
+        response.status_code = 200
+    return body
+
+
+@router.patch("/datasets/{name}", status_code=201)
+async def patch_dataset(
+    name: str, edit: DatasetEdit, response: Response, svc: Svc
+) -> dict[str, Any]:
+    """Apply a case-level edit to the version whose content hash is ``base``, as
+    the next version (201). 200 with the version when the edit changes nothing or
+    gives content that is already a version (``existing``); 409 naming the newest
+    version when ``base`` is not the newest."""
+    validate_name(name)
+
+    def store(session: Session) -> tuple[dict[str, Any], bool]:
+        result = apply_edit(session, name, edit)
+        return {**_dataset_json(result.dataset, session), "existing": result.existing}, (
+            result.created
+        )
 
     body, created = await _in_session(svc, store)
     if not created:
@@ -270,13 +316,39 @@ async def put_dataset(
 
 @router.get("/datasets")
 async def get_datasets(svc: Svc) -> dict[str, Any]:
-    rows = await _in_session(svc, lambda s: [_dataset_json(d) for d in list_datasets(s)])
+    rows = await _in_session(svc, lambda s: [_dataset_json(d, s) for d in list_datasets(s)])
     return {"datasets": rows}
+
+
+@router.get("/datasets/{name}/log")
+async def get_dataset_log(name: str, svc: Svc) -> dict[str, Any]:
+    """Every version, newest first, with its parent, origin, note and changes."""
+    rows = await _in_session(svc, lambda s: dataset_log(s, name))
+    return {"versions": [_version_info_json(v) for v in rows]}
+
+
+@router.get("/datasets/{name}/diff")
+async def get_dataset_diff(
+    name: str,
+    svc: Svc,
+    from_: Annotated[int, Query(alias="from", ge=1)],
+    to: Annotated[int | None, Query(ge=1)] = None,
+) -> dict[str, Any]:
+    """Added, removed and changed cases between two versions (``to``: newest),
+    with each changed case's field-level changes."""
+    return await _in_session(svc, lambda s: asdict(diff_versions(s, name, from_, to)))
 
 
 @router.get("/datasets/{name}/versions/{version}")
 async def get_dataset_version(name: str, version: int, svc: Svc) -> dict[str, Any]:
-    return await _in_session(svc, lambda s: _dataset_json(get_dataset(s, name, version)))
+    return await _in_session(svc, lambda s: _dataset_json(get_dataset(s, name, version), s))
+
+
+@router.get("/datasets/{name}/versions/{version}/lineage")
+async def get_dataset_lineage(name: str, version: int, svc: Svc) -> dict[str, Any]:
+    """The version and its ancestors, newest first."""
+    rows = await _in_session(svc, lambda s: lineage(s, name, version))
+    return {"versions": [_version_info_json(v) for v in rows]}
 
 
 @router.get("/datasets/{name}/versions/{version}/export")

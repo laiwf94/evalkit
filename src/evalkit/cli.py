@@ -20,6 +20,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import re
 import signal
 import sys
 import tomllib
@@ -38,6 +39,13 @@ from evalkit import __version__, aggregates, blobs, cache, runqueue
 from evalkit.api import serve
 from evalkit.config import ConfigError, Settings, parse_duration, parse_size
 from evalkit.conformance import AgentConformance, ConformanceReport
+from evalkit.dataset_edits import (
+    DatasetEdit,
+    apply_edit,
+    dataset_log,
+    diff_versions,
+    lineage,
+)
 from evalkit.datasets import (
     get_dataset,
     import_dataset,
@@ -569,12 +577,117 @@ async def cmd_dataset(args: argparse.Namespace, app: App) -> int:
                 await asyncio.to_thread(Path(args.output).write_text, text, encoding="utf-8")
             else:
                 app.out.write(text)
+        elif args.dataset_command == "edit":
+            edit = _read_edit(Path(args.file), args.base, session, args.name)
+            result = apply_edit(session, args.name, edit)
+            ds = result.dataset
+            if result.created:
+                app.out.write(
+                    f"{ds.name} edited: version {ds.version} ({ds.content_hash[:12]}), "
+                    f"{_changes(ds.cases_added, ds.cases_changed, ds.cases_removed)}\n"
+                )
+            elif result.existing:
+                app.out.write(
+                    f"{ds.name} unchanged: the edit gives version {ds.version} "
+                    f"({ds.content_hash[:12]}), which already exists\n"
+                )
+            else:
+                app.out.write(f"{ds.name} unchanged: the edit changes nothing\n")
+        elif args.dataset_command == "diff":
+            found = diff_versions(session, args.name, args.old, args.new)
+            _emit(app.out, found, args.json, lambda d: _format_dataset_diff(d, args.limit))
+        elif args.dataset_command == "log":
+            rows = (
+                lineage(session, args.name, args.version)
+                if args.version is not None
+                else dataset_log(session, args.name)
+            )
+            _emit(app.out, rows, args.json, _format_dataset_log)
         else:
             for ds in list_datasets(session):
                 app.out.write(
                     f"{ds.name}\tv{ds.version}\t{ds.case_count} cases\t{ds.content_hash[:12]}\n"
                 )
     return EXIT_OK
+
+
+def _read_edit(path: Path, base: str | None, session: Session, name: str) -> DatasetEdit:
+    """An edit file (JSON, the body of PATCH /v1/datasets/NAME). ``--base`` gives or
+    overrides its base: a content hash, or a version number to take the hash of."""
+    data = _read_bytes(path)
+    try:
+        raw = json.loads(data.decode("utf-8"))
+    except (UnicodeDecodeError, ValueError, RecursionError) as exc:
+        raise CliError(f"{path} is not valid JSON: {exc}", EXIT_INPUT) from None
+    if not isinstance(raw, dict):
+        raise CliError(f"{path} must hold a JSON object", EXIT_INPUT)
+    if base is not None:
+        version = re.fullmatch(r"v?(\d{1,9})", base)
+        raw["base"] = (
+            base if version is None else get_dataset(session, name, int(version[1])).content_hash
+        )
+    try:
+        return DatasetEdit.model_validate(raw)
+    except ValidationError as exc:
+        raise CliError(f"{path}: {_describe(exc)}", EXIT_INPUT) from None
+
+
+def _changes(added: int | None, changed: int | None, removed: int | None) -> str:
+    if added is None:
+        return "first version"
+    return f"+{added} added, ~{changed} changed, -{removed} removed"
+
+
+def _short(value: Any, width: int = 60) -> str:
+    text = json.dumps(value, ensure_ascii=False, sort_keys=True)
+    return text if len(text) <= width else text[: width - 3] + "..."
+
+
+def _format_field_change(c: Any) -> str:
+    if c.kind == "added":
+        return f"{c.path}: added {_short(c.after)}"
+    if c.kind == "removed":
+        return f"{c.path}: removed (was {_short(c.before)})"
+    if c.path == "tags" and isinstance(c.before, list) and isinstance(c.after, list):
+        plus = [f"+{t}" for t in c.after if t not in c.before]
+        minus = [f"-{t}" for t in c.before if t not in c.after]
+        if plus or minus:
+            return "tags: " + " ".join(plus + minus)
+        return "tags: reordered"
+    return f"{c.path}: {_short(c.before)} -> {_short(c.after)}"
+
+
+def _format_dataset_diff(d: Any, limit: int) -> str:
+    lines = [
+        f"{d.name} v{d.from_version} ({d.from_hash[:12]}) -> v{d.to_version} "
+        f"({d.to_hash[:12]}): {len(d.added)} added, {len(d.changed)} changed, "
+        f"{len(d.removed)} removed, {d.unchanged} unchanged"
+    ]
+    entries = (
+        [f"+ {case_id}" for case_id in d.added]
+        + [f"- {case_id}" for case_id in d.removed]
+        + [
+            f"~ {c.id}" + "".join(f"\n    {_format_field_change(f)}" for f in c.changes)
+            for c in d.changed
+        ]
+    )
+    lines += entries[:limit]
+    if len(entries) > limit:
+        lines.append(f"... and {len(entries) - limit} more (--limit, or --json for all)")
+    return "\n".join(lines) + "\n"
+
+
+def _format_dataset_log(rows: list[Any]) -> str:
+    lines = []
+    for r in rows:
+        parent = "-" if r.parent_version is None else f"v{r.parent_version}"
+        note = f"  {r.note}" if r.note else ""
+        lines.append(
+            f"v{r.version}\t{r.content_hash[:12]}\t{r.origin}\tfrom {parent}\t"
+            f"{r.case_count} cases\t{_changes(r.added, r.changed, r.removed)}\t"
+            f"{r.created_at.isoformat(timespec='seconds')}{note}"
+        )
+    return "\n".join(lines) + "\n"
 
 
 async def cmd_prompt(args: argparse.Namespace, app: App) -> int:
@@ -970,7 +1083,7 @@ def _add_agent_commands(sub: Any) -> None:
 
 
 def _add_maintenance_commands(sub: Any) -> None:
-    ds = sub.add_parser("dataset", help="import, export or list datasets")
+    ds = sub.add_parser("dataset", help="import, edit, diff, log, export or list datasets")
     ds_sub = ds.add_subparsers(dest="dataset_command", required=True)
     imp = ds_sub.add_parser("import")
     imp.add_argument("name")
@@ -981,6 +1094,24 @@ def _add_maintenance_commands(sub: Any) -> None:
     exp.add_argument("--version", type=int)
     exp.add_argument("-o", "--output")
     ds_sub.add_parser("list")
+    edit = ds_sub.add_parser(
+        "edit", help="apply a JSON edit (upsert, update, delete) as the next version"
+    )
+    edit.add_argument("name")
+    edit.add_argument("file", help="JSON: {base, upsert, update, delete, note}")
+    edit.add_argument(
+        "--base", help="the edited version: a content hash or a version number (sets base)"
+    )
+    dif = ds_sub.add_parser("diff", help="field-level changes between two versions")
+    dif.add_argument("name")
+    dif.add_argument("old", type=int, help="version to diff from")
+    dif.add_argument("new", type=int, nargs="?", help="version to diff to (default: newest)")
+    dif.add_argument("--limit", type=int, default=50, help="cases to print (default 50)")
+    dif.add_argument("--json", action="store_true", help="print JSON instead of text")
+    log = ds_sub.add_parser("log", help="every version with its parent and changes")
+    log.add_argument("name")
+    log.add_argument("--version", type=int, help="only this version and its ancestors")
+    log.add_argument("--json", action="store_true", help="print JSON instead of a table")
     ds.set_defaults(handler=cmd_dataset)
 
     cache_cmd = sub.add_parser("cache", help="bound the response cache and check blobs")
@@ -1191,6 +1322,15 @@ def _format_compare(r: CompareReport) -> str:
         )
     for change in r.judge_changes:
         lines.append(f"warning: judge changed for {change.metric}: {', '.join(change.changes)}")
+    if r.dataset_change is not None:
+        d = r.dataset_change
+        left_out = d.changed + d.only_baseline + d.only_candidate
+        lines.append(
+            f"note: {d.dataset} v{d.baseline_version} vs v{d.candidate_version}: compared on "
+            f"the {d.shared} cases both have unchanged; {left_out} left out ({d.changed} "
+            f"changed, {d.only_baseline} only in the baseline, {d.only_candidate} only in "
+            "the candidate)"
+        )
     lines += ["", "PASS: no regression" if r.passed else f"FAIL: {', '.join(r.regressions)}"]
     return "\n".join(lines) + "\n"
 

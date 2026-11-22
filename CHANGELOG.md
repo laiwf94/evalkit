@@ -261,3 +261,28 @@ week 2 (#23), and agents and conversations from week 3 (#24).
   ordinary operator config, so no key or network is needed. CI runs the demo
   on every push, and `tests/test_rag_demo.py` checks every case's stages,
   scores and cause.
+
+### Datasets as a product (#26, in progress)
+
+- **Case-level edits.** `PATCH /v1/datasets/{name}` and `evalkit dataset edit`
+  apply an edit (`upsert` whole cases, `update` some fields of a case,
+  `delete` cases, and a `note`) to the version named by its content hash, as
+  the next version with that version as its parent. If the dataset has moved
+  on, the edit is refused with a conflict (409, exit 3) that names the newest
+  version; resending an edit that was applied returns the version it made.
+  Concurrent edits race on the version number's unique constraint, so exactly
+  one wins.
+- **Log, lineage and diffs.** Every version records its parent, origin
+  (import or edit), note and how many cases it added, changed and removed.
+  `evalkit dataset log` and `GET /v1/datasets/{name}/log` list them;
+  `--version` and `.../versions/{v}/lineage` give one version's ancestors.
+  `evalkit dataset diff` and `GET /v1/datasets/{name}/diff` list added,
+  removed and changed cases, each change down to the field and object key
+  (`input.question`, `tags: +billing`). Imports are recorded as children of
+  the newest version.
+- **Comparison across versions.** Runs on two versions of one dataset are
+  compared on the cases both versions have unchanged, and the gate prints how
+  many were left out (`dataset_change` in JSON and the API). Before, any
+  change to a dataset made its runs incomparable.
+- Migration 0016 adds the lineage columns and a per-case hash, and fills both
+  in for existing datasets, chaining each name's versions in order.

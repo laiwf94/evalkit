@@ -19,8 +19,11 @@ is discussed under [Bigger runs](#bigger-runs).
 ## What is stored
 
 ```text
-datasets        (name, version) unique, (name, content_hash) unique
-dataset_cases   (dataset_id, case_id) unique; input, expected, tags, split, metadata (JSON)
+datasets        (name, version) unique, (name, content_hash) unique; parent (the
+                version it was made from), origin (import or edit), note, and
+                cases added, changed and removed relative to the parent
+dataset_cases   (dataset_id, case_id) unique; input, expected, tags, split, metadata
+                (JSON), case_hash (SHA-256 of the case in canonical JSON)
 runs            target spec + target hash, scorer specs, options, filter, seed,
                 status, lease (owner, expires_at; batch mode only), batch_id,
                 queued_at, priority, max_workers, cases_total,
@@ -70,6 +73,47 @@ or metadata does. Importing content that already exists under the name returns
 the existing version, so a CI job can import on every run without minting
 versions. Concurrent imports race on the unique constraints and the loser
 re-reads, so the same content never gets two versions.
+
+### Edits, lineage and diffs
+
+A version is never changed after it is written; an edit
+(`src/evalkit/dataset_edits.py`) writes the next one. It names its base by
+content hash, applies `upsert` (whole cases), `update` (some fields of a case)
+and `delete` to the base's cases, keeps their positions and appends new ones,
+and records the base as the new version's parent. Each case row carries its
+own hash, so the change counts, the log and a diff between two versions come
+from comparing (case id, hash) pairs, without reading the cases; only the
+changed cases are loaded, and their fields are compared key by key down into
+objects (16 levels), so a diff says `input.question` changed rather than
+`input`. An import is recorded as a child of the newest version.
+
+Concurrency is optimistic, on the version hash. An edit whose base is not the
+newest version is refused with a conflict naming the newest, unless the newest
+is exactly what the edit gives (the reply to an applied edit was lost and the
+client sent it again). Two edits of the newest version at once both try to
+insert the same version number; the unique constraint on (name, version) lets
+one in, and the other rolls back, reads again, and is refused because its base
+is no longer the newest. No lock is held while the cases are rewritten. The
+PostgreSQL test releases twelve writers at once and checks that one wins, that
+identical edits mint one version, and that writers who retry on conflict lose
+none of their edits.
+
+An edit whose content is already a version (an edit that undoes the last
+one) returns that version rather than a new one, the same rule an import
+follows, because (name, content hash) is unique. `parent_id` has no foreign key:
+versions are never deleted, and on SQLite a column with one cannot be dropped
+by a downgrade without rebuilding a table other tables reference.
+
+### Comparing runs on two versions
+
+Score arrays are in case-id order over each run's own version, so two runs on
+different versions of one dataset are paired by position maps: the case ids in
+both versions with the same case hash, looked up in each version's sorted ids.
+The comparison runs on those cases only, and the report's `dataset_change`
+says how many were shared, changed, or in one version only. A changed case is
+left out because its score change would measure the edit, not the system under
+test. Runs on different datasets, or on versions with no unchanged case in
+common, are still refused.
 
 ### How a target is identified
 

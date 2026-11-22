@@ -18,6 +18,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from evalkit import aggregates, runqueue
+from evalkit.dataset_edits import VersionPairing, pair_versions
 from evalkit.db.models import Dataset, Result, Run, as_utc, utcnow
 from evalkit.errors import InvalidInputError, NotFoundError, PreconditionError
 from evalkit.scorers.judge import identity_changes, judge_identity
@@ -106,6 +107,9 @@ class CompareReport:
     regressions: list[str] = field(default_factory=list)
     # Only ever non-empty when the comparison was asked to allow judge changes.
     judge_changes: list[JudgeChange] = field(default_factory=list)
+    # Set when the runs used different versions of one dataset: the comparison is
+    # over the cases both versions have unchanged, and this says how many those are.
+    dataset_change: VersionPairing | None = None
 
     @property
     def passed(self) -> bool:
@@ -294,7 +298,8 @@ def compare_runs(
     resamples: int = DEFAULT_RESAMPLES,
     allow_judge_change: bool = False,
 ) -> CompareReport:
-    """Paired comparison of two completed runs over the same dataset content.
+    """Paired comparison of two completed runs over the same dataset content, or
+    over the cases that two versions of one dataset have unchanged.
 
     A metric whose judge differs between the runs (provider, endpoint, model,
     mode, effort or rubric) measures the judge as much as the system under test,
@@ -305,12 +310,13 @@ def compare_runs(
     for run in (base, cand):
         if run.status != "completed":
             raise PreconditionError(f"run {run.id} is {run.status}, not completed")
-    base_hash = session.get_one(Dataset, base.dataset_id).content_hash
-    cand_hash = session.get_one(Dataset, cand.dataset_id).content_hash
-    if base_hash != cand_hash:
-        raise PreconditionError(
-            "the runs used different dataset contents; results cannot be paired"
-        )
+    base_ds = session.get_one(Dataset, base.dataset_id)
+    cand_ds = session.get_one(Dataset, cand.dataset_id)
+    paired = (
+        None
+        if base_ds.content_hash == cand_ds.content_hash
+        else pair_versions(session, base_ds, cand_ds)
+    )
     base_names = set(aggregates.metric_names(base))
     shared = [n for n, _ in scorer_names(cand) if n in base_names]
     if metrics:
@@ -334,6 +340,11 @@ def compare_runs(
         )
     base_scores = aggregates.load_scores(session, base, selected)
     cand_scores = aggregates.load_scores(session, cand, selected)
+    if paired is not None:
+        # Different versions of one dataset: keep the cases both have unchanged.
+        _, base_index, cand_index = paired
+        base_scores = {k: v[base_index] for k, v in base_scores.items()}
+        cand_scores = {k: v[cand_index] for k, v in cand_scores.items()}
     usable = {
         name: (base_scores[name], cand_scores[name])
         for name in selected
@@ -353,4 +364,5 @@ def compare_runs(
         comparisons=comparisons,
         regressions=[c.metric for c in comparisons if c.verdict == "worse"],
         judge_changes=changed,
+        dataset_change=None if paired is None else paired[0],
     )
