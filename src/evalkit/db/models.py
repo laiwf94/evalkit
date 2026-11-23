@@ -477,3 +477,56 @@ class CachedEmbedding(Base):
     vector: Mapped[bytes] = mapped_column(LargeBinary)
     created_at: Mapped[datetime] = mapped_column(default=utcnow)
     last_used_at: Mapped[datetime] = mapped_column(default=utcnow)
+
+
+class Generation(Base):
+    """One synthetic generation (``evalkit.generate``): the settings it ran with,
+    the generator and deduplication it used, what it produced and what it cost.
+    Its cases wait in ``case_drafts`` until a reviewer approves or rejects them."""
+
+    __tablename__ = "generations"
+    __table_args__ = (Index("ix_generations_dataset", "dataset", "created_at"),)
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True)
+    # The dataset the drafts are for; it need not exist until the first approval.
+    dataset: Mapped[str] = mapped_column(String(128))
+    spec: Mapped[dict[str, Any]] = mapped_column()
+    generator: Mapped[dict[str, Any]] = mapped_column()
+    dedupe: Mapped[dict[str, Any]] = mapped_column()
+    requested: Mapped[int] = mapped_column(Integer)
+    generated: Mapped[int] = mapped_column(Integer)
+    invalid: Mapped[int] = mapped_column(Integer)
+    duplicates: Mapped[int] = mapped_column(Integer)
+    # Calls that failed, as {"source", "error"}: the rest of the generation stands.
+    errors: Mapped[list[Any]] = mapped_column(default=list)
+    calls: Mapped[int] = mapped_column(Integer, default=0)
+    cached_calls: Mapped[int] = mapped_column(Integer, default=0)
+    input_tokens: Mapped[int] = mapped_column(BigInteger, default=0)
+    output_tokens: Mapped[int] = mapped_column(BigInteger, default=0)
+    cost_usd: Mapped[float] = mapped_column(Float, default=0.0)
+    created_at: Mapped[datetime] = mapped_column(default=utcnow)
+
+
+class CaseDraft(Base):
+    """A generated case waiting for review. ``status`` is pending, duplicate (a
+    near-duplicate of ``duplicate_of``, with its estimated Jaccard similarity),
+    approved (into ``dataset_version``) or rejected."""
+
+    __tablename__ = "case_drafts"
+    __table_args__ = (
+        UniqueConstraint("generation_id", "case_id", name="uq_case_drafts_case"),
+        Index("ix_case_drafts_status", "generation_id", "status", "position"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    generation_id: Mapped[str] = mapped_column(ForeignKey("generations.id", ondelete="CASCADE"))
+    position: Mapped[int] = mapped_column(Integer)
+    case_id: Mapped[str] = mapped_column(String(256))
+    case: Mapped[dict[str, Any]] = mapped_column()
+    source: Mapped[str | None] = mapped_column(String(512), nullable=True)
+    status: Mapped[str] = mapped_column(String(16))
+    duplicate_of: Mapped[str | None] = mapped_column(String(256), nullable=True)
+    similarity: Mapped[float | None] = mapped_column(Float, nullable=True)
+    note: Mapped[str] = mapped_column(Text, default="")
+    reviewed_at: Mapped[datetime | None] = mapped_column(nullable=True)
+    dataset_version: Mapped[int | None] = mapped_column(Integer, nullable=True)

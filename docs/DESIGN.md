@@ -12,7 +12,8 @@ are bounded, it makes no requests to arbitrary URLs, and neither the store nor
 the logs hold personal data or keys.
 
 It does not evaluate model weights at training time, and it is not a human
-annotation tool (calibration labels are imported, not collected). Several
+annotation tool (calibration labels are imported, not collected). Generated
+cases do wait for a person: they are drafts until approved. Several
 processes, on several machines, can share one run; what else changes at scale
 is discussed under [Bigger runs](#bigger-runs).
 
@@ -58,6 +59,12 @@ run_scores      (run_id, metric) key; a completed run's scores as one float64 ar
 response_cache  key = sha256(target hash, input, redaction fingerprint); output (or
                 its blob digest), created_at, last_used_at, size_bytes
 judge_calibrations  judge hash, kappa, weighted kappa, agreement, confusion matrix
+generations     one synthetic generation: dataset name, settings, generator identity,
+                dedupe settings, counts (asked, generated, invalid, duplicates),
+                failed calls, tokens, cost
+case_drafts     (generation_id, case_id) unique; the case (JSON), source document,
+                status (pending, duplicate, approved, rejected), duplicate_of and
+                similarity, note, reviewed_at, the dataset version it went into
 prompts         name unique; description
 prompt_versions (prompt_id, version) unique, (prompt_id, content_hash) unique;
                 system, template, note; inserted, never updated
@@ -114,6 +121,95 @@ says how many were shared, changed, or in one version only. A changed case is
 left out because its score change would measure the edit, not the system under
 test. Runs on different datasets, or on versions with no unchanged case in
 common, are still refused.
+
+### Generated cases and drafts
+
+A dataset grows faster when a model drafts cases from the documents the system
+answers from (`src/evalkit/generate.py`), but a model's cases are not test
+cases until someone has read them. So a generation never writes to a dataset:
+it stores drafts, and approval turns them into one ordinary edit of the newest
+version, with the lineage, diff and comparison rules every other edit has.
+
+A request shows the instructions in the system prompt and, in the user
+message, up to 20 examples spread evenly over the example file or the
+dataset's newest version (an even spread covers more of a dataset ordered by
+topic than its first rows), then one document cut at 20,000 characters, and
+asks for `per_document` cases in JSON constrained by a schema. Documents and
+examples are marked as data, since a support article can contain
+instructions. When `allowed_tags` is set the schema's tag field is an enum of
+them, so a model cannot invent slice names; any it chose are added to the
+configured tags. Without documents, `count` cases are asked for `per_call` at a
+time; each request carries its number, so the requests (and their cache keys)
+differ, and their repeats are caught as duplicates.
+
+Calls are cached in the response cache table by the generator's identity
+(provider, endpoint, model, effort, `max_tokens`, system prompt, schema) and
+the exact request, under the provider's `generate` limiter and the retry
+policy, so an unchanged config is free to run again and gives the same drafts;
+a generation is cheap to repeat after a crash rather than resumable. One
+request failing does not fail the generation: it is recorded with its
+document, as are replies that were refused, cut off or off the schema, and a
+case that is not a valid case (an empty input, more than one JSONL line's 1
+MiB) is counted as invalid. A reply with more cases than asked is cut.
+
+A draft's id is the prefix and the first 12 hex digits of the SHA-256 of its
+input in canonical JSON, so the same question gets the same id from every
+generation, and a draft that repeats a dataset case word for word has that
+case's id only if that case was itself generated. Two drafts with the same
+input in one generation keep one id; the later ones get `~2`, `~3` and are
+duplicates of the first.
+
+Approval upserts the approved cases into the newest version as one edit whose
+base is that version's hash (or imports them as version 1). A writer that
+moves the dataset on in between makes the edit a conflict; approval reads the
+newest version again and retries, up to five times. If the process dies after
+the edit but before the drafts are marked, approving again finds the cases
+already there: the edit changes nothing, returns the version, and the drafts
+are marked. Approving every pending draft first compares them with the newest
+version, because cases may have been added since the generation ran; drafts
+named one by one are a reviewer's decision and are added as asked, including
+duplicates and rejected drafts. A draft that is in a version cannot be
+rejected, since rejecting it would not take it out; that is a dataset edit.
+
+### Near-duplicates
+
+Generated cases repeat each other and the dataset: the same question from two
+documents, or a paraphrase of an example. Exact hashing misses "How do I reset
+my password?" against "How can I reset my password?", and comparing embeddings
+of every pair is quadratic and costs a provider call per text. Near-duplicates
+are found with MinHash and locality-sensitive hashing in numpy
+(`src/evalkit/dedupe.py`), the method web-scale corpora are deduplicated with.
+
+Texts are normalised (NFKC, case-folded, runs of non-word characters made one
+space) and cut into character 5-grams, which work for short questions and for
+scripts without spaces; word n-grams are available. Each window's polynomial
+hash is computed for all windows at once, modulo the largest prime below
+2^32. A signature is 128 minima of the multiply-add-shift hashes
+(a·x + b) mod 2^64 with random odd a: the modulus is uint64 wraparound, so
+there is no division, and every set is hashed in blocks of 8,192 shingles into
+one reused 8 MiB buffer, its minima taken with `np.minimum.reduceat`. Two sets
+share a minimum with probability equal to their Jaccard similarity, so the
+fraction of equal positions estimates it with standard error
+sqrt(J(1 - J) / 128), 0.035 at 0.8.
+
+LSH splits signatures into bands; two texts are compared only when a band is
+identical. The layout minimises the false positive area below the threshold
+plus four times the false negative area above it, because a candidate is only
+checked on its signature while a missed pair is a duplicate let into the
+dataset: at 0.8 that is 12 bands of 10 rows, which makes 99.4% of pairs at 0.9
+candidates and 0.1% at 0.4. Each text is matched with the most similar kept
+text or dataset case at or above the threshold, so a chain of edits points at
+the first text, not the previous edit.
+
+Decisions are made on the estimate, so pairs within about two standard errors
+of the threshold go either way; `num_perm` (up to 1,024) narrows that.
+Measured on a 4-core Linux container with planted one-word edits: among
+10,100 sixty-word texts every one of the 100 edits was found and nothing else
+was flagged, in 1.7 s; among 101,000 twelve-word texts, where one word is a
+large part of the text and many edits fall near 0.8, 248 of the 313 edits
+whose exact similarity is at least 0.8 were found and 162 edits just below it
+were flagged, and nothing else, in 7.2 s (3.2 s of it shingling, 1.3 s
+signatures). Memory is the signatures, 1 KiB per text, plus one 8 MiB block.
 
 ### How a target is identified
 
@@ -1442,6 +1538,9 @@ the whole-dataset test, and in 500 slices 12.0 s; 10,000 cases in 20 slices,
 | Retry-After honoured | up to 120 s by default | |
 | Judge `max_tokens` | 256-16,000 | |
 | Calibration items | 5,000 | |
+| Seed documents per generation | 10,000; 1 MiB per file, 20,000 characters per request | |
+| Cases per generation request | 50 (`per_document`, `per_call`); 100,000 per generation | |
+| Generation errors kept | 100 | |
 | Result page | 500 | |
 | Case lease | 30 s default | Time before a dead process's cases are taken over. |
 | Cases per claim | 4 per worker, 64-500 | Bounds what a dead process strands for one lease length. |

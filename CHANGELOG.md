@@ -294,3 +294,21 @@ week 2 (#23), and agents and conversations from week 3 (#24).
   `--rules` make the gate fail when a named slice regresses or is too small to
   test. `POST /v1/compare` takes the same rules as `slices` and returns
   `failures`.
+- **Synthetic generation with drafts.** `evalkit generate CONFIG` asks a model
+  on any configured provider for cases from seed documents (files or a JSONL
+  of `{id, text}`) and examples (a file or the dataset's newest version), in
+  JSON constrained by a schema, under a `generate` limiter with retries and
+  caching. Each case gets the configured tags (plus any of `allowed_tags` the
+  model chose), split, its source document and an id from its input. They are
+  stored as drafts (migration 0017: `generations`, `case_drafts`) and reach the
+  dataset only through `evalkit drafts approve` (or `POST
+  /v1/generations/{id}/approve`), as one edit of the newest version; `drafts
+  reject`, `drafts show` and `drafts list` (and the matching API routes) cover
+  the rest of the review.
+- **Near-duplicate removal.** `src/evalkit/dedupe.py` estimates Jaccard
+  similarity of character 5-grams with 128-permutation MinHash signatures and
+  finds candidate pairs with LSH banding, all in numpy. Drafts that repeat a
+  dataset case, an example or an earlier draft are marked `duplicate`, with the
+  case they repeat and the similarity; approving all pending drafts checks them
+  again against the newest version. 101,000 short texts take 7.2 s on four
+  cores.

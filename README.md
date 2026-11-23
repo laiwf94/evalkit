@@ -197,6 +197,62 @@ in several slices; a list in metadata works the same way; numbers and booleans
 are named by their JSON (`3`, `true`). On two versions of a dataset, slices are
 taken over the cases both versions have unchanged.
 
+### Generating cases
+
+`evalkit generate` drafts new cases with a model, from seed documents and
+examples, and keeps them as drafts until someone approves them:
+
+```toml
+# generate.toml
+[generate]
+dataset = "support"
+instructions = "Write questions a customer would ask about the document, each with a short answer taken from it."
+documents = "kb/*.md"            # or a .jsonl of {"id", "text"}; paths are relative to this file
+per_document = 5
+examples_from_dataset = true     # or examples = "examples.jsonl"
+max_examples = 5
+input_key = "question"           # inputs become {"question": "..."}
+allowed_tags = ["billing", "shipping", "account"]
+provider = "anthropic"           # any configured provider
+model = "claude-opus-5-5"
+
+[generate.dedupe]
+threshold = 0.8                  # estimated Jaccard similarity of character 5-grams
+```
+
+```console
+$ evalkit generate generate.toml
+generation 3f1c0e9a... for support: 58 drafts of 60 asked (49 pending, 9 near-duplicates, 2 invalid)
+12 calls, 41250 input and 9310 output tokens, $0.351200
+review with: evalkit drafts show 3f1c0e9a...
+$ evalkit drafts show 3f1c0e --status duplicate
+[duplicate] gen-5d0c41e2a9b7 from kb/refunds.md
+    input:    {"question": "How long does a refund take?"}
+    repeats q014 (similarity 0.86)
+$ evalkit drafts reject 3f1c0e --id gen-0a9e3c51d2f4 --note "answer not in the document"
+$ evalkit drafts approve 3f1c0e --all --note "reviewed"
+approved 48 drafts: support now at version 5 (a81c90d2e4f3)
+```
+
+Without `documents`, `count` cases are asked for `per_call` at a time from the
+instructions and examples alone. Each draft gets the configured `tags`
+(`synthetic` by default) and any of `allowed_tags` the model chose, `split`,
+its document in `metadata.source`, and an id from a hash of its input. Drafts
+that repeat a case already in the dataset, an example or an earlier draft are
+marked `duplicate` with the case they repeat; the comparison is MinHash with
+locality-sensitive hashing (`src/evalkit/dedupe.py`), so it stays fast on
+large datasets. Calls are cached: running an unchanged config again costs
+nothing and gives the same drafts.
+
+`drafts approve --all` adds every pending draft to the newest version as one
+edit (or as the first version of a new dataset), after comparing them again
+with that version, since it may have gained similar cases since the
+generation ran; `--id` (repeatable) adds the named drafts as asked, including
+duplicates and rejected ones. Approving again is safe. A draft already in a
+version cannot be rejected: remove the case with `dataset edit`. The API has
+the review step too: `GET /v1/generations`, `.../{id}/drafts`, and `POST
+.../{id}/approve` and `.../{id}/reject`.
+
 ## Model matrices
 
 A `[matrix]` table runs the same dataset and scorers over several models,
@@ -934,6 +990,9 @@ different judge it would refuse (exit 3) unless `--allow-judge-change` is given.
 | `evalkit dataset edit NAME FILE [--base V\|HASH]` | Apply a JSON edit (`upsert`, `update`, `delete`, `note`) as the next version; exit 3 if the dataset moved on since the base. |
 | `evalkit dataset diff NAME FROM [TO] [--limit N]` | Added, removed and changed cases between two versions, field by field (`TO` defaults to the newest). |
 | `evalkit dataset log NAME [--version V]` | Every version with its parent, origin, note and changes; with `--version`, that version's lineage. |
+| `evalkit generate CONFIG` | Draft cases from seed documents and examples (`[generate]`), with near-duplicates marked; exit 3 if no call gave a usable reply. |
+| `evalkit drafts list [--dataset D]`, `evalkit drafts show GEN [--status S]` | Generations and their draft counts; one generation's drafts. |
+| `evalkit drafts approve GEN (--all\|--id ID...) [--note N]`, `evalkit drafts reject GEN --id ID... [--note N]` | Add drafts to the dataset as one new version; mark drafts rejected (exit 3 for one already in a version). |
 | `evalkit prompt push NAME FILE [--system FILE] [--note N]` | Store a prompt file (TOML with `system` and `template`, or a template file) as a new version; unchanged content is a no-op. |
 | `evalkit prompt show REF`, `evalkit prompt list` | A version's content and labels; every prompt with its newest version and labels. |
 | `evalkit prompt diff REF [REF]` | Unified diff of two versions (the second defaults to the newest). |
@@ -1001,6 +1060,9 @@ Every `/v1` route takes `Authorization: Bearer <token>`.
 | `PATCH /v1/datasets/{name}` | Edit cases: `{"base": HASH, "upsert": [...], "update": [...], "delete": [...], "note": ""}`. 201 for a new version; 200 if it changes nothing or the content is already a version (`existing`); 409 naming the newest version if `base` is not the newest. |
 | `GET /v1/datasets/{name}/log`, `GET /v1/datasets/{name}/versions/{v}/lineage` | Every version, newest first; one version and its ancestors. |
 | `GET /v1/datasets/{name}/diff?from=&to=` | Added, removed and changed cases with field-level changes (`to` defaults to the newest). |
+| `GET /v1/generations[?dataset=]`, `GET /v1/generations/{id}` | Generations with their counts, tokens, cost, errors and draft statuses. |
+| `GET /v1/generations/{id}/drafts?status=&limit=&offset=` | Drafts in generation order. |
+| `POST /v1/generations/{id}/approve`, `POST /v1/generations/{id}/reject` | `{"all": true}` or `{"ids": [...]}`, and a `note`: approved drafts become one new dataset version; 409 when rejecting a draft that is already in one. |
 | `POST /v1/prompts/{name}/versions` | Push `{"template", "system", "note", "description"}`. 201 for a new version, 200 if the content already exists. |
 | `GET /v1/prompts`, `GET /v1/prompts/{name}` | All prompts with their labels; one prompt's labels and versions. |
 | `GET /v1/prompts/{name}/versions/{version\|label\|latest}` | A version and its content. |
@@ -1051,6 +1113,8 @@ tests compare the bodies they received with the exact bodies expected.
 | A booking agent end to end | `tests/test_booking_end_to_end.py` serves the reference agent and its `--skip-lookup` twin on local sockets and drives the CLI through `examples/agents` unchanged. 50 dialogues with a scripted user end on goal reached, give-up or the turn limit. A run SIGKILLed mid-dialogue in a child process resumes with every outcome, step and turn equal to an uninterrupted run, the agent answers each step once over both processes, and at least one dialogue is finished from where the kill left it. The blind agent confirms as many bookings and fails the gate on `tool_calls` (-54%). |
 | A RAG pipeline end to end | `tests/test_rag_demo.py` serves `examples/rag/server.py` on a local socket and drives the CLI through `examples/rag` unchanged. Every case stores the recorded ranking and an answer copied from an answering document among its top 3; on the regressed retriever the eight questions that lose that document score 0 on `answer_completeness` and `context_recall`, mean recall@3 is exactly 5/9, the RAG report attributes all eight to a retrieval miss, and the gate fails on recall@3, nDCG@5 and answer completeness. A rerun sends nothing to the fakes. |
 | Slices | `tests/test_slices.py` plants a regression in one tag: two fake runs at 80% accuracy whose differences cancel over 400 cases (-1.0%, no detectable change), while the 40 `billing` cases lose 25 and win none. `--by tag` finds billing worse and `--require-slice billing` fails the gate; splits and regions, which dilute it, pass. Holm-adjusted p-values equal Holm over the tested pairs (Hypothesis), 40 null slices report a false regression in at most 2 of 20 trials, too-small slices are left out of the family and fail a rule that requires them, and on two dataset versions the slices cover only the unchanged cases. |
+| Near-duplicates | `tests/test_dedupe.py` checks shingles and exact Jaccard values worked out by hand, MinHash estimates on sets of known overlap (within four standard errors) and their bias over 300 random pairs (under 0.01), batched signatures equal to the minimum computed directly (Hypothesis, including sets larger than a block), the band layout's curve, and 60 planted one-word edits among 400 random texts: every one is found, pointing at its original, and no random text is flagged. |
+| Generation and review | `tests/test_generate.py` drives a scripted model through three documents: an empty case is invalid, a near-copy of a dataset case, an exact repeat and a near-repeat in one reply are marked duplicate of the right case, a refusal, a cut-off reply, a reply off the schema and a failed call are errors for their document, and a rerun is served from the cache. Approval makes one edit version, re-checks against cases added since, forces named duplicates in, creates a missing dataset, recovers when the edit went in but the drafts were not marked, and retries a conflicting writer; through the CLI and the API too. |
 | API and CLI | Every endpoint, error code and exit code, over ASGI and over the wire. |
 
 ```console
@@ -1115,6 +1179,8 @@ src/evalkit/stats.py       bootstrap, permutation test, effect size, Holm
 src/evalkit/aggregates.py  per-run aggregates, latency histograms, score arrays, run verify
 src/evalkit/report.py      run summaries and comparisons
 src/evalkit/slices.py      per-slice comparisons (tag, split, metadata), Holm over slices, slice gate rules
+src/evalkit/generate.py    synthetic cases from seed documents and examples, drafts, approval and rejection
+src/evalkit/dedupe.py      MinHash signatures and LSH banding in numpy: near-duplicate texts
 src/evalkit/pricing.py     versioned per-provider price lists, overrides, run price records,
                            token estimates for providers that cannot count
 src/evalkit/estimate.py    cost estimates from token counts

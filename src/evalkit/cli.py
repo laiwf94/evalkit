@@ -37,6 +37,7 @@ from sqlalchemy.orm import Session, sessionmaker
 
 from evalkit import __version__, aggregates, blobs, cache, runqueue
 from evalkit.api import serve
+from evalkit.cache import VerdictStore
 from evalkit.config import (
     ConfigError,
     GateRules,
@@ -67,6 +68,20 @@ from evalkit.embeddings import EmbeddingStore
 from evalkit.errors import ConflictError, EvalkitError, NotFoundError, PreconditionError
 from evalkit.estimate import MatrixEstimate, estimate, estimate_matrix
 from evalkit.frontier import MatrixReport, matrix_report
+from evalkit.generate import (
+    ApprovalResult,
+    GenerateSpec,
+    GenerationInfo,
+    GenerationReport,
+    approve,
+    generate,
+    generation_info,
+    generator_from_spec,
+    list_drafts,
+    list_generations,
+    load_documents,
+    reject,
+)
 from evalkit.logs import configure_logging, scrubber
 from evalkit.matrix import child_runs, resolve_matrix
 from evalkit.prompts import (
@@ -646,6 +661,62 @@ async def cmd_dataset(args: argparse.Namespace, app: App) -> int:
     return EXIT_OK
 
 
+async def cmd_generate(args: argparse.Namespace, app: App) -> int:
+    """``evalkit generate CONFIG``: draft cases from seed documents and examples.
+    Exits 3 when no call gave a usable reply."""
+    path = Path(args.config)
+    table = _read_toml(path).get("generate")
+    if not isinstance(table, dict):
+        raise CliError(f"{path} has no [generate] table", EXIT_INPUT)
+    try:
+        spec = GenerateSpec.model_validate(table)
+    except ValidationError as exc:
+        raise CliError(f"{path}: {_describe(exc)}", EXIT_INPUT) from None
+    base = path.parent
+    documents = (
+        await asyncio.to_thread(load_documents, spec.documents, base) if spec.documents else []
+    )
+    examples = parse_jsonl(_read_bytes(base / spec.examples)) if spec.examples else []
+    generator = generator_from_spec(spec, app.providers(), cache=VerdictStore(app.sessions))
+    report = await generate(app.sessions, spec, generator, documents=documents, examples=examples)
+    _emit(app.out, report, args.json, _format_generation)
+    return (
+        EXIT_UNUSABLE if report.calls == 0 or (report.errors and not report.generated) else EXIT_OK
+    )
+
+
+async def cmd_drafts(args: argparse.Namespace, app: App) -> int:
+    """``evalkit drafts list|show|approve|reject``: review generated cases."""
+    with app.sessions() as session:
+        if args.drafts_command == "list":
+            rows = list_generations(session, args.dataset)
+            _emit(app.out, rows, args.json, _format_generations)
+        elif args.drafts_command == "show":
+            info = generation_info(session, args.generation)
+            drafts = list_drafts(
+                session, info.id, args.status, limit=args.limit, offset=args.offset
+            )
+            _emit(
+                app.out,
+                {"generation": info, "drafts": drafts},
+                args.json,
+                _format_drafts,
+            )
+        elif args.drafts_command == "approve":
+            if not args.all and not args.id:
+                raise CliError(
+                    "name drafts with --id, or approve every pending one with --all", EXIT_INPUT
+                )
+            result = approve(
+                session, args.generation, None if args.all else args.id, note=args.note
+            )
+            _emit(app.out, result, args.json, _format_approval)
+        else:
+            rejected = reject(session, args.generation, args.id, note=args.note)
+            app.out.write(f"rejected {len(rejected)} drafts\n")
+    return EXIT_OK
+
+
 def _read_edit(path: Path, base: str | None, session: Session, name: str) -> DatasetEdit:
     """An edit file (JSON, the body of PATCH /v1/datasets/NAME). ``--base`` gives or
     overrides its base: a content hash, or a version number to take the hash of."""
@@ -991,6 +1062,7 @@ def build_parser() -> argparse.ArgumentParser:
     cal.set_defaults(handler=cmd_calibrate)
 
     _add_prompt_commands(sub)
+    _add_generate_commands(sub)
     _add_maintenance_commands(sub)
     _add_tools_commands(sub)
     _add_agent_commands(sub)
@@ -1140,6 +1212,39 @@ def _add_agent_commands(sub: Any) -> None:
     conf.add_argument("--max-steps", type=int, default=20, help="replies per session")
     conf.add_argument("--strict", action="store_true", help="exit 1 on warnings too")
     conf.add_argument("--json", action="store_true", help="print JSON instead of a table")
+
+
+def _add_generate_commands(sub: Any) -> None:
+    gen = sub.add_parser("generate", help="draft cases from seed documents and examples")
+    gen.add_argument("config", help="TOML file with a [generate] table")
+    gen.add_argument("--json", action="store_true", help="print JSON instead of a summary")
+    gen.set_defaults(handler=cmd_generate)
+
+    drafts = sub.add_parser("drafts", help="review generated cases: list, show, approve, reject")
+    drafts_sub = drafts.add_subparsers(dest="drafts_command", required=True)
+    lst = drafts_sub.add_parser("list", help="every generation and its draft counts")
+    lst.add_argument("--dataset", help="only generations for this dataset")
+    lst.add_argument("--json", action="store_true", help="print JSON instead of a table")
+    show = drafts_sub.add_parser("show", help="a generation's drafts")
+    show.add_argument("generation", help="generation id (or a prefix of 6 or more characters)")
+    show.add_argument("--status", choices=["pending", "duplicate", "approved", "rejected"])
+    show.add_argument("--limit", type=int, default=50, help="drafts to print (default 50)")
+    show.add_argument("--offset", type=int, default=0)
+    show.add_argument("--json", action="store_true", help="print JSON instead of text")
+    app_ = drafts_sub.add_parser("approve", help="add drafts to the dataset as a new version")
+    app_.add_argument("generation")
+    which = app_.add_mutually_exclusive_group()
+    which.add_argument("--id", action="append", default=[], help="a draft id (repeatable)")
+    which.add_argument(
+        "--all", action="store_true", help="every pending draft not repeating a dataset case"
+    )
+    app_.add_argument("--note", default="", help="the dataset version's note")
+    app_.add_argument("--json", action="store_true", help="print JSON instead of a summary")
+    rej = drafts_sub.add_parser("reject", help="mark drafts rejected")
+    rej.add_argument("generation")
+    rej.add_argument("--id", action="append", required=True, help="a draft id (repeatable)")
+    rej.add_argument("--note", default="", help="why")
+    drafts.set_defaults(handler=cmd_drafts)
 
 
 def _add_maintenance_commands(sub: Any) -> None:
@@ -1504,6 +1609,70 @@ def _format_matrix(r: MatrixReport) -> str:
 
 def _format_rag(r: RagReport) -> str:
     return format_rag(r)
+
+
+def _format_generation(r: GenerationReport) -> str:
+    cached = f", {r.cached_calls} from the cache" if r.cached_calls else ""
+    lines = [
+        f"generation {r.id} for {r.dataset}: {r.generated} drafts of {r.requested} asked "
+        f"({r.pending} pending, {r.duplicates} near-duplicates, {r.invalid} invalid)",
+        f"{r.calls} calls{cached}, {r.input_tokens} input and {r.output_tokens} output tokens, "
+        f"{_money(r.cost_usd)}",
+    ]
+    lines += [f"error: {e['source']}: {e['error']}" for e in r.errors[:10]]
+    if len(r.errors) > 10:
+        lines.append(f"... and {len(r.errors) - 10} more errors (--json for all)")
+    lines.append(f"review with: evalkit drafts show {r.id}")
+    return "\n".join(lines) + "\n"
+
+
+def _format_generations(rows: list[GenerationInfo]) -> str:
+    lines = []
+    for g in rows:
+        counts = ", ".join(f"{n} {s}" for s, n in g.statuses.items() if n)
+        lines.append(
+            f"{g.id}\t{g.dataset}\t{g.created_at.isoformat(timespec='seconds')}\t"
+            f"{g.generated} drafts\t{counts or 'none'}"
+        )
+    return "\n".join(lines) + "\n" if lines else "no generations\n"
+
+
+def _format_drafts(value: dict[str, Any]) -> str:
+    g: GenerationInfo = value["generation"]
+    counts = ", ".join(f"{n} {s}" for s, n in g.statuses.items())
+    lines = [f"generation {g.id} for {g.dataset}: {counts}"]
+    for d in value["drafts"]:
+        case = d.case
+        source = f" from {d.source}" if d.source else ""
+        lines.append(f"[{d.status}] {d.id}{source}")
+        lines.append(f"    input:    {_short(case['input'], 90)}")
+        if case.get("expected") is not None:
+            lines.append(f"    expected: {_short(case['expected'], 90)}")
+        if d.duplicate_of is not None:
+            lines.append(f"    repeats {d.duplicate_of} (similarity {d.similarity:.2f})")
+        if d.dataset_version is not None:
+            lines.append(f"    in version {d.dataset_version}")
+    return "\n".join(lines) + "\n"
+
+
+def _format_approval(r: ApprovalResult) -> str:
+    lines = []
+    if r.approved:
+        verb = "now at" if r.created else "already had them at"
+        lines.append(
+            f"approved {len(r.approved)} drafts: {r.dataset} {verb} version {r.version} "
+            f"({(r.content_hash or '')[:12]})"
+        )
+    else:
+        lines.append("nothing to approve")
+    if r.now_duplicates:
+        lines.append(
+            f"{len(r.now_duplicates)} drafts left out: they repeat cases now in {r.dataset}"
+        )
+        lines += [f"    {k} repeats {v}" for k, v in list(r.now_duplicates.items())[:10]]
+    if r.already_approved:
+        lines.append(f"{len(r.already_approved)} drafts were already approved")
+    return "\n".join(lines) + "\n"
 
 
 def _format_sandbox(info: dict[str, Any]) -> str:

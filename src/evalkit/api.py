@@ -77,6 +77,14 @@ from evalkit.db.models import (
 )
 from evalkit.errors import EvalkitError, InvalidInputError, NotFoundError
 from evalkit.frontier import matrix_report
+from evalkit.generate import (
+    STATUSES,
+    approve,
+    generation_info,
+    list_drafts,
+    list_generations,
+    reject,
+)
 from evalkit.logs import configure_logging, log_context, scrubber
 from evalkit.prompts import (
     Resolved,
@@ -378,6 +386,77 @@ class LabelMoveRequest(BaseModel):
     # Required, and may be null: the version the label must be at now, or null
     # when the label must not exist yet. A label never moves without a check.
     expected_version: int | None = Field(ge=1)
+
+
+DraftId = Annotated[str, Field(min_length=1, max_length=300)]
+
+
+class ApproveBody(BaseModel):
+    """``ids`` names drafts to approve; ``all`` approves every pending draft that
+    does not repeat a case now in the dataset. Exactly one of them."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    ids: list[DraftId] | None = Field(default=None, min_length=1, max_length=100_000)
+    all: bool = False
+    note: str = Field(default="", max_length=2000)
+
+
+class RejectBody(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    ids: list[DraftId] = Field(min_length=1, max_length=100_000)
+    note: str = Field(default="", max_length=2000)
+
+
+@router.get("/generations")
+async def get_generations(
+    svc: Svc, dataset: Annotated[str | None, Query(max_length=128)] = None
+) -> dict[str, Any]:
+    rows = await _in_session(svc, lambda s: [asdict(g) for g in list_generations(s, dataset)])
+    return {"generations": rows}
+
+
+@router.get("/generations/{generation_id}")
+async def get_generation_info(generation_id: str, svc: Svc) -> dict[str, Any]:
+    return await _in_session(svc, lambda s: asdict(generation_info(s, generation_id)))
+
+
+@router.get("/generations/{generation_id}/drafts")
+async def get_drafts(
+    generation_id: str,
+    svc: Svc,
+    status: Annotated[str | None, Query(max_length=16)] = None,
+    limit: Annotated[int, Query(ge=1, le=500)] = 100,
+    offset: Annotated[int, Query(ge=0)] = 0,
+) -> dict[str, Any]:
+    """Drafts in generation order, optionally of one status (one of ``STATUSES``)."""
+    if status is not None and status not in STATUSES:
+        raise InvalidInputError(f"status must be one of {', '.join(STATUSES)}")
+    rows = await _in_session(
+        svc,
+        lambda s: [
+            asdict(d) for d in list_drafts(s, generation_id, status, limit=limit, offset=offset)
+        ],
+    )
+    return {"drafts": rows}
+
+
+@router.post("/generations/{generation_id}/approve")
+async def approve_drafts(generation_id: str, body: ApproveBody, svc: Svc) -> dict[str, Any]:
+    """Add drafts to the dataset as one new version (or its first version)."""
+    if (body.ids is None) == (not body.all):
+        raise InvalidInputError("give either ids or all")
+    return await _in_session(
+        svc, lambda s: asdict(approve(s, generation_id, body.ids, note=body.note))
+    )
+
+
+@router.post("/generations/{generation_id}/reject")
+async def reject_drafts(generation_id: str, body: RejectBody, svc: Svc) -> dict[str, Any]:
+    """Mark drafts rejected; 409 for a draft that is already in a version."""
+    rejected = await _in_session(svc, lambda s: reject(s, generation_id, body.ids, note=body.note))
+    return {"rejected": rejected}
 
 
 def _version_json(found: Resolved, *, content: bool = True) -> dict[str, Any]:
