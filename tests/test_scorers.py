@@ -105,6 +105,14 @@ def test_numeric_match() -> None:
     for bad in (None, "seven", True, float("nan"), [1]):
         assert run(NumericMatch("n"), case(bad), "7")[0] is None
     assert run(NumericMatch("n", extract="whole"), case(1), "inf")[1] == "no number in output"
+    whole = NumericMatch("n", extract="whole")
+    for text in ("1_000", "1,2,3", "1234,5", "١٢٣", "1,23"):
+        assert run(whole, case(1000), text)[1] == "no number in output", text
+    for text in ("1_000", "1,2,3", "1234,5", "١٢٣"):
+        assert run(NumericMatch("n"), case(text), "7")[0] is None, text
+    assert run(whole, case(1000), " 1,000 ")[0] == 1.0
+    assert run(whole, case(2000), "2e3")[0] == 1.0
+    assert run(whole, case(-3), "-3")[0] == 1.0
     with pytest.raises(ValueError, match="extract"):
         NumericMatch("n", extract="middle")
 

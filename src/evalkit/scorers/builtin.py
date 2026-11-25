@@ -179,8 +179,14 @@ class NumericMatch(Scorer):
 def _to_float(value: str | float) -> float | None:
     if isinstance(value, int | float):
         return float(value) if math.isfinite(value) else None
+    text = value.strip()
+    # float() also reads 1_000 and digits from other scripts, and dropping every
+    # comma turns 1,2,3 into 123. Only plain ASCII with commas as thousands
+    # separators counts as a number, the same rule the extraction regex uses.
+    if not text.isascii() or "_" in text or ("," in text and not _NUMBER.fullmatch(text)):
+        return None
     try:
-        number = float(value.replace(",", ""))
+        number = float(text.replace(",", ""))
     except ValueError:
         return None
     return number if math.isfinite(number) else None
