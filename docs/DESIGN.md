@@ -1002,7 +1002,7 @@ example, the case has no expected value), which is different from 0.
 |---|---|
 | `exact` | 1 if equal after optional case folding and whitespace normalisation. |
 | `regex` | 1 if the pattern (from the config or the case) matches. 250 ms limit per match. |
-| `json_schema` | 1 if the output is JSON that validates (Draft 2020-12). References are never fetched. |
+| `json_schema` | 1 if the output is strict JSON that validates (Draft 2020-12): `NaN`, `Infinity` and `-Infinity` count as not JSON. References are never fetched. |
 | `numeric` | 1 if the first, last or whole number is within absolute/relative tolerance. |
 | `token_f1` | Bag-of-tokens F1 after SQuAD normalisation (Rajpurkar et al.): partial credit without embeddings. |
 | `judge` | Rubric 1-5 mapped to (s-1)/4, or pairwise win/tie/loss against the reference. |

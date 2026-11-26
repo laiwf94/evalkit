@@ -25,6 +25,10 @@ _FENCE = re.compile(r"^\s*```(?:json)?\s*\n(.*?)\n\s*```\s*$", re.DOTALL)
 MAX_DETAIL = 300
 
 
+def _reject_constant(token: str) -> Any:
+    raise ValueError(f"{token} is not a JSON value")
+
+
 def _short(text: str) -> str:
     return text if len(text) <= MAX_DETAIL else text[: MAX_DETAIL - 3] + "..."
 
@@ -123,7 +127,7 @@ class JsonSchemaMatch(Scorer):
         fenced = _FENCE.match(output)
         text = fenced.group(1) if fenced else output
         try:
-            document = json.loads(text)
+            document = json.loads(text, parse_constant=_reject_constant)
         except (ValueError, RecursionError) as exc:
             return ScoreResult.passed(ok=False, detail=_short(f"not JSON: {exc}"))
         try:

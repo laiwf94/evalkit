@@ -84,6 +84,22 @@ def test_json_schema_match() -> None:
     assert "invalid" in run(per_case, case({"type": "nonsense"}), "{}")[1]
 
 
+def test_json_schema_rejects_python_only_constants() -> None:
+    number = JsonSchemaMatch("j", schema={"type": "number"})
+    loose = JsonSchemaMatch("j", schema={})
+    for text in ("NaN", "Infinity", "-Infinity"):
+        value, detail = run(number, case(), text)
+        assert value == 0.0
+        assert detail.startswith("not JSON")
+        assert text.lstrip("-") in detail
+    for text in ('{"score": NaN}', "[1, [Infinity]]", '```json\n{"a": -Infinity}\n```'):
+        value, detail = run(loose, case(), text)
+        assert value == 0.0
+        assert detail.startswith("not JSON")
+    for text in ("1e5", "-0.5", '{"nan": "NaN"}'):
+        assert run(loose, case(), text) == (1.0, "")
+
+
 def test_json_schema_does_not_fetch_remote_refs() -> None:
     s = JsonSchemaMatch("j", schema={"$ref": "https://example.invalid/schema.json"})
     value, detail = run(s, case(), "{}")
