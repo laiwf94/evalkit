@@ -312,3 +312,18 @@ week 2 (#23), and agents and conversations from week 3 (#24).
   case they repeat and the similarity; approving all pending drafts checks them
   again against the newest version. 101,000 short texts take 7.2 s on four
   cores.
+- **Annotation queues.** `evalkit annotate create` (or `POST
+  /v1/annotation-queues`) builds a queue from a dataset version or a run's
+  outputs; annotators `next` (claim), `submit`, `skip`, and an adjudicator
+  settles disputed items. Each item takes `overlap` labels from different
+  annotators, enforced by unique slots, with claims that lapse and can be taken
+  over. Items become `agreed` or `disputed` when their last label arrives, and
+  `export` writes the final labels in the form `evalkit calibrate` reads.
+  Migration 0018 adds `annotation_queues`, `annotation_tasks` and
+  `annotation_assignments`.
+- **Krippendorff's alpha.** `src/evalkit/agreement.py` computes alpha for any
+  number of annotators with missing labels, on nominal, ordinal, interval and
+  ratio levels, from the coincidence matrix in numpy, and matches the
+  published worked examples. `evalkit annotate agreement` and `GET
+  /v1/annotation-queues/{queue}` report it with each annotator's agreement
+  with the final labels.

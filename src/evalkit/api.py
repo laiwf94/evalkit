@@ -39,13 +39,27 @@ from fastapi import APIRouter, Depends, FastAPI, Query, Request, Response
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, PlainTextResponse
 from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, StrictFloat, StrictInt, StrictStr
 from sqlalchemy import Engine, select, text
 from sqlalchemy.orm import Session, sessionmaker
 from starlette.exceptions import HTTPException as StarletteHTTPException
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from evalkit import metrics, runqueue
+from evalkit.annotation import STATUSES as TASK_STATUSES
+from evalkit.annotation import (
+    QueueSpec,
+    adjudicate,
+    agreement,
+    claim_next,
+    create_queue,
+    export_labels,
+    list_queues,
+    list_tasks,
+    queue_summary,
+    skip,
+    submit,
+)
 from evalkit.config import ConfigError, GateRules, Settings
 from evalkit.dataset_edits import (
     DatasetEdit,
@@ -457,6 +471,137 @@ async def reject_drafts(generation_id: str, body: RejectBody, svc: Svc) -> dict[
     """Mark drafts rejected; 409 for a draft that is already in a version."""
     rejected = await _in_session(svc, lambda s: reject(s, generation_id, body.ids, note=body.note))
     return {"rejected": rejected}
+
+
+Annotator = Annotated[str, Field(min_length=1, max_length=128)]
+LabelValue = Annotated[StrictStr, Field(min_length=1, max_length=64)] | StrictInt | StrictFloat
+
+
+class ClaimBody(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    annotator: Annotator
+
+
+class SubmitBody(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    annotator: Annotator
+    case_id: Annotated[str, Field(min_length=1, max_length=256)]
+    label: LabelValue
+    note: str = Field(default="", max_length=2000)
+
+
+class AdjudicateBody(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    adjudicator: Annotator
+    case_id: Annotated[str, Field(min_length=1, max_length=256)]
+    label: LabelValue
+    note: str = Field(default="", max_length=2000)
+
+
+@router.post("/annotation-queues", status_code=201)
+async def post_annotation_queue(spec: QueueSpec, response: Response, svc: Svc) -> dict[str, Any]:
+    """Create a queue: 201, or 200 with the existing queue when one of this name
+    has the same settings; 409 when its settings differ."""
+    summary, created = await _in_session(svc, lambda s: create_queue(s, spec))
+    if not created:
+        response.status_code = 200
+    return asdict(summary)
+
+
+@router.get("/annotation-queues")
+async def get_annotation_queues(svc: Svc) -> dict[str, Any]:
+    return {"queues": await _in_session(svc, lambda s: [asdict(q) for q in list_queues(s)])}
+
+
+@router.get("/annotation-queues/{queue}")
+async def get_annotation_queue(queue: str, svc: Svc) -> dict[str, Any]:
+    """The queue, its item counts by status, and Krippendorff's alpha so far."""
+
+    def read(session: Session) -> dict[str, Any]:
+        return asdict(queue_summary(session, queue)) | {
+            "agreement": _agreement_json(agreement(session, queue))
+        }
+
+    return await _in_session(svc, read)
+
+
+def _agreement_json(a: Any) -> dict[str, Any]:
+    body = asdict(a)
+    body["annotators"] = [asdict(s) | {"agreement": s.agreement} for s in a.annotators]
+    return body
+
+
+@router.get("/annotation-queues/{queue}/tasks")
+async def get_annotation_tasks(
+    queue: str,
+    svc: Svc,
+    status: Annotated[str | None, Query(max_length=16)] = None,
+    limit: Annotated[int, Query(ge=1, le=500)] = 100,
+    offset: Annotated[int, Query(ge=0)] = 0,
+) -> dict[str, Any]:
+    """Items in queue order with every claim and label, optionally of one status."""
+    if status is not None and status not in TASK_STATUSES:
+        raise InvalidInputError(f"status must be one of {', '.join(TASK_STATUSES)}")
+    rows = await _in_session(
+        svc,
+        lambda s: [asdict(t) for t in list_tasks(s, queue, status, limit=limit, offset=offset)],
+    )
+    return {"tasks": rows}
+
+
+@router.post("/annotation-queues/{queue}/claim", response_model=None)
+async def claim_annotation_task(queue: str, body: ClaimBody, svc: Svc) -> dict[str, Any] | Response:
+    """The annotator's next item (the one they hold, if any), or 204 when none is left."""
+    claim = await _in_session(svc, lambda s: claim_next(s, queue, body.annotator))
+    if claim is None:
+        return Response(status_code=204)
+    return asdict(claim)
+
+
+@router.post("/annotation-queues/{queue}/submit")
+async def submit_annotation(queue: str, body: SubmitBody, svc: Svc) -> dict[str, Any]:
+    """Record a label for an item the annotator holds; 409 if they do not hold it
+    or it is adjudicated."""
+    done = await _in_session(
+        svc,
+        lambda s: submit(s, queue, body.annotator, body.case_id, body.label, note=body.note),
+    )
+    return asdict(done)
+
+
+class SkipBody(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    annotator: Annotator
+    case_id: Annotated[str, Field(min_length=1, max_length=256)]
+
+
+@router.post("/annotation-queues/{queue}/skip", status_code=204)
+async def skip_annotation(queue: str, body: SkipBody, svc: Svc) -> Response:
+    """Give back a claimed item unlabelled; it is not offered to that annotator again."""
+    await _in_session(svc, lambda s: skip(s, queue, body.annotator, body.case_id))
+    return Response(status_code=204)
+
+
+@router.post("/annotation-queues/{queue}/adjudicate")
+async def adjudicate_annotation(queue: str, body: AdjudicateBody, svc: Svc) -> dict[str, Any]:
+    """Give a disputed item its final label; 409 for an item that is not disputed."""
+    done = await _in_session(
+        svc,
+        lambda s: adjudicate(s, queue, body.adjudicator, body.case_id, body.label, note=body.note),
+    )
+    return asdict(done)
+
+
+@router.get("/annotation-queues/{queue}/export")
+async def export_annotations(queue: str, svc: Svc) -> Response:
+    """Items with a final label as JSON lines, the labelled-item form calibration reads."""
+    rows = await _in_session(svc, lambda s: export_labels(s, queue))
+    text = "".join(json.dumps(r, ensure_ascii=False) + "\n" for r in rows)
+    return Response(text, media_type="application/x-ndjson")
 
 
 def _version_json(found: Resolved, *, content: bool = True) -> dict[str, Any]:

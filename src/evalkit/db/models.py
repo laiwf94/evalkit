@@ -530,3 +530,77 @@ class CaseDraft(Base):
     note: Mapped[str] = mapped_column(Text, default="")
     reviewed_at: Mapped[datetime | None] = mapped_column(nullable=True)
     dataset_version: Mapped[int | None] = mapped_column(Integer, nullable=True)
+
+
+class AnnotationQueue(Base):
+    """A set of items for people to label (``evalkit.annotation``): the dataset
+    version (and run, when the items carry a run's outputs) they come from, the
+    labels allowed and their level of measurement, how many annotators label
+    each item, and how long a claim lasts."""
+
+    __tablename__ = "annotation_queues"
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True)
+    name: Mapped[str] = mapped_column(String(128), unique=True)
+    # SHA-256 of the canonical spec: creating the same queue again returns it.
+    spec_hash: Mapped[str] = mapped_column(String(64))
+    spec: Mapped[dict[str, Any]] = mapped_column()
+    dataset: Mapped[str] = mapped_column(String(128))
+    dataset_version: Mapped[int] = mapped_column(Integer)
+    run_id: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    labels: Mapped[list[Any]] = mapped_column()
+    level: Mapped[str] = mapped_column(String(16))
+    overlap: Mapped[int] = mapped_column(Integer)
+    claim_seconds: Mapped[int] = mapped_column(Integer)
+    task_count: Mapped[int] = mapped_column(Integer)
+    created_at: Mapped[datetime] = mapped_column(default=utcnow)
+
+
+class AnnotationTask(Base):
+    """One item of a queue. ``status`` is open (waiting for labels), agreed (every
+    annotator gave the same label), disputed (they differ, waiting for an
+    adjudicator) or adjudicated; ``label`` is the final label of an agreed or
+    adjudicated item."""
+
+    __tablename__ = "annotation_tasks"
+    __table_args__ = (
+        UniqueConstraint("queue_id", "case_id", name="uq_annotation_tasks_case"),
+        Index("ix_annotation_tasks_status", "queue_id", "status", "position"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    queue_id: Mapped[str] = mapped_column(ForeignKey("annotation_queues.id", ondelete="CASCADE"))
+    position: Mapped[int] = mapped_column(Integer)
+    case_id: Mapped[str] = mapped_column(String(256))
+    # What the annotator sees: the case's input and expected value, and the
+    # run's output when the queue labels a run.
+    item: Mapped[dict[str, Any]] = mapped_column()
+    status: Mapped[str] = mapped_column(String(16), default="open")
+    label: Mapped[Any] = mapped_column(JSON, nullable=True)
+    adjudicator: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    adjudicated_at: Mapped[datetime | None] = mapped_column(nullable=True)
+    note: Mapped[str] = mapped_column(Text, default="")
+
+
+class AnnotationAssignment(Base):
+    """One of a task's ``overlap`` slots: who holds it, until when, and once
+    submitted the label they gave. Unique slots cap a task at ``overlap``
+    annotators; unique annotators stop one person labelling an item twice."""
+
+    __tablename__ = "annotation_assignments"
+    __table_args__ = (
+        UniqueConstraint("task_id", "slot", name="uq_annotation_assignments_slot"),
+        UniqueConstraint("task_id", "annotator", name="uq_annotation_assignments_annotator"),
+        Index("ix_annotation_assignments_annotator", "queue_id", "annotator"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    task_id: Mapped[int] = mapped_column(ForeignKey("annotation_tasks.id", ondelete="CASCADE"))
+    queue_id: Mapped[str] = mapped_column(String(32))
+    slot: Mapped[int] = mapped_column(Integer)
+    annotator: Mapped[str] = mapped_column(String(128))
+    claimed_at: Mapped[datetime] = mapped_column(default=utcnow)
+    expires_at: Mapped[datetime] = mapped_column()
+    label: Mapped[Any] = mapped_column(JSON, nullable=True)
+    note: Mapped[str] = mapped_column(Text, default="")
+    submitted_at: Mapped[datetime | None] = mapped_column(nullable=True)

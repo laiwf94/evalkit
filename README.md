@@ -253,6 +253,63 @@ version cannot be rejected: remove the case with `dataset edit`. The API has
 the review step too: `GET /v1/generations`, `.../{id}/drafts`, and `POST
 .../{id}/approve` and `.../{id}/reject`.
 
+### Annotation queues
+
+People label items through a queue, several per item, and the labels they
+agree on (or an adjudicator settles) become a labelled set for `evalkit
+calibrate`. A queue is built from a dataset version, or from a run, in which
+case each item also shows that run's output:
+
+```toml
+# annotate.toml
+[annotate]
+name = "faithfulness-oct"
+run = "9b3e..."                  # or dataset = "support" (and version = N)
+labels = ["faithful", "unfaithful"]
+level = "nominal"                # ordinal, interval or ratio for scales
+overlap = 3                      # annotators per item
+claim_timeout = "30m"
+instructions = "Is every claim in the answer supported by the contexts?"
+tags = ["billing"]               # optional: cases with any of these tags, a split, a limit
+```
+
+```console
+$ evalkit annotate create annotate.toml
+created faithfulness-oct	run 9b3e...	120 items x 3	nominal	120 open
+$ evalkit annotate next faithfulness-oct --annotator ana
+faithfulness-oct: item q014 (held until 2026-11-28T10:41:07+00:00)
+  input:    {"question": "Can I get my money back on an annual plan?", ...}
+  output:   "Annual plans are refunded in full within 30 days."
+$ evalkit annotate submit faithfulness-oct q014 unfaithful --annotator ana --note "14 days, not 30"
+q014: unfaithful (1 of 3 labels; open)
+$ evalkit annotate skip faithfulness-oct q015 --annotator ana     # never offered to ana again
+$ evalkit annotate show faithfulness-oct --status disputed
+$ evalkit annotate adjudicate faithfulness-oct q031 faithful --adjudicator lee
+$ evalkit annotate agreement faithfulness-oct
+faithfulness-oct: Krippendorff's alpha (nominal) 0.781 over 360 labels on 120 items (120 with two or more labels)
+  ana                      120 labels  agrees with the final label 94.2% of 120
+  ...
+$ evalkit annotate export faithfulness-oct -o labels.jsonl
+$ evalkit calibrate --judge examples/rag/faithfulness.toml labels.jsonl
+```
+
+`next` gives the annotator the first item, in dataset order, that they have not
+labelled and that has a free slot; asking again returns the item they hold and
+extends the claim. A claim that lapses can be taken over by someone else;
+until then it is still theirs, to renew with `next` or to label. An
+item with all `overlap` labels is `agreed` when they are the same and
+`disputed` otherwise; `adjudicate` gives a disputed item its final label. A
+label can be changed until the item is adjudicated. Agreement is
+Krippendorff's alpha (`src/evalkit/agreement.py`), which handles any number of
+annotators, missing labels and the four levels of measurement; it is checked
+against Krippendorff's published worked examples. `export` writes every item
+with a final label as `{id, input, expected, output, label}`, the form
+`evalkit calibrate` reads. The API has every step: `POST /v1/annotation-queues`,
+`POST .../{queue}/claim`, `.../submit`, `.../skip`, `.../adjudicate`, and `GET
+.../{queue}` (with alpha), `.../tasks` and `.../export`. Annotators are named
+in each request; until projects and users arrive (week 9) every token holder
+can label as anyone.
+
 ## Model matrices
 
 A `[matrix]` table runs the same dataset and scorers over several models,
@@ -993,6 +1050,9 @@ different judge it would refuse (exit 3) unless `--allow-judge-change` is given.
 | `evalkit generate CONFIG` | Draft cases from seed documents and examples (`[generate]`), with near-duplicates marked; exit 3 if no call gave a usable reply. |
 | `evalkit drafts list [--dataset D]`, `evalkit drafts show GEN [--status S]` | Generations and their draft counts; one generation's drafts. |
 | `evalkit drafts approve GEN (--all\|--id ID...) [--note N]`, `evalkit drafts reject GEN --id ID... [--note N]` | Add drafts to the dataset as one new version; mark drafts rejected (exit 3 for one already in a version). |
+| `evalkit annotate create CONFIG`, `evalkit annotate list`, `evalkit annotate show QUEUE [--status S]` | Create a labelling queue from an `[annotate]` table (a dataset version or a run); list queues; one queue's items, claims and labels. |
+| `evalkit annotate next QUEUE --annotator A`, `submit QUEUE CASE LABEL --annotator A`, `skip QUEUE CASE --annotator A` | Claim the next item (exit 3 when none is left), label it, or give it back. |
+| `evalkit annotate adjudicate QUEUE CASE LABEL --adjudicator A`, `agreement QUEUE`, `export QUEUE [-o FILE]` | Settle a disputed item; Krippendorff's alpha and per-annotator agreement; final labels as JSON lines for `evalkit calibrate`. |
 | `evalkit prompt push NAME FILE [--system FILE] [--note N]` | Store a prompt file (TOML with `system` and `template`, or a template file) as a new version; unchanged content is a no-op. |
 | `evalkit prompt show REF`, `evalkit prompt list` | A version's content and labels; every prompt with its newest version and labels. |
 | `evalkit prompt diff REF [REF]` | Unified diff of two versions (the second defaults to the newest). |
@@ -1062,6 +1122,9 @@ Every `/v1` route takes `Authorization: Bearer <token>`.
 | `GET /v1/datasets/{name}/diff?from=&to=` | Added, removed and changed cases with field-level changes (`to` defaults to the newest). |
 | `GET /v1/generations[?dataset=]`, `GET /v1/generations/{id}` | Generations with their counts, tokens, cost, errors and draft statuses. |
 | `GET /v1/generations/{id}/drafts?status=&limit=&offset=` | Drafts in generation order. |
+| `POST /v1/annotation-queues`, `GET /v1/annotation-queues`, `GET /v1/annotation-queues/{queue}` | Create a labelling queue (201, or 200 for the same settings again, 409 for other settings); list them; one queue with its status counts and Krippendorff's alpha. |
+| `GET /v1/annotation-queues/{queue}/tasks?status=&limit=&offset=`, `GET .../export` | Items with every claim and label; final labels as JSON lines. |
+| `POST /v1/annotation-queues/{queue}/claim`, `.../submit`, `.../skip`, `.../adjudicate` | `{"annotator"}` for the next item (204 when none is left); `{"annotator", "case_id", "label", "note"}` to label it (409 without a claim); `{"annotator", "case_id"}` to give it back; `{"adjudicator", "case_id", "label", "note"}` for a disputed item. |
 | `POST /v1/generations/{id}/approve`, `POST /v1/generations/{id}/reject` | `{"all": true}` or `{"ids": [...]}`, and a `note`: approved drafts become one new dataset version; 409 when rejecting a draft that is already in one. |
 | `POST /v1/prompts/{name}/versions` | Push `{"template", "system", "note", "description"}`. 201 for a new version, 200 if the content already exists. |
 | `GET /v1/prompts`, `GET /v1/prompts/{name}` | All prompts with their labels; one prompt's labels and versions. |
@@ -1115,6 +1178,7 @@ tests compare the bodies they received with the exact bodies expected.
 | Slices | `tests/test_slices.py` plants a regression in one tag: two fake runs at 80% accuracy whose differences cancel over 400 cases (-1.0%, no detectable change), while the 40 `billing` cases lose 25 and win none. `--by tag` finds billing worse and `--require-slice billing` fails the gate; splits and regions, which dilute it, pass. Holm-adjusted p-values equal Holm over the tested pairs (Hypothesis), 40 null slices report a false regression in at most 2 of 20 trials, too-small slices are left out of the family and fail a rule that requires them, and on two dataset versions the slices cover only the unchanged cases. |
 | Near-duplicates | `tests/test_dedupe.py` checks shingles and exact Jaccard values worked out by hand, MinHash estimates on sets of known overlap (within four standard errors) and their bias over 300 random pairs (under 0.01), batched signatures equal to the minimum computed directly (Hypothesis, including sets larger than a block), the band layout's curve, and 60 planted one-word edits among 400 random texts: every one is found, pointing at its original, and no random text is flagged. |
 | Generation and review | `tests/test_generate.py` drives a scripted model through three documents: an empty case is invalid, a near-copy of a dataset case, an exact repeat and a near-repeat in one reply are marked duplicate of the right case, a refusal, a cut-off reply, a reply off the schema and a failed call are errors for their document, and a rerun is served from the cache. Approval makes one edit version, re-checks against cases added since, forces named duplicates in, creates a missing dataset, recovers when the edit went in but the drafts were not marked, and retries a conflicting writer; through the CLI and the API too. |
+| Annotation and agreement | `tests/test_annotation.py` checks Krippendorff's alpha against his published worked examples (the two-coder binary table, 2/21 ≈ 0.095, and the four-coder table with missing data: 0.743 nominal, 0.815 ordinal, 0.849 interval, 0.797 ratio), against a brute-force pair-by-pair computation on random data (Hypothesis, all four levels) and against Scott's pi for two coders. Four annotators then label that table through a queue, skipping where it has no value, and the queue reports the same alphas. Claims respect overlap and order, lapsed claims are taken over, skips are remembered, and twelve threads labelling at once on SQLite leave every item with exactly three labels from different people and the right status; on PostgreSQL (`tests/e2e/test_annotation_races.py`) twenty items take sixty labels from twelve threads, ten last labels submitted at once settle the item exactly once, and six concurrent creates make one queue. Exported labels load in `evalkit calibrate`. |
 | API and CLI | Every endpoint, error code and exit code, over ASGI and over the wire. |
 
 ```console
@@ -1181,6 +1245,8 @@ src/evalkit/report.py      run summaries and comparisons
 src/evalkit/slices.py      per-slice comparisons (tag, split, metadata), Holm over slices, slice gate rules
 src/evalkit/generate.py    synthetic cases from seed documents and examples, drafts, approval and rejection
 src/evalkit/dedupe.py      MinHash signatures and LSH banding in numpy: near-duplicate texts
+src/evalkit/annotation.py  annotation queues: claims with overlap, labels, skips, adjudication, export
+src/evalkit/agreement.py   Krippendorff's alpha from the coincidence matrix, four levels of measurement
 src/evalkit/pricing.py     versioned per-provider price lists, overrides, run price records,
                            token estimates for providers that cannot count
 src/evalkit/estimate.py    cost estimates from token counts

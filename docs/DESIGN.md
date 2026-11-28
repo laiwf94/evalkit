@@ -11,9 +11,10 @@ finished work. And because the harness also runs as a shared service, inputs
 are bounded, it makes no requests to arbitrary URLs, and neither the store nor
 the logs hold personal data or keys.
 
-It does not evaluate model weights at training time, and it is not a human
-annotation tool (calibration labels are imported, not collected). Generated
-cases do wait for a person: they are drafts until approved. Several
+It does not evaluate model weights at training time. People do take part:
+generated cases are drafts until someone approves them, and labels for
+calibrating judges can be collected through annotation queues, several
+annotators per item, or imported. Several
 processes, on several machines, can share one run; what else changes at scale
 is discussed under [Bigger runs](#bigger-runs).
 
@@ -65,6 +66,14 @@ generations     one synthetic generation: dataset name, settings, generator iden
 case_drafts     (generation_id, case_id) unique; the case (JSON), source document,
                 status (pending, duplicate, approved, rejected), duplicate_of and
                 similarity, note, reviewed_at, the dataset version it went into
+annotation_queues  name unique; settings and their hash, dataset and version, run,
+                labels, level, overlap, claim length, item count
+annotation_tasks  (queue_id, case_id) unique; the item shown (input, expected,
+                output), status (open, agreed, disputed, adjudicated), final
+                label, adjudicator and note
+annotation_assignments  (task_id, slot) unique, (task_id, annotator) unique;
+                claimed_at, expires_at, label, note, submitted_at; a skip keeps
+                the row with a negative slot
 prompts         name unique; description
 prompt_versions (prompt_id, version) unique, (prompt_id, content_hash) unique;
                 system, template, note; inserted, never updated
@@ -210,6 +219,56 @@ large part of the text and many edits fall near 0.8, 248 of the 313 edits
 whose exact similarity is at least 0.8 were found and 162 edits just below it
 were flagged, and nothing else, in 7.2 s (3.2 s of it shingling, 1.3 s
 signatures). Memory is the signatures, 1 KiB per text, plus one 8 MiB block.
+
+### Annotation queues
+
+Calibrating a judge needs labels people agree on, and one person's labels say
+nothing about how reliable they are. A queue (`src/evalkit/annotation.py`)
+snapshots its items when it is created, from a dataset version or from a run
+(adding that run's output for each case), so later edits and runs never change
+what was labelled; the same name and settings again return it, so a config can
+be applied repeatedly.
+
+Each item has `overlap` slots. Unique (task, slot) caps it at `overlap`
+annotators and unique (task, annotator) stops anyone labelling it twice, so no
+interleaving can break either rule; a claim that loses a race for a slot tries
+the next slot or item. The next item is the first in dataset order the
+annotator has not touched with a free slot, so annotators working together
+finish items rather than spreading partial labels over the whole queue. A
+claim lasts `claim_timeout` (1 minute to 7 days). A lapsed claim's slot can be
+taken over, by compare-and-set on its expiry, and the old holder's label is
+then refused; if nobody took it, the label still counts, because the only cost
+of a late label is that it was late. A skip keeps the assignment row under a
+negative slot: it frees the slot, counts towards nothing, and keeps the item
+from being offered to that annotator again.
+
+Every write to an item starts by updating the item's own row, before it reads
+anything. On PostgreSQL that is the row lock; on SQLite, where the driver
+opens a transaction only at the first write, it takes the database write lock
+first, so the reads that follow are never from an older snapshot. A submit
+therefore always sees every other label of its item, and the one that
+completes it sets `agreed` or `disputed` exactly once: ten final labels sent at
+once on PostgreSQL leave one submit reporting the settled status and nine
+reporting `open`.
+
+Agreement is Krippendorff's alpha (`src/evalkit/agreement.py`), not pairwise
+kappa, because items have more than two annotators, different annotators on
+different items, and gaps where someone skipped; alpha handles all three and
+the nominal, ordinal, interval and ratio levels (Krippendorff, *Content
+Analysis*, ch. 12). It is computed from the coincidence matrix: per item, the
+counts of each label, each ordered pair within the item weighted by 1/(m - 1).
+With the counts as a units-by-labels matrix C and w = 1/(m - 1) per row, the
+coincidences are (wC)ᵀC less the diagonal of wC's column sums, one matrix
+product; 100,000 items of three labels take 0.06 s with 5 labels and 0.1 s
+with 50 on a 4-core container. Alpha is reported as undefined, not as 0 or 1,
+when no item has two labels or the labels show no variation. Next to it the
+queue reports, per annotator, how often their labels match the final ones,
+which finds the one annotator dragging alpha down. Claim and submit together
+take about 6 ms on SQLite.
+
+The labels people agree on become the judge's test: `export` writes final
+labels in the form `evalkit calibrate` reads, so the kappa a judge is held to
+is measured against labels whose own reliability is known.
 
 ### How a target is identified
 
@@ -1514,6 +1573,7 @@ the whole-dataset test, and in 500 slices 12.0 s; 10,000 cases in 20 slices,
 | Limit | Value | Why |
 |---|---|---|
 | Cases per dataset | 100,000 | Bounds import memory. Summaries no longer grow with run size. |
+| Annotation queue | 50 labels, overlap 1-10, claims 1 minute to 7 days, notes 2,000 characters | Labels are categories or points on a scale; more than ten annotators per item adds cost without changing alpha much. |
 | JSONL line | 1 MiB | Checked before parsing. |
 | API request body | 16 MiB (configurable, max 256 MiB) | Checked by Content-Length and while reading. |
 | Concurrent cases per process (`concurrency`) | 1-256 | |

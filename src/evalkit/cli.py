@@ -36,6 +36,24 @@ from sqlalchemy.engine import make_url
 from sqlalchemy.orm import Session, sessionmaker
 
 from evalkit import __version__, aggregates, blobs, cache, runqueue
+from evalkit.annotation import (
+    Agreement,
+    Claim,
+    QueueSpec,
+    QueueSummary,
+    Submitted,
+    TaskInfo,
+    adjudicate,
+    agreement,
+    claim_next,
+    create_queue,
+    export_labels,
+    list_queues,
+    list_tasks,
+    queue_summary,
+    skip,
+    submit,
+)
 from evalkit.api import serve
 from evalkit.cache import VerdictStore
 from evalkit.config import (
@@ -717,6 +735,64 @@ async def cmd_drafts(args: argparse.Namespace, app: App) -> int:
     return EXIT_OK
 
 
+async def cmd_annotate(args: argparse.Namespace, app: App) -> int:
+    """``evalkit annotate``: create queues, label items, adjudicate and export.
+    ``next`` exits 3 when nothing is left for the annotator."""
+    with app.sessions() as session:
+        match args.annotate_command:
+            case "create":
+                path = Path(args.config)
+                table = _read_toml(path).get("annotate")
+                if not isinstance(table, dict):
+                    raise CliError(f"{path} has no [annotate] table", EXIT_INPUT)
+                try:
+                    spec = QueueSpec.model_validate(table)
+                except ValidationError as exc:
+                    raise CliError(f"{path}: {_describe(exc)}", EXIT_INPUT) from None
+                summary, created = create_queue(session, spec)
+                verb = "created" if created else "unchanged, already exists:"
+                app.out.write(f"{verb} {_format_queue_line(summary)}\n")
+            case "list":
+                _emit(app.out, list_queues(session), args.json, _format_queues)
+            case "show":
+                summary = queue_summary(session, args.queue)
+                tasks = list_tasks(
+                    session, args.queue, args.status, limit=args.limit, offset=args.offset
+                )
+                _emit(app.out, {"queue": summary, "tasks": tasks}, args.json, _format_queue)
+            case "next":
+                claim = claim_next(session, args.queue, args.annotator)
+                if claim is None:
+                    app.out.write(f"nothing left for {args.annotator} in {args.queue}\n")
+                    return EXIT_UNUSABLE
+                _emit(app.out, claim, args.json, _format_claim)
+            case "submit":
+                done = submit(
+                    session, args.queue, args.annotator, args.case_id, args.label, note=args.note
+                )
+                _emit(app.out, done, args.json, _format_submitted)
+            case "skip":
+                skip(session, args.queue, args.annotator, args.case_id)
+                app.out.write(f"{args.case_id}: skipped by {args.annotator}\n")
+            case "adjudicate":
+                done = adjudicate(
+                    session, args.queue, args.adjudicator, args.case_id, args.label, note=args.note
+                )
+                _emit(app.out, done, args.json, _format_submitted)
+            case "agreement":
+                found = agreement(session, args.queue)
+                _emit(app.out, found, args.json, _format_agreement)
+            case _:
+                rows = export_labels(session, args.queue)
+                text = "".join(json.dumps(r, ensure_ascii=False) + "\n" for r in rows)
+                if args.output:
+                    await asyncio.to_thread(Path(args.output).write_text, text, encoding="utf-8")
+                    app.out.write(f"wrote {len(rows)} labelled items to {args.output}\n")
+                else:
+                    app.out.write(text)
+    return EXIT_OK
+
+
 def _read_edit(path: Path, base: str | None, session: Session, name: str) -> DatasetEdit:
     """An edit file (JSON, the body of PATCH /v1/datasets/NAME). ``--base`` gives or
     overrides its base: a content hash, or a version number to take the hash of."""
@@ -1063,6 +1139,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     _add_prompt_commands(sub)
     _add_generate_commands(sub)
+    _add_annotate_commands(sub)
     _add_maintenance_commands(sub)
     _add_tools_commands(sub)
     _add_agent_commands(sub)
@@ -1245,6 +1322,54 @@ def _add_generate_commands(sub: Any) -> None:
     rej.add_argument("--id", action="append", required=True, help="a draft id (repeatable)")
     rej.add_argument("--note", default="", help="why")
     drafts.set_defaults(handler=cmd_drafts)
+
+
+def _add_annotate_commands(sub: Any) -> None:
+    ann = sub.add_parser(
+        "annotate", help="label items with several annotators, adjudicate and export the labels"
+    )
+    ann_sub = ann.add_subparsers(dest="annotate_command", required=True)
+    create = ann_sub.add_parser("create", help="create a queue from an [annotate] table")
+    create.add_argument("config", help="TOML file with an [annotate] table")
+    lst = ann_sub.add_parser("list", help="every queue and its item counts")
+    lst.add_argument("--json", action="store_true", help="print JSON instead of a table")
+    show = ann_sub.add_parser("show", help="a queue's items, claims and labels")
+    show.add_argument("queue", help="queue name or id")
+    show.add_argument("--status", choices=["open", "agreed", "disputed", "adjudicated"])
+    show.add_argument("--limit", type=int, default=50, help="items to print (default 50)")
+    show.add_argument("--offset", type=int, default=0)
+    show.add_argument("--json", action="store_true", help="print JSON instead of text")
+    nxt = ann_sub.add_parser("next", help="claim the next item to label")
+    nxt.add_argument("queue")
+    nxt.add_argument("--annotator", required=True)
+    nxt.add_argument("--json", action="store_true", help="print JSON instead of text")
+    sbm = ann_sub.add_parser("submit", help="label an item you claimed")
+    sbm.add_argument("queue")
+    sbm.add_argument("case_id")
+    sbm.add_argument("label")
+    sbm.add_argument("--annotator", required=True)
+    sbm.add_argument("--note", default="")
+    sbm.add_argument("--json", action="store_true", help="print JSON instead of text")
+    skp = ann_sub.add_parser("skip", help="give back an item you claimed without labelling it")
+    skp.add_argument("queue")
+    skp.add_argument("case_id")
+    skp.add_argument("--annotator", required=True)
+    adj = ann_sub.add_parser("adjudicate", help="give a disputed item its final label")
+    adj.add_argument("queue")
+    adj.add_argument("case_id")
+    adj.add_argument("label")
+    adj.add_argument("--adjudicator", required=True)
+    adj.add_argument("--note", default="")
+    adj.add_argument("--json", action="store_true", help="print JSON instead of text")
+    agr = ann_sub.add_parser("agreement", help="Krippendorff's alpha and per-annotator agreement")
+    agr.add_argument("queue")
+    agr.add_argument("--json", action="store_true", help="print JSON instead of text")
+    exp = ann_sub.add_parser(
+        "export", help="items with a final label as JSON lines, for evalkit calibrate"
+    )
+    exp.add_argument("queue")
+    exp.add_argument("-o", "--output")
+    ann.set_defaults(handler=cmd_annotate)
 
 
 def _add_maintenance_commands(sub: Any) -> None:
@@ -1672,6 +1797,73 @@ def _format_approval(r: ApprovalResult) -> str:
         lines += [f"    {k} repeats {v}" for k, v in list(r.now_duplicates.items())[:10]]
     if r.already_approved:
         lines.append(f"{len(r.already_approved)} drafts were already approved")
+    return "\n".join(lines) + "\n"
+
+
+def _format_queue_line(q: QueueSummary) -> str:
+    source = f"run {q.run}" if q.run else f"{q.dataset} v{q.dataset_version}"
+    counts = ", ".join(f"{n} {s}" for s, n in q.statuses.items() if n)
+    return f"{q.name}\t{source}\t{q.tasks} items x {q.overlap}\t{q.level}\t{counts}"
+
+
+def _format_queues(rows: list[QueueSummary]) -> str:
+    return "".join(_format_queue_line(q) + "\n" for q in rows) or "no annotation queues\n"
+
+
+def _label_text(value: Any) -> str:
+    return "-" if value is None else str(value)
+
+
+def _format_queue(value: dict[str, Any]) -> str:
+    q: QueueSummary = value["queue"]
+    lines = [_format_queue_line(q), f"labels: {', '.join(map(str, q.labels))}"]
+    tasks: list[TaskInfo] = value["tasks"]
+    for t_ in tasks:
+        given = ", ".join(
+            f"{a.annotator}="
+            + (
+                "(skipped)"
+                if a.skipped
+                else _label_text(a.label)
+                if a.submitted_at
+                else "(claimed)"
+            )
+            for a in t_.assignments
+        )
+        final = f" -> {t_.label}" if t_.label is not None else ""
+        lines.append(f"[{t_.status}] {t_.case_id}{final}  {given or 'no labels'}")
+    return "\n".join(lines) + "\n"
+
+
+def _format_claim(c: Claim) -> str:
+    lines = [
+        f"{c.queue}: item {c.case_id} (held until {c.expires_at.isoformat(timespec='seconds')})"
+    ]
+    for key in ("input", "expected", "output"):
+        if c.item.get(key) is not None:
+            lines.append(f"  {key + ':':<10}{_short(c.item[key], 400)}")
+    return "\n".join(lines) + "\n"
+
+
+def _format_submitted(r: Submitted) -> str:
+    final = f", final label {r.final}" if r.final is not None else ""
+    return f"{r.case_id}: {r.label} ({r.labels} of {r.overlap} labels; {r.status}{final})\n"
+
+
+def _format_agreement(a: Agreement) -> str:
+    alpha = a.alpha
+    value = "undefined" if alpha.alpha is None else f"{alpha.alpha:.3f}"
+    lines = [
+        f"{a.queue}: Krippendorff's alpha ({a.level}) {value} over {a.labels} labels on "
+        f"{a.labelled_items} items ({alpha.pairable_units} with two or more labels)"
+    ]
+    if alpha.alpha is None:
+        lines.append("  alpha needs two labels on one item and some variation among the labels")
+    for s in a.annotators:
+        lines.append(
+            f"  {s.annotator:<20} {s.submitted:>6} labels  "
+            f"agrees with the final label {_pct(s.agreement)} of {s.compared}"
+        )
     return "\n".join(lines) + "\n"
 
 
