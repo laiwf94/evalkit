@@ -56,6 +56,14 @@ from evalkit.annotation import (
 )
 from evalkit.api import serve
 from evalkit.cache import VerdictStore
+from evalkit.clusters import (
+    ClusterSpec,
+    cluster_failures,
+    format_clusters,
+    format_tags,
+    save_tags,
+)
+from evalkit.clusters import from_spec as clusters_from_spec
 from evalkit.config import (
     ConfigError,
     GateRules,
@@ -357,6 +365,57 @@ async def cmd_report_rag(args: argparse.Namespace, app: App) -> int:
             limit=args.limit,
         )
     _emit(app.out, report, args.json, _format_rag)
+    return EXIT_OK
+
+
+async def cmd_report_clusters(args: argparse.Namespace, app: App) -> int:
+    """``evalkit report clusters RUN``: the run's failing cases grouped by what
+    they have in common, against a baseline's when one is given. Exits 3 when
+    the embedding requests fail."""
+    table: dict[str, Any] = {}
+    if args.config:
+        raw = _read_toml(Path(args.config))
+        found = raw.get("clusters")
+        if not isinstance(found, dict):
+            raise CliError(f"{args.config} has no [clusters] table", EXIT_INPUT)
+        table = dict(found)
+    if args.threshold:
+        default, per_metric = parse_thresholds(args.threshold)
+        table["threshold"] = default
+        table["thresholds"] = {**table.get("thresholds", {}), **per_metric}
+    if args.metric:
+        table["metrics"] = args.metric
+    if args.k is not None:
+        table["k"] = args.k
+    if args.no_names:
+        table["names"] = False
+    try:
+        spec = ClusterSpec.model_validate(table)
+    except ValidationError as exc:
+        raise CliError(f"{args.config or '[clusters]'}: {_describe(exc)}", EXIT_INPUT) from None
+    with app.sessions() as session:
+        run_id = resolve_run(session, args.run)
+        baseline = resolve_run(session, args.baseline) if args.baseline else None
+    embedder, namer = clusters_from_spec(
+        spec, app.providers(), app.sessions, cache=VerdictStore(app.sessions)
+    )
+    try:
+        report = await cluster_failures(
+            app.sessions, run_id, spec=spec, embedder=embedder, namer=namer, baseline_id=baseline
+        )
+    except TargetError as exc:
+        raise CliError(f"embedding call failed: {exc.message}", EXIT_UNUSABLE) from None
+    tags = None
+    if args.save_tags and report.clusters:
+        with app.sessions() as session:
+            tags = save_tags(session, report, prefix=spec.tag_prefix)
+    if args.json:
+        value = _jsonable(report) | ({"tags": _jsonable(tags)} if tags is not None else {})
+        app.out.write(json.dumps(value, indent=2) + "\n")
+    else:
+        app.out.write(format_clusters(report, args.limit))
+        if tags is not None:
+            app.out.write(format_tags(tags))
     return EXIT_OK
 
 
@@ -1217,6 +1276,32 @@ def _add_report_commands(sub: Any) -> None:
     rag.add_argument("--limit", type=int, default=20, help="failing cases to list (default 20)")
     rag.add_argument("--json", action="store_true", help="print JSON instead of a table")
     rag.set_defaults(handler=cmd_report_rag)
+    clu = report_sub.add_parser(
+        "clusters",
+        help="group a run's failing cases by what they have in common, against a baseline",
+    )
+    clu.add_argument("run", help="run id or label:NAME")
+    clu.add_argument("--baseline", help="run to compare with: id or label:NAME")
+    clu.add_argument("--config", help="TOML file with a [clusters] table")
+    clu.add_argument("--k", type=int, help="number of clusters (default: chosen by silhouette)")
+    clu.add_argument(
+        "--threshold",
+        action="append",
+        metavar="[NAME=]VALUE",
+        help="a case fails below this score (default 0.5); NAME=VALUE for one metric; repeatable",
+    )
+    clu.add_argument(
+        "--metric", action="append", help="metric that decides failure (default: gated ones)"
+    )
+    clu.add_argument("--no-names", action="store_true", help="name clusters by their words only")
+    clu.add_argument(
+        "--save-tags",
+        action="store_true",
+        help="tag each failing case with its cluster in the newest dataset version",
+    )
+    clu.add_argument("--limit", type=int, default=5, help="case ids to list per cluster")
+    clu.add_argument("--json", action="store_true", help="print JSON instead of a table")
+    clu.set_defaults(handler=cmd_report_clusters)
 
 
 def _add_prompt_commands(sub: Any) -> None:

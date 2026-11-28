@@ -270,6 +270,95 @@ The labels people agree on become the judge's test: `export` writes final
 labels in the form `evalkit calibrate` reads, so the kappa a judge is held to
 is measured against labels whose own reliability is known.
 
+### Failure clusters
+
+A gate says that a run is worse; it does not say how. `evalkit report
+clusters` (`src/evalkit/clusters.py`) groups the failing cases so that the
+answer is a handful of named kinds of failure with counts.
+
+**What is clustered.** A case fails when its target call failed or it scores
+below its threshold on a metric that decides failure (the run's gated metrics
+unless `metrics` names others), the same rule as the RAG report. Each failing
+case becomes one text from the fields the config names: its input (or
+`input[input_key]`), expected answer, output (or the target error), and the
+detail of each metric it failed, which is where a faithfulness judge lists the
+unsupported claims and a judge gives its reasoning. Each part is clipped to
+2,000 characters and details to 500, so one long output cannot swamp the
+vector. The texts go through `Embedder`, so they share batched requests and
+come from the float32 embedding cache on a rerun; a case that fails the same
+way in both runs is one text, embedded once.
+
+**Spherical k-means.** Embedding models put meaning in direction, so the
+vectors are scaled to unit length and clustered on cosine distance: each
+centre is the normalised mean of its members, and assignment is the largest
+dot product. Seeding is k-means++ (each next centre drawn in proportion to its
+squared distance from the nearest one so far) from a generator seeded by
+`seed`, with `n_init` starts (4) and the one with the smallest total distance
+kept; Lloyd iterations stop when no case moves. A cluster that loses every
+member is reseeded with the case farthest from its centre, so the result
+always has k clusters unless there are fewer distinct cases. Clusters are
+numbered by size, so the same failures give the same report. Everything is
+in numpy: the per-cluster sums are one one-hot matrix product (`np.add.at`
+was over ten times slower), and each case's similarity to its own centre is read
+from the n × k product rather than gathered as `centers[labels]`, which would
+copy an n × d matrix. The vectors are held once, as float32, and scaled in
+place.
+
+**Choosing k.** With no `k`, every k from 2 to `max_k` (10) is fitted on an
+evenly spaced sample of at most 2,000 cases, and the one with the highest
+mean silhouette wins (cosine distance; a case alone in its cluster scores 0,
+as Rousseeuw defines it). The sample bounds the n² silhouette to a 16 MB
+distance matrix; the chosen k is then fitted on every case. When no k reaches
+a silhouette of 0.1 the failures show no structure worth splitting (points
+spread evenly over the sphere score 0.03 at 64 dimensions and 0.002 at 1536),
+and they form one cluster.
+
+**Names.** Each cluster gets its most distinctive words, class-based TF-IDF
+over cases: the share of the cluster's cases that contain a word, weighted by
+log(1 + k / clusters using it), with stop words and words in a single case of
+a larger cluster left out. Unless `names = false`, a model on any configured
+provider (Claude Haiku by default) is shown the `examples` distinct cases
+nearest the centre and the words, all marked as data, and answers in JSON
+constrained by a schema with a name of two to six words and one sentence.
+Replies are cached by the namer's identity (provider, endpoint, model,
+effort, prompt and schema) and the exact request, so an unchanged clustering
+is free to report again. A refusal, a reply off the schema or a failed call
+names that cluster by its words and adds a note; the clusters stand. Tags are
+`cluster:` plus the name as a slug, made unique with `-2`, `-3`.
+
+**Against a baseline.** Clustering each run on its own would give two sets
+of clusters with no correspondence between them, so the failures of both runs
+are clustered together, over the case ids both runs have (matched by id when
+they are on different versions of the dataset, and refused when they are on
+different datasets). Each cluster then counts its baseline and candidate
+cases and is `new`, `grew`, `same`, `shrank` or `resolved`, with the cases
+that newly fail and those that were fixed. Above `max_cases` (5,000; at most
+50,000) the cases are picked by a hash of their ids, so both runs and every
+rerun use the same ones, and the report says how many were left out.
+
+**Clusters as tags.** `--save-tags` writes the candidate's clusters into the
+newest dataset version as one edit (`evalkit.dataset_edits`), so the
+clustering is versioned and logged like any other change: each failing case
+gets its cluster's tag, and every tag with the prefix is first taken off every
+case, so the tags always describe the latest clustering and a case that now
+passes loses its old one. Other tags keep their order and a cluster tag that
+is already right keeps its place, so saving the same clustering twice makes no
+version. A case already at 32 tags is not tagged and is listed. A writer that
+moves the dataset on in between is retried. Runs on the tagged version can
+then be compared with `--by tag` and gated with `--require-slice
+cluster:NAME`, which is how a cluster found once is watched from then on.
+
+**Cost.** The embedding and naming calls dominate; the clustering itself, on
+a 4-core container with 1536-dimension vectors and k chosen from 2 to 10
+(`benchmarks/clusters.py`, planted groups, all recovered):
+
+| Cases | Groups | Time | Peak memory of the arrays |
+|---|---|---|---|
+| 1,000 (256 dims) | 4 | 0.21 s | 10 MiB |
+| 5,000 | 6 | 0.77 s | 73 MiB |
+| 20,000 | 8 | 1.16 s | 161 MiB |
+| 50,000 | 10 | 3.9 s | 336 MiB |
+
 ### How a target is identified
 
 The target hash covers every field that can change an
@@ -1598,6 +1687,7 @@ the whole-dataset test, and in 500 slices 12.0 s; 10,000 cases in 20 slices,
 | Retry-After honoured | up to 120 s by default | |
 | Judge `max_tokens` | 256-16,000 | |
 | Calibration items | 5,000 | |
+| Failure clustering | 5,000 cases by default, 50,000 max; k up to 50; 20 cases shown per cluster name | Vectors are held in memory as float32: 50,000 at 1536 dimensions is 293 MiB. |
 | Seed documents per generation | 10,000; 1 MiB per file, 20,000 characters per request | |
 | Cases per generation request | 50 (`per_document`, `per_call`); 100,000 per generation | |
 | Generation errors kept | 100 | |

@@ -327,3 +327,15 @@ week 2 (#23), and agents and conversations from week 3 (#24).
   published worked examples. `evalkit annotate agreement` and `GET
   /v1/annotation-queues/{queue}` report it with each annotator's agreement
   with the final labels.
+- **Failure clusters.** `evalkit report clusters RUN [--baseline RUN]`
+  embeds each failing case (input, output and the detail of each failed
+  metric, through the embedding cache), groups them with spherical k-means in
+  numpy (k-means++ restarts, k chosen by silhouette on a sample, or `--k`),
+  and names each cluster with a model shown its most typical cases, falling
+  back to its most distinctive words. With a baseline both runs' failures are
+  clustered together and each cluster is new, grew, same, shrank or resolved,
+  with the cases that newly fail or were fixed. `--save-tags` writes the
+  clusters into the newest dataset version as `cluster:NAME` tags in one edit,
+  replacing an earlier clustering's, so `--by tag` slices and
+  `--require-slice` follow them. 20,000 vectors of 1536 dimensions cluster in
+  1.2 s on four cores (`benchmarks/clusters.py`).

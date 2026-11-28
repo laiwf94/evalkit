@@ -310,6 +310,66 @@ with a final label as `{id, input, expected, output, label}`, the form
 in each request; until projects and users arrive (week 9) every token holder
 can label as anyone.
 
+### Failure clusters
+
+`evalkit report clusters` groups a run's failing cases by what they have in
+common, so a regression reads as "refund amounts invented: 15 new failures"
+rather than a list of ids. A case fails when its target call failed or it
+scores below the threshold (0.5, or `--threshold NAME=V`) on a gated metric
+(or the `--metric`s named). Each failing case's input, output and the detail
+of every metric it failed are embedded (through the embedding cache), grouped
+with k-means on cosine distance, and each group is named by a model from the
+cases nearest its centre. With `--baseline`, both runs' failures are
+clustered together, so each cluster says whether it is new, grew, shrank or
+was resolved, and which cases newly fail or were fixed:
+
+```toml
+# clusters.toml (every key is optional)
+[clusters]
+fields = ["input", "output", "detail"]   # what is embedded; "expected" too
+input_key = "question"                   # embed input.question rather than the whole input
+max_k = 10                               # k is chosen by silhouette; or k = 4
+[clusters.embed]
+provider = "openai"
+model = "text-embedding-3-small"
+[clusters.namer]
+provider = "anthropic"
+model = "claude-haiku-5-5"
+examples = 5                             # cases shown per cluster
+```
+
+```console
+$ evalkit report clusters label:candidate --baseline label:main --config clusters.toml
+clusters  run 5c1e...  candidate  vs 9b3e...  main
+dataset support v4  failing on exact
+37 of 65 cases failing (baseline 30)
+3 clusters (k by silhouette, silhouette 0.730)
+
+1. Login help missing  [cluster:login-help-missing]  10 failing, baseline 18, shrank
+   Answers do not help with locked accounts.
+   words: reset, login, sign, verification, email
+   cases: password-0017, password-0027, password-0007, password-0002, password-0020 and 5 more
+   fixed: pwfix-0000, pwfix-0003, pwfix-0009, pwfix-0011, pwfix-0012 and 3 more
+2. Parcel tracking unknown  [cluster:parcel-tracking-unknown]  12 failing, baseline 12, same
+   ...
+3. Refund amounts wrong  [cluster:refund-amounts-wrong]  15 failing, baseline 0, new
+   Answers get the refund amount wrong.
+   newly failing: refund-0011, refund-0015, refund-0022, refund-0024, refund-0026 and 10 more
+$ evalkit report clusters label:candidate --baseline label:main --save-tags
+...
+support now at version 5: 37 cases tagged, 0 old cluster tags removed
+$ evalkit gate label:main label:candidate --by tag --require-slice cluster:refund-amounts-wrong
+```
+
+`--save-tags` writes each of the candidate's failing cases' cluster into the
+newest dataset version as a `cluster:NAME` tag, in one edit, and takes the
+tags of an earlier clustering off every case; runs on that version can then
+be compared and gated per cluster. `--no-names` names clusters by their most
+distinctive words and makes no model call, and `--k` fixes the number of
+clusters. A rerun is served from the embedding and naming caches. At most
+`max_cases` cases (5,000 by default) are clustered, the same ones from both
+runs, picked by a hash of their ids.
+
 ## Model matrices
 
 A `[matrix]` table runs the same dataset and scorers over several models,
@@ -1040,6 +1100,7 @@ different judge it would refuse (exit 3) unless `--allow-judge-change` is given.
 | `evalkit gate BASE CAND [--allow-judge-change] [--by KEY] [--require-slice NAME]... [--any-slice] [--rules FILE]` | Same, and exit 1 if any gated metric is worse or a slice rule fails; exit 3 if a metric's judge changed, unless allowed. |
 | `evalkit report matrix MATRIX [--metric M] [--latency p50\|p95]` | A matrix's variants, their cost/quality/latency frontier and paired steps along it. |
 | `evalkit report rag RUN [--threshold [NAME=]V]... [--limit N]` | Each failing case of a RAG run attributed to a retrieval miss, an unsupported answer or ignored context. |
+| `evalkit report clusters RUN [--baseline RUN] [--config FILE] [--k N] [--metric M]... [--threshold [NAME=]V]... [--no-names] [--save-tags] [--limit N]` | The run's failing cases clustered by embedding and named by a model, with each cluster's change against the baseline; `--save-tags` tags the cases with their clusters; exit 3 if the embedding calls fail. |
 | `evalkit estimate CONFIG` | Cost estimate from token counts (per variant for a matrix). |
 | `evalkit calibrate --judge J LABELS` | Judge agreement with human labels (rubric, pairwise, trajectory or faithfulness judges). |
 | `evalkit calibrate --scorer S LABELS [--folds 5]` | The `semantic_similarity` threshold that agrees best with 0/1 labels, with a cross-validated kappa. |
@@ -1179,6 +1240,7 @@ tests compare the bodies they received with the exact bodies expected.
 | Near-duplicates | `tests/test_dedupe.py` checks shingles and exact Jaccard values worked out by hand, MinHash estimates on sets of known overlap (within four standard errors) and their bias over 300 random pairs (under 0.01), batched signatures equal to the minimum computed directly (Hypothesis, including sets larger than a block), the band layout's curve, and 60 planted one-word edits among 400 random texts: every one is found, pointing at its original, and no random text is flagged. |
 | Generation and review | `tests/test_generate.py` drives a scripted model through three documents: an empty case is invalid, a near-copy of a dataset case, an exact repeat and a near-repeat in one reply are marked duplicate of the right case, a refusal, a cut-off reply, a reply off the schema and a failed call are errors for their document, and a rerun is served from the cache. Approval makes one edit version, re-checks against cases added since, forces named duplicates in, creates a missing dataset, recovers when the edit went in but the drafts were not marked, and retries a conflicting writer; through the CLI and the API too. |
 | Annotation and agreement | `tests/test_annotation.py` checks Krippendorff's alpha against his published worked examples (the two-coder binary table, 2/21 ≈ 0.095, and the four-coder table with missing data: 0.743 nominal, 0.815 ordinal, 0.849 interval, 0.797 ratio), against a brute-force pair-by-pair computation on random data (Hypothesis, all four levels) and against Scott's pi for two coders. Four annotators then label that table through a queue, skipping where it has no value, and the queue reports the same alphas. Claims respect overlap and order, lapsed claims are taken over, skips are remembered, and twelve threads labelling at once on SQLite leave every item with exactly three labels from different people and the right status; on PostgreSQL (`tests/e2e/test_annotation_races.py`) twenty items take sixty labels from twelve threads, ten last labels submitted at once settle the item exactly once, and six concurrent creates make one queue. Exported labels load in `evalkit calibrate`. |
+| Failure clusters | `tests/test_clusters.py` checks spherical k-means against planted groups (every group recovered, the same labels from the same seed), the reseeding of an emptied cluster, the silhouette against a brute-force computation (Hypothesis), and the choice of k (4 planted groups give k = 4; points spread evenly over the sphere give one cluster). Two fake runs plant failures in three topics: one fails only in the candidate, one in both, one less in the candidate. The report finds exactly those three clusters with the right members, names them from a scripted model, marks them new, same and shrank with the newly failing and fixed cases, and a rerun makes no embedding or naming request. Saved tags replace an earlier clustering's, keep other tags in order, skip cases already at the tag limit, retry a conflicting writer, and give slices `evalkit compare --by tag` finds worse. |
 | API and CLI | Every endpoint, error code and exit code, over ASGI and over the wire. |
 
 ```console
@@ -1186,6 +1248,7 @@ $ ./scripts/check.sh                 # format, lint, mypy --strict, tests with c
 $ uv run pip-audit
 $ uv run python benchmarks/run.py
 $ uv run python benchmarks/summary.py --cases 1000000   # summary on a huge run
+$ uv run python benchmarks/clusters.py --cases 20000    # failure clustering on planted groups
 ```
 
 ## Speed
@@ -1247,6 +1310,8 @@ src/evalkit/generate.py    synthetic cases from seed documents and examples, dra
 src/evalkit/dedupe.py      MinHash signatures and LSH banding in numpy: near-duplicate texts
 src/evalkit/annotation.py  annotation queues: claims with overlap, labels, skips, adjudication, export
 src/evalkit/agreement.py   Krippendorff's alpha from the coincidence matrix, four levels of measurement
+src/evalkit/clusters.py    failure clusters: spherical k-means in numpy, k by silhouette, model-named
+                           clusters, baseline diffs, clusters saved as dataset tags
 src/evalkit/pricing.py     versioned per-provider price lists, overrides, run price records,
                            token estimates for providers that cannot count
 src/evalkit/estimate.py    cost estimates from token counts
